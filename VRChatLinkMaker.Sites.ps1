@@ -4866,14 +4866,20 @@ function Find-SiteContent([string]$query) {
       [void]$kept[$s].Add($r)
     }
   }
-  # A few from each (Dream Cast's on top), then fill up with whatever is left (WPARTY's first, Dream Cast's last).
+  # A few from each, then fill up with whatever is left (WPARTY's first, Dream Cast's last). Dream Cast's rows go
+  # last too: Enter should take the show with every voice-over (picked by DubPriority), not "Overlord 4" from Dream Cast.
+  $order = @($srcs | Where-Object { $_ -ne 'dreamcast' }) + @('dreamcast')
   $take = @{}
   $n = 0
   foreach ($s in $srcs) { $take[$s] = [Math]::Min($kept[$s].Count, $script:SearchQuota[$s]); $n += $take[$s] }
-  foreach ($s in @($srcs | Where-Object { $_ -ne 'dreamcast' }) + @('dreamcast')) { while ($n -lt $script:SearchMaxRows -and $take[$s] -lt $kept[$s].Count) { $take[$s]++; $n++ } }
+  foreach ($s in $order) { while ($n -lt $script:SearchMaxRows -and $take[$s] -lt $kept[$s].Count) { $take[$s]++; $n++ } }
   $rows = @()
-  foreach ($s in $srcs) { if ($take[$s] -gt 0) { $rows += @($kept[$s])[0..($take[$s] - 1)] } }
-  return $rows
+  foreach ($s in $order) { if ($take[$s] -gt 0) { $rows += @($kept[$s])[0..($take[$s] - 1)] } }
+  # The exact title typed comes first (stable: the source order stays within each group).
+  $qk = ConvertTo-SearchKey $q
+  $exact = @($rows | Where-Object { @($_.Names | Where-Object { (ConvertTo-SearchKey $_) -eq $qk }).Count -gt 0 })
+  $rest = @($rows | Where-Object { $exact -notcontains $_ })
+  return @($exact + $rest)
 }
 
 # One result as a line of the list: Title (Year) - kind - extra [source]
