@@ -996,7 +996,8 @@ function Test-FfmpegHasSrt {
 $script:PcPublishPass = ''
 function Get-PcPublishPass($s) {
   $p = "$(Get-Prop $s 'PublishPass')"
-  if ($p) { return $p }
+  # (It goes into the publish URL and MediaMTX's config as is: only letters, digits, - and _.)
+  if ($p -match '^[A-Za-z0-9_-]{12,64}$') { return $p }
   if (-not $script:PcPublishPass) { $script:PcPublishPass = New-MtxSecret 18 }
   return $script:PcPublishPass
 }
@@ -2174,11 +2175,18 @@ function Add-UpnpPortMappings([int[]]$ports, [switch]$DryRun) {
 $script:UpnpLease = 3600
 $script:UpnpRenewAt = [datetime]::MaxValue
 function Update-UpnpLeases {
-  if ((Get-Date) -lt $script:UpnpRenewAt) { return }
+  if ($script:UpnpMapped.Count -eq 0 -or (Get-Date) -lt $script:UpnpRenewAt) { return }
   $script:UpnpRenewAt = (Get-Date).AddSeconds($script:UpnpLease / 2)
   foreach ($m in @($script:UpnpMapped)) {
     if (-not $m.Fields -or [int]$m.Fields['NewLeaseDuration'] -eq 0) { continue }
-    try { [void](Invoke-UpnpSoap $m.Service 'AddPortMapping' $m.Fields) } catch {}
+    try {
+      $r = Invoke-UpnpSoap $m.Service 'AddPortMapping' $m.Fields
+      if (-not $r.Ok) {
+        # Some routers refuse to renew an existing forward (e.g. 718 "conflict"): remove it and add it again.
+        [void](Invoke-UpnpSoap $m.Service 'DeletePortMapping' ([ordered]@{ NewRemoteHost = ''; NewExternalPort = $m.Port; NewProtocol = 'TCP' }))
+        [void](Invoke-UpnpSoap $m.Service 'AddPortMapping' $m.Fields)
+      }
+    } catch {}
   }
 }
 

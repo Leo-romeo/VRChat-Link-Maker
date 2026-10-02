@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.1'
+$script:Version = '1.2'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -51,6 +51,7 @@ $script:LastEnd = -1.0
 $script:RelayStartedAt = Get-Date
 $script:SlateNoText = $false
 $script:DubPref = $null
+$script:DubChoice = $null   # (the voice-over a person picked this session; DubPref also holds automatic picks)
 $script:Paused = $false
 $script:PausedAt = 0.0
 $script:PauseMaxMinutes = 120.0
@@ -441,8 +442,10 @@ function Get-HelperDllName {
   return "helper-$h.dll"
 }
 
+$script:HelperOk = $null
 function Initialize-Helper {
   if ('VRCLinkMaker.ChildJob' -as [type]) { return $true }
+  if ($script:HelperOk -eq $false) { return $false }   # (failed once: compiling again would only cost seconds each time)
   try {
     [void][System.IO.Directory]::CreateDirectory($script:TempRoot)
     $dll = PathJoin $script:TempRoot (Get-HelperDllName)
@@ -450,7 +453,7 @@ function Initialize-Helper {
     try { Add-Type -TypeDefinition $script:HelperSource -OutputAssembly $dll -OutputType Library; Add-Type -Path $dll; return $true } catch {}
     Add-Type -TypeDefinition $script:HelperSource
     return $true
-  } catch { return $false }
+  } catch { $script:HelperOk = $false; return $false }
 }
 
 # Puts a started program into the job (see above).
@@ -460,6 +463,9 @@ function Add-ChildToJob($proc) {
 }
 
 function Start-Child($psi) {
+  # A program whose output is all read by the tool needs no console of its own (with some terminals it would get a
+  # window of its own otherwise).
+  if ($psi.RedirectStandardOutput -and $psi.RedirectStandardError) { $psi.CreateNoWindow = $true }
   $p = [System.Diagnostics.Process]::Start($psi)
   Add-ChildToJob $p
   return $p
@@ -956,6 +962,9 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
   # MediaMTX accepts an SRT (MPEG-TS) stream only if it finds the audio within its first 1 MB, and the first keyframe
   # (up to the buffer size) comes before it: above ~7 Mbps a one-second buffer made the VPS refuse the connection.
   if ([int]$buf.TrimEnd('k') -gt 5000 -and (Get-IngestFormat) -eq 'mpegts') { $buf = '5000k' }
+  # The colour tags the filters set (setparams), also told to the encoder: older ffmpeg builds don't pass them on.
+  $col = @()
+  if (-not $classic) { $col = @('-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv') }
   if ($venc -eq 'h264_nvenc') {
     $preset = 'p7'
     if ($script:NvTier -le 1) { $preset = 'p5' }
@@ -964,14 +973,14 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
     $a = @('-c:v', 'h264_nvenc', '-preset', $preset, '-tune', 'hq', '-profile:v', 'high', '-level:v', '4.1') + $rc + @('-bf', '0', '-g', "$g", '-no-scenecut', '1')
     if ($script:NvTier -ge 3) { $a += @('-multipass', 'fullres') }
     if ($script:NvTier -ge 2) { $a += @('-temporal-aq', '1') }
-    return $a
+    return $a + $col
   }
   if ($venc -eq 'h264_amf') {
     return @('-c:v', 'h264_amf', '-usage', 'transcoding', '-quality', 'quality', '-profile:v', 'high', '-rc', 'vbr_peak', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
-      '-bf', '0', '-g', "$g")
+      '-bf', '0', '-g', "$g") + $col
   }
   if ($venc -eq 'h264_qsv') {
-    return @('-c:v', 'h264_qsv', '-preset', 'medium', '-profile:v', 'high', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf, '-bf', '0', '-g', "$g")
+    return @('-c:v', 'h264_qsv', '-preset', 'medium', '-profile:v', 'high', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf, '-bf', '0', '-g', "$g") + $col
   }
   $preset = "$($script:Cfg.CpuPreset)"
   if ($script:CpuPreset) { $preset = $script:CpuPreset }
@@ -981,7 +990,7 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
   if ($null -eq $tune) { $tune = 'animation' }
   if ("$tune".Trim()) { $a += @('-tune', "$tune".Trim()) }
   return $a + @('-profile:v', 'high', '-level:v', '4.1', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
-    '-bf', '0', '-g', "$g", '-keyint_min', "$g", '-sc_threshold', '0')
+    '-bf', '0', '-g', "$g", '-keyint_min', "$g", '-sc_threshold', '0') + $col
 }
 
 # ------------------------------------------------------------------ media info + track choice
@@ -1495,10 +1504,17 @@ function Invoke-AddEntries([string[]]$entries, [string]$kind = '') {
 # Deletes an item's temporary folder (its download, subtitles, fonts). A download still running is stopped first and
 # given a moment to let go of its file; a folder that is still in use is tried again later (Remove-PendingDirs).
 $script:PendingDirs = New-Object System.Collections.ArrayList
+function Stop-ProcessTree($proc) {
+  try { [void](& taskkill.exe /T /F /PID $proc.Id 2>&1) } catch {}
+  try { if (-not $proc.HasExited) { $proc.Kill() } } catch {}
+  try { [void]$proc.WaitForExit(3000) } catch {}
+}
+
 function Remove-ItemFiles($item) {
   if ($item -and $item.JobDir) {
     if ($item.PSObject.Properties['Dl'] -and $item.Dl -and $item.Dl.Proc) {
-      try { if (-not $item.Dl.Proc.HasExited) { $item.Dl.Proc.Kill(); [void]$item.Dl.Proc.WaitForExit(3000) } } catch {}
+      # (The whole tree: yt-dlp's own ffmpeg would keep the files open.)
+      try { if (-not $item.Dl.Proc.HasExited) { Stop-ProcessTree $item.Dl.Proc } } catch {}
     }
     if ($script:JobLocks.ContainsKey($item.JobDir)) {
       try { $script:JobLocks[$item.JobDir].Dispose() } catch {}
@@ -2799,7 +2815,7 @@ function Get-NextCmd([string]$kind) {
     $c = $script:Cmds[0]
     $script:Cmds.RemoveAt(0)
     # The plain link put in again while paused: continue (the TV then shows the stream again, from live).
-    if ($c.Cmd -eq 'sync' -and $c.From -eq 'link' -and $kind -eq 'paused') { $c = [pscustomobject]@{ Cmd = 'resume'; Arg = $null; From = 'link'; At = $c.At } }
+    if ($c.Cmd -eq 'sync' -and $c.From -eq 'link' -and $c.Arg -eq 'plain' -and $kind -eq 'paused') { $c = [pscustomobject]@{ Cmd = 'resume'; Arg = $null; From = 'link'; At = $c.At } }
     if ($c.Cmd -in @('lost', 'sync', 'restart') -and $kind -ne 'content') { continue }   # only matter while a video plays
     $why = ''
     $r = Resolve-Cmd $c $kind ([ref]$why)
@@ -2826,6 +2842,7 @@ function Get-QueuedSeek {
 # Keys and the control window. Things that don't change the stream (open a window...) happen right here.
 function Receive-Commands([string]$kind) {
   Add-Cmd (Read-KeyCommand $kind)
+  try { Update-UpnpLeases } catch {}   # (also while waiting for input, not only while a video plays)
   if ($script:PanelShown) {
     for ($i = 0; $i -lt 20; $i++) {
       $p = $null
@@ -3046,6 +3063,7 @@ function Update-StreamQuality {
     # sharper than 1080p at 1350). "HeightPolicy": "exact" in config.json keeps the size as set.
     $need = 0
     foreach ($r in $script:Resolutions) { if ($r.H -ge $h) { $need = $r.Min; break } }
+    if ($need -eq 0 -and @($script:Resolutions).Count -gt 0) { $need = @($script:Resolutions)[-1].Min }   # (above the largest listed size)
     $auto = Get-AutoHeight (Get-KbpsCeiling)
     if ($need -gt 0 -and (Get-KbpsCeiling) -lt $need * (Get-FpsFactor) -and $auto -lt $h) { $script:HeightCappedFrom = $h; $h = $auto }
   }
@@ -3125,7 +3143,7 @@ $script:JoinGraceUntil = [datetime]::MinValue
 $script:VrcRunning = $false
 # The player here and our stream. State: none (not showing it), loading, playing, failed, stopped.
 $script:Vrc = [pscustomobject]@{ State = 'none'; LoadAt = [datetime]::MinValue; PlayAt = [datetime]::MinValue; FailAt = [datetime]::MinValue
-  PlayTs = $null; Opening = ''; Vp = ''; Sync = $null }   # Sync: ProTV's last periodic position report @{ Ts; X }
+  PlayTs = $null; Opening = ''; Vp = ''; Sync = @{} }   # Sync: per ProTV TV, its last periodic position report @{ Ts; X }
 $script:DriftResync = 8.0      # the player here this many seconds behind (froze): everyone reconnects (0 = off)
 $script:LostHandled = [datetime]::MinValue
 $script:LostMuted = $false
@@ -3292,7 +3310,7 @@ function Get-WorldPlayerCommand([string]$line) {
       $p = $script:Players[$ptv]
       if ($p) { $p.AutoPlayUntil = $now.AddSeconds(2.5) }
     }
-    if ($pmsg -match '^Livestream has stopped\.' -and (Test-OwnStreamUrl $v.Opening)) { $v.State = 'failed'; $v.FailAt = $now; $v.Sync = $null }
+    if ($pmsg -match '^Livestream has stopped\.' -and (Test-OwnStreamUrl $v.Opening)) { $v.State = 'failed'; $v.FailAt = $now; $v.Sync = @{} }
     # ProTV logs where its player is every 5 minutes. Less progress than the time that passed means the player here
     # froze for that long and is now that far behind the others (seen when the stream's H.264 header changed):
     # everyone reconnects to the live picture (Receive-WorldCommands, only while a video plays).
@@ -3300,13 +3318,14 @@ function Get-WorldPlayerCommand([string]$line) {
     if ($m.Success -and $ts -and $v.State -eq 'playing' -and (Test-OwnStreamUrl $v.Opening)) {
       $x = 0.0
       [void][double]::TryParse($m.Groups[1].Value, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$x)
-      $prev = $v.Sync
-      $v.Sync = @{ Ts = $ts; X = $x }
+      # (Per TV: a world can have several, each with its own clock.)
+      $prev = $v.Sync[$ptv]
+      $v.Sync[$ptv] = @{ Ts = $ts; X = $x }
       if ($prev -and -not $inGrace -and $script:DriftResync -gt 0) {
         $dt = ($ts - $prev.Ts).TotalSeconds
         $lag = $dt - ($x - $prev.X)
         if ($dt -ge 200 -and $dt -le 400 -and $x -gt $prev.X -and $lag -ge $script:DriftResync) {
-          $v.Sync = $null
+          $v.Sync = @{}
           $c = New-Cmd 'resync' $null 'player'
           $c | Add-Member -NotePropertyName Lag -NotePropertyValue $lag
           return $c
@@ -3359,7 +3378,7 @@ function Get-WorldPlayerCommand([string]$line) {
       # Every load of our stream is a new connection: the player shows it again only after this.
       $v.State = 'loading'
       $v.LoadAt = $now
-      $v.Sync = $null
+      $v.Sync = @{}
     }
     $same = ($url -eq $script:WorldUrl)
     $script:WorldUrl = $url
@@ -3371,7 +3390,7 @@ function Get-WorldPlayerCommand([string]$line) {
     if ($same -and -not $deliberate) { return $null }
     $c = Get-ControlLinkCommand $url
     # Our plain link loaded again: every player in the world reconnects, like &sync.
-    if (-not $c) { $c = New-Cmd 'sync' $null 'link' }
+    if (-not $c) { $c = New-Cmd 'sync' 'plain' 'link' }
     return $c
   }
 
@@ -3387,7 +3406,7 @@ function Get-WorldPlayerCommand([string]$line) {
   if (-not $ev) { return $null }
   $p = $script:Players[$player]
   if (-not $p -or -not (Test-OwnStreamUrl $p.Url)) { return $null }
-  $v.Sync = $null   # (a pause stops the player's clock on purpose)
+  $v.Sync = @{}   # (a pause stops the player's clock on purpose)
   if ($ev -eq 'stop') { $v.State = 'stopped' }
   if ($inGrace) { return $null }
   switch ($ev) {
@@ -3765,7 +3784,7 @@ function Invoke-Source {
       Receive-QueueFile
       Update-Prep
       if ($script:PendingDirs.Count -gt 0) { Remove-PendingDirs }
-      if ($script:UpnpAdded) { try { Update-UpnpLeases } catch {} }
+      try { Update-UpnpLeases } catch {}
       # (Finished background programs: their handles and output aren't needed any more.)
       for ($i = $script:BgProcs.Count - 1; $i -ge 0; $i--) { try { if ($script:BgProcs[$i].Proc.HasExited -and $script:BgProcs[$i].Out.IsCompleted) { $script:BgProcs.RemoveAt($i) } } catch {} }
     }

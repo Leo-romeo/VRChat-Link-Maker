@@ -4156,10 +4156,12 @@ function Select-SiteDub($names, [int]$defPos, [bool]$canAsk, [bool]$auto = $true
   if ($script:SiteChoice) { $want = $script:SiteChoice.Dub }
   if ($want) {
     $hit = Find-DubIndex $names $want
-    if ($hit -ge 0) { $pos = $hit }
+    if ($hit -ge 0) { $pos = $hit; $script:DubChoice = [string]$names[$hit] }
   } else {
-    $kept = (-not $auto) -or ($script:DubPref -and $defPos -ge 0 -and $defPos -lt $names.Count -and
-      ([string]$names[$defPos] -eq $script:DubPref -or (Test-SameDub ([string]$names[$defPos]) $script:DubPref)))
+    # Only a voice-over a person picked earlier (not an automatic pick, which the callers also remember in DubPref)
+    # beats DubPriority.
+    $kept = (-not $auto) -or ($script:DubChoice -and $defPos -ge 0 -and $defPos -lt $names.Count -and
+      ([string]$names[$defPos] -eq $script:DubChoice -or (Test-SameDub ([string]$names[$defPos]) $script:DubChoice)))
     $hit = -1
     if (-not $kept -and $names.Count -gt 1) { $hit = Find-PriorityDub $names }
     if ($hit -ge 0) { $pos = $hit }
@@ -4175,6 +4177,7 @@ function Select-SiteDub($names, [int]$defPos, [bool]$canAsk, [bool]$auto = $true
       }
       $pick = Read-Choice (T 'Which voice-over (or subtitles)? Preferred ones are at the top ("DubPriority" in config.json).') $labels 0 $false
       $pos = $order[$pick]
+      $script:DubChoice = [string]$names[$pos]
     }
   }
   $script:LastDub = [string]$names[$pos]
