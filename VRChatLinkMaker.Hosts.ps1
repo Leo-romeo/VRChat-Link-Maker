@@ -378,7 +378,8 @@ function Get-HostProfile([string]$id = '') {
         }
       }
       if ($useSrt) {
-        $p.IngestUrl = "srt://${h}:$srtPort" + "?streamid=publish:live/${tok}:${user}:${pass}&pkt_size=1316&passphrase=$(Get-Prop $v 'SrtPassphrase')&pbkeylen=32"
+        # latency (microseconds): SRT's 120 ms default leaves no time to resend a lost packet on a ~100 ms path.
+        $p.IngestUrl = "srt://${h}:$srtPort" + "?streamid=publish:live/${tok}:${user}:${pass}&pkt_size=1316&passphrase=$(Get-Prop $v 'SrtPassphrase')&pbkeylen=32&latency=400000"
         $p.IngestFormat = 'mpegts'
       } else {
         $p.IngestUrl = "rtmp://${h}:$rtmp/live/$tok" + '?user=' + [Uri]::EscapeDataString($user) + '&pass=' + [Uri]::EscapeDataString($pass)
@@ -1037,7 +1038,8 @@ function New-MediaMtxConfig([string]$mode, $s, [string]$bindHost = '') {
   $L.Add('logFile: mediamtx.log')
   $L.Add('readTimeout: 10s')
   $L.Add('writeTimeout: 10s')
-  $L.Add('writeQueueSize: 512')
+  # Counted in RTP packets per viewer: 512 (~700 KB) is less than one keyframe at 6+ Mbps, and the tail of it was dropped.
+  $L.Add('writeQueueSize: 4096')
   $L.Add('authMethod: internal')
   $L.Add('authInternalUsers:')
   if ($mode -eq 'pc') {

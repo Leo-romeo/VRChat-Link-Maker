@@ -953,6 +953,9 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
   $m = "$([int][Math]::Round($kbps * 1.06))k"
   $buf = "$($kbps)k"
   if (-not $classic) { $m = "$($cap)k"; $buf = "$($cap)k" }
+  # MediaMTX accepts an SRT (MPEG-TS) stream only if it finds the audio within its first 1 MB, and the first keyframe
+  # (up to the buffer size) comes before it: above ~7 Mbps a one-second buffer made the VPS refuse the connection.
+  if ([int]$buf.TrimEnd('k') -gt 5000 -and (Get-IngestFormat) -eq 'mpegts') { $buf = '5000k' }
   if ($venc -eq 'h264_nvenc') {
     $preset = 'p7'
     if ($script:NvTier -le 1) { $preset = 'p5' }
