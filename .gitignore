@@ -22,3 +22,15 @@ plan/
 
 # Built single-file releases (tools\Build-SingleFile.ps1)
 dist/
+
+# Keys, certificates and server files (MediaMTX/tests may drop them here)
+*.key
+*.crt
+*.pem
+*.pfx
+*.p12
+mediamtx.yml
+mediamtx.log
+*.log
+.env
+*.secret
