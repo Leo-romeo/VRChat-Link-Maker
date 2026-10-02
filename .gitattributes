@@ -4,3 +4,7 @@
 *.json text eol=crlf
 *.md   text eol=crlf
 *.sh   text eol=lf
+
+# Not part of the downloadable zip (what updates install)
+.gitignore     export-ignore
+.gitattributes export-ignore

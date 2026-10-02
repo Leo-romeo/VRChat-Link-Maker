@@ -1,11 +1,16 @@
 # Per-user runtime data (stream keys, tokens, passwords, IPs) - never commit
 config.json
 state.json
+queue.txt
 log.txt
 log-previous.txt
 log-*.txt
 Clipboard Text.txt
 vps-setup/
+
+# Left behind only if an update was interrupted
+*.update-new
+*.update-old
 
 # Downloaded on demand by the tool
 bin/

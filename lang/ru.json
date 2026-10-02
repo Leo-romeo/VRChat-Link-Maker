@@ -617,5 +617,18 @@
   "Where to stream (server)...": "Куда транслировать (сервер)...",
   "Picture size...": "Размер картинки...",
   "Upload speed test": "Проверить скорость отдачи",
-  "New link...": "Новая ссылка..."
+  "New link...": "Новая ссылка...",
+  "the download has no VRChatLinkMaker.ps1 in it": "в загрузке нет VRChatLinkMaker.ps1",
+  "{0} in the download has errors": "в загруженном {0} есть ошибки",
+  "Couldn't check for a new version: {0}": "Не удалось проверить, вышла ли новая версия: {0}",
+  "A new version is out: {0} (this one is {1}).": "Вышла новая версия: {0} (у вас {1}).",
+  "Update now? Your settings and your link stay as they are.": "Обновить сейчас? Настройки и ссылка останутся прежними.",
+  "Yes, update and restart": "Да, обновить и перезапустить",
+  "Not now": "Не сейчас",
+  "Skip this version": "Пропустить эту версию",
+  "OK, you won't be asked about {0} again.": "Хорошо, про {0} больше не спрошу.",
+  "Downloading {0}...": "Скачиваю {0}...",
+  "The update didn't work, so nothing was changed: {0}": "Обновить не получилось, поэтому ничего не изменено: {0}",
+  "Updated to {0}. Starting it...": "Обновлено до {0}. Запускаю...",
+  "Couldn't start the new version ({0}). Start the tool again.": "Не удалось запустить новую версию ({0}). Запустите программу заново."
 }

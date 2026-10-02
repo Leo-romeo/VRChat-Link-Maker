@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.0'
+$script:Version = '1.1'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -2001,6 +2001,10 @@ function Test-HostModule { return [bool](Get-Command Get-HostProfile -CommandTyp
 $script:PreviewFile = PathJoin $script:TempRoot 'preview.jpg'
 $script:PanelFile = PathJoin $script:ToolDir 'VRChatLinkMaker.Panel.ps1'
 if ([System.IO.File]::Exists($script:PanelFile)) { . $script:PanelFile }
+
+# Updates from GitHub (asked about at start). Optional: without the file there are none.
+$script:UpdateFile = PathJoin $script:ToolDir 'VRChatLinkMaker.Update.ps1'
+if ([System.IO.File]::Exists($script:UpdateFile)) { . $script:UpdateFile }
 
 # ------------------------------------------------------------------ preparing an item (probe, subtitles, downloads)
 $script:JobLocks = @{}
@@ -4616,6 +4620,7 @@ function Main {
     Select-Language
   }
   $script:Cfg = Get-Config
+  if ((Get-Command Invoke-UpdateCheck -CommandType Function -ErrorAction SilentlyContinue) -and (Invoke-UpdateCheck)) { return }
   if (Test-HostModule) {
     # Older config.json files get "Host" / "StreamKey" (same link as before) and the self-host settings.
     try { if (Initialize-HostConfig) { Save-Config $script:Cfg } } catch { Say (T 'Couldn''t update config.json: {0}' $_.Exception.Message) 'Yellow' }
@@ -4676,6 +4681,7 @@ try {
 } finally {
   Stop-Everything
 }
+if ($script:RestartAfterUpdate -and (Restart-AfterUpdate)) { exit 0 }
 if ($script:Interactive -and -not $script:NoPause) {
   Say ''
   [void](Read-Host (T 'Press Enter to close this window'))

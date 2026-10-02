@@ -302,6 +302,19 @@ set "_language" to the language's own name. It then shows up in the language
 menu. Anything left out stays in English.
 
 
+UPDATES
+-------
+New versions are published on github.com/Leo-romeo/VRChat-Link-Maker. Each
+time you start the tool it checks there (a second or less). When there is a
+newer version it shows what changed and asks: update now, not now, or skip
+that version. Updating downloads it, replaces the program files and starts
+again. Your config.json is never touched, so your link stays the same. If
+anything goes wrong, the old files are put back.
+To turn the check off, add  "Updates": "off"  to config.json.
+To install by hand, download the zip from the Releases page and copy its
+files over the old ones (config.json isn't in it).
+
+
 QUEST / ANDROID VIEWERS
 -----------------------
 The window shows a second link for Quest. The video player sends ONE link to
