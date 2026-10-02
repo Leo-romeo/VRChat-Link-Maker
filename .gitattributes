@@ -8,3 +8,4 @@
 # Not part of the downloadable zip (what updates install)
 .gitignore     export-ignore
 .gitattributes export-ignore
+tools/         export-ignore

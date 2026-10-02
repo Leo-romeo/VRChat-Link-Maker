@@ -19,3 +19,6 @@ bin/
 PLAN.md
 plan/
 .claude/
+
+# Built single-file releases (tools\Build-SingleFile.ps1)
+dist/
