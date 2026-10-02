@@ -1,0 +1,16 @@
+# Per-user runtime data (stream keys, tokens, passwords, IPs) - never commit
+config.json
+state.json
+log.txt
+log-previous.txt
+log-*.txt
+Clipboard Text.txt
+vps-setup/
+
+# Downloaded on demand by the tool
+bin/
+
+# Local dev notes and tooling
+PLAN.md
+plan/
+.claude/
