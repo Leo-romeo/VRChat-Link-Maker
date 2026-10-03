@@ -717,5 +717,19 @@
   "Downloading {0}...": "Скачиваю {0}...",
   "The update didn't work, so nothing was changed: {0}": "Обновить не получилось, поэтому ничего не изменено: {0}",
   "Updated to {0}. Starting it...": "Обновлено до {0}. Запускаю...",
-  "Couldn't start the new version ({0}). Start the tool again.": "Не удалось запустить новую версию ({0}). Запустите программу заново."
+  "Couldn't start the new version ({0}). Start the tool again.": "Не удалось запустить новую версию ({0}). Запустите программу заново.",
+  "  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter": "  - или вставьте ссылку (на видео, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) и нажмите Enter",
+  "Reading the AniLiberty release...": "Читаю релиз AniLiberty...",
+  "AniLiberty has no such release (check the link)": "на AniLiberty нет такого релиза (проверьте ссылку)",
+  "AniLiberty didn't answer ({0})": "AniLiberty не ответил ({0})",
+  "AniLiberty has taken this release down (the right holder asked, or it is blocked in your country)": "AniLiberty убрал этот релиз (по требованию правообладателя или он заблокирован в вашей стране)",
+  "AniLiberty hasn't put up any episodes of it yet": "AniLiberty пока не выложил ни одной серии",
+  "Found on AniLiberty: {0}": "Найдено на AniLiberty: {0}",
+  "Found on AniLiberty: {0} ({1} episodes)": "Найдено на AniLiberty: {0} (серий: {1})",
+  "Reading AnimeVost...": "Читаю AnimeVost...",
+  "AnimeVost has no such title (check the link)": "на AnimeVost нет такого тайтла (проверьте ссылку)",
+  "AnimeVost didn't answer ({0})": "AnimeVost не ответил ({0})",
+  "AnimeVost hasn't put up any episodes of it yet": "AnimeVost пока не выложил ни одной серии",
+  "Found on AnimeVost: {0}": "Найдено на AnimeVost: {0}",
+  "Found on AnimeVost: {0} ({1} episodes)": "Найдено на AnimeVost: {0} (серий: {1})"
 }

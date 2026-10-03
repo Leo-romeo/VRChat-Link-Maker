@@ -41,6 +41,10 @@ Paste a link to one of these like any other link:
 
   Dream Cast  https://dreamerscast.com/home/release/...   (the voice-over
                                                  team's own site: 1080p)
+  AniLiberty  https://anilibria.top/anime/releases/release/...   (AniLibria's
+                                                 own site: up to 1080p)
+  AnimeVost   https://animevost.org/tip/tv/...  (its own voice-overs, 720p
+                                                 where it has it, else 480p)
   AnimeGO     https://animego.me/anime/...      (a series or a movie page)
   AnimeLib    https://anilib.me/ru/anime/...    (also animelib.org links)
   WPARTY      https://wparty.net/s/...          (a room: it plays what the
@@ -89,13 +93,15 @@ SEARCHING BY TITLE
 If AnimeGO or AnimeLib don't open where you live, you don't need their links:
 just type a title (Russian or English) instead of a link and press Enter.
 
-- Results come from Dream Cast's catalogue (on top: its own voice-overs in
-  1080p), WPARTY's search (films, series and anime, from Kinopoisk),
-  Shikimori (anime) and AnimeLib.
+- Results come from WPARTY's search (films, series and anime, from
+  Kinopoisk), Shikimori (anime) and AnimeLib, then the catalogues of
+  AniLiberty, AnimeVost and Dream Cast (each with its own voice-over only).
+  If AniLiberty's or AnimeVost's main address doesn't answer, their other
+  addresses are tried.
 - Pick one, then the season / part, the voice-over (Enter = the preferred
   one) and the episodes.
-- It plays through Kodik, Dream Cast's site, CVH or Alloha (if those fail,
-  Collaps). When Kodik doesn't have a voice-over Alloha has (e.g. an official
+- It plays through Kodik, Dream Cast's site, AniLiberty's site (Kodik as
+  the backup), AnimeVost, CVH or Alloha (if those fail, Collaps). When Kodik doesn't have a voice-over Alloha has (e.g. an official
   dub), that one can be picked too.
 - This works on the start screen, while something streams, and in the search
   window that + opens (there you can "play now" or add to the queue).
@@ -423,7 +429,8 @@ All of these are optional.
               else English), "en" or "ru". See LANGUAGE above.
   Player      "ask" (the default: asks once per session), "auto" (always the
               sharpest), or one player first: "kodik", "aniboom", "sibnet",
-              "cvh", "collaps", "animelib", "alloha" or "dreamcast".
+              "cvh", "collaps", "animelib", "alloha", "dreamcast",
+              "aniliberty" or "animevost".
   DubPriority the preferred voice-overs, best first: listed at the top when
               it asks, and the first one is what Enter takes. Default:
               ["Dream Cast", "AniLibria", "official"] ("official" = any

@@ -46,6 +46,10 @@
 
   Dream Cast  https://dreamerscast.com/home/release/...   (собственный сайт
                                                  команды озвучки: 1080p)
+  AniLiberty  https://anilibria.top/anime/releases/release/...   (сайт
+                                                 AniLibria: до 1080p)
+  AnimeVost   https://animevost.org/tip/tv/...  (своя озвучка: 720p, где
+                                                 он есть, иначе 480p)
   AnimeGO     https://animego.me/anime/...      (страница сериала или фильма)
   AnimeLib    https://anilib.me/ru/anime/...    (ссылки animelib.org тоже подходят)
   WPARTY      https://wparty.net/s/...          (комната: играет то же, что в ней)
@@ -95,13 +99,14 @@
 Если AnimeGO или AnimeLib у вас не открываются, их ссылки не нужны: просто
 введите вместо ссылки название (по-русски или по-английски) и нажмите Enter.
 
-- Результаты берутся из каталога Dream Cast (вверху списка: их собственная
-  озвучка в 1080p), поиска WPARTY (фильмы, сериалы и аниме, с Kinopoisk),
-  Shikimori (аниме) и AnimeLib.
+- Результаты берутся из поиска WPARTY (фильмы, сериалы и аниме, с
+  Kinopoisk), Shikimori (аниме) и AnimeLib, затем из каталогов AniLiberty,
+  AnimeVost и Dream Cast (у каждого только своя озвучка). Если основной
+  адрес AniLiberty или AnimeVost не отвечает, пробуются их другие адреса.
 - Выберите нужное, затем сезон / часть, озвучку (Enter = приоритетная) и
   серии.
-- Видео играет через Kodik, сайт Dream Cast, CVH или Alloha (если не
-  получится — через Collaps). Если озвучка есть в Alloha, но не в Kodik
+- Видео играет через Kodik, сайт Dream Cast, сайт AniLiberty (запасной —
+  Kodik), AnimeVost, CVH или Alloha (если не получится — через Collaps). Если озвучка есть в Alloha, но не в Kodik
   (например, официальный дубляж), её тоже можно выбрать.
 - Искать можно на стартовом экране, во время трансляции и в окне поиска,
   которое открывается по + (там можно «включить сейчас» или добавить в очередь).
@@ -462,7 +467,7 @@ config.json. Экраны, которые видят зрители («Пауз�
   Player      "ask" (по умолчанию: спросить один раз за сеанс), "auto"
               (всегда самый чёткий) или один плеер в первую очередь:
               "kodik", "aniboom", "sibnet", "cvh", "collaps", "animelib",
-              "alloha" или "dreamcast".
+              "alloha", "dreamcast", "aniliberty" или "animevost".
   DubPriority приоритетные озвучки, лучшая первой: в вопросе они стоят в
               начале списка, а первую берёт просто Enter.
               По умолчанию ["Dream Cast", "AniLibria", "official"]

@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.3'
+$script:Version = '1.4'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -1449,7 +1449,7 @@ function Read-Entries {
   if (Get-Command Find-SiteContent -CommandType Function -ErrorAction SilentlyContinue) {
     Say (T '  - Type a title (anime, film, series - in Russian or English) and press Enter to search for it')
   }
-  Say (T '  - or paste a link (a video, Dream Cast, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
+  Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
   Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
   Say (T '  - or just press Enter to pick files')
   if (Test-HasTranslations) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
@@ -1597,7 +1597,7 @@ function Invoke-Web {
     }
   }
   if ($ContentType) { $req.ContentType = $ContentType }
-  if ($null -ne $Body -and $Method -ne 'GET') {
+  if ($null -ne $Body -and $Method -ne 'GET' -and $Method -ne 'HEAD') {   # ([string] makes a missing body '', not `$null)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
     $req.ContentLength = $bytes.Length
     $rs = $req.GetRequestStream()
@@ -1815,7 +1815,7 @@ function Read-EpisodeSelection($list, [int]$defPos) {
 # ------------------------------------------------------------------ which player (Kodik, AniBoom, ...) a web video comes from
 # "Player" in config.json: "ask" (the default: asked once per session, the first time there is a choice), "auto" (the
 # players that have the chosen voice-over are all checked and the sharpest real picture wins), or a player's name
-# (kodik, aniboom, cvh, sibnet, collaps, animelib, alloha, dreamcast: that one first). The answer holds for the whole session.
+# (kodik, aniboom, cvh, sibnet, collaps, animelib, alloha, dreamcast, aniliberty, animevost: that one first). The answer holds for the whole session.
 $script:PlayerPref = $null
 $script:AutoWinner = $null   # the player "auto" picked last (for videos that aren't part of a show)
 $script:ShowWinners = @{}    # show -> the player "auto" picked for it ('' = nothing to compare): its next episodes try it first
@@ -1829,6 +1829,8 @@ function Get-ShowKey($item) {
     'animego' { return "ag:$($s.AnimeId):$($s.DubName)" }
     'animelib' { return "al:$($s.Sid):$(@($s.Names)[0]):$($s.DubName)" }
     'shikimori' { return "sh:$($s.Sid):$($s.DubName)" }
+    # A release with its own player and a backup (AniLiberty: its HLS + Kodik): one show per release.
+    'player' { if (@($s.Cands).Count -gt 1) { return "pl:$($item.Source -replace '#.*$', ''):$(@($s.Cands)[0].Dub)" } }
   }
   return $null
 }

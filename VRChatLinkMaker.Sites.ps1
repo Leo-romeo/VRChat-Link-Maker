@@ -3972,6 +3972,364 @@ function ConvertFrom-KodikPartTitle([string]$t) {
   return ($base + ' ' + $m.Groups[1].Value)
 }
 
+# ------------------------------------------------------------------ APIs with several addresses (mirrors)
+# One API call on a list of hosts: the one that answered last first, then the others in order. A host counts as
+# answering when it sends JSON (404 included: the host works, the thing isn't there). $state: a hashtable that keeps
+# .Good (the host that answered last). $skip: a host already tried. Returns Invoke-Web's answer; throws when none answers.
+function Invoke-MirrorApi($hosts, $state, [string]$path, [string]$method = 'GET', [string]$body = $null, [int]$timeoutSec = 15, [string]$skip = $null) {
+  $list = @($hosts)
+  if ($state.Good) { $list = @($state.Good) + @($list | Where-Object { $_ -ne $state.Good }) }
+  if ($skip) { $list = @($list | Where-Object { $_ -ne $skip }) }
+  $last = 'no address to try'
+  foreach ($h in $list) {
+    try {
+      $q = @{ Url = $h + $path; Method = $method; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $timeoutSec }
+      if ($method -ne 'GET') { $q.Body = $body; $q.ContentType = 'application/x-www-form-urlencoded; charset=UTF-8' }
+      $r = Invoke-Web @q
+      $t = ([string]$r.Text).TrimStart()
+      if (($r.Status -eq 200 -or $r.Status -eq 404) -and ($t.StartsWith('{') -or $t.StartsWith('['))) { $state.Good = $h; return $r }
+      $last = "HTTP $($r.Status)"
+    } catch { $e = $_.Exception; if ($e.InnerException) { $e = $e.InnerException }; $last = $e.Message }
+  }
+  throw $last
+}
+
+function Get-MirrorHost($hosts, $state) { if ($state.Good) { return $state.Good }; return @($hosts)[0] }
+
+# A JSON answer that is a list -> that list, kept whole (returned as is, PowerShell would turn a list of one into the
+# item and an empty one into $null). $null when the answer isn't a list.
+function ConvertFrom-JsonList([string]$text) {
+  $t = ([string]$text).Trim()
+  if (-not $t.StartsWith('[')) { return $null }
+  $j = ConvertFrom-JsonDict ('{"list":' + $t + '}')
+  if ($j -isnot [System.Collections.IDictionary]) { return $null }
+  return , @($j['list'])
+}
+
+# Search rows of one source, closest titles first: the same title, then one starting with what was typed, then one
+# containing it, then the rest; shorter before longer, else the source's order.
+function Sort-SearchRows($rows, [string]$query) {
+  $qk = ConvertTo-SearchKey $query
+  $scored = @()
+  foreach ($r in @($rows)) {
+    $score = 3
+    foreach ($k in @($r.Names | ForEach-Object { ConvertTo-SearchKey $_ })) {
+      if (-not $k -or -not $qk) { continue }
+      if ($k -eq $qk) { $score = [Math]::Min($score, 0) } elseif ($k.StartsWith($qk)) { $score = [Math]::Min($score, 1) } elseif ($k.Contains($qk)) { $score = [Math]::Min($score, 2) }
+    }
+    $scored += [pscustomobject]@{ Row = $r; Score = $score; Len = (ConvertTo-SearchKey ([string]$r.Title)).Length; Pos = $scored.Count }
+  }
+  return @($scored | Sort-Object Score, Len, Pos | ForEach-Object { $_.Row })
+}
+
+# ==================================================================================================
+# AniLiberty (the former AniLibria): its own voice-overs, HLS up to 1080p, a free JSON API (checked 2026-10-03)
+# ==================================================================================================
+# Search   GET <api>/api/v1/app/search/releases?query=<text>  -> [{id, alias, year, type{value: TV|MOVIE|...},
+#            name{main (Russian), english}, episodes_total (null = only announced), is_ongoing, shikimori{id}}]
+#            (every hit: there is no limit parameter)
+# Release  GET <api>/api/v1/anime/releases/<alias or id>  -> {id, alias, name, year, is_blocked_by_geo,
+#            is_blocked_by_copyrights, external_player ("//aniqit.com/serial/..." = the same release on Kodik),
+#            shikimori{id}, episodes:[{ordinal, name, duration (s), hls_480, hls_720, hls_1080}]}
+#   Each hls_* is one quality's playlist (H.264 + AAC in MPEG-TS, 23.976 fps) on cache.libria.fun; no Referer, cookies
+#   or tokens needed. The "isWithVideoAds" in their query adds nothing to the playlist (no ad segments, checked).
+# The release link the tool hands out (search rows) and understands: https://anilibria.top/anime/releases/release/<alias>
+# (aniliberty.top, the old anilibria.tv/release/<alias>.html links too). The API answers on all three hosts below.
+$script:AnilibertyHosts = @('https://anilibria.top', 'https://aniliberty.top', 'https://api.anilibria.app')
+$script:AnilibertyState = @{ Good = $null }
+$script:AnilibertySite = 'https://anilibria.top'
+$script:AnilibertyReleases = @{}   # alias -> @{ At; Release } (read this session, kept 30 minutes)
+$script:AnilibertyLinkRe = '^(?i)https?://(?:www\.)?(?:anilibria\.(?:top|tv|wtf)|aniliberty\.top)/(?:anime/releases/release|release)/([a-z0-9][a-z0-9-]*)'
+
+function Test-AnilibertyUrl([string]$u) { return ([string]$u -match $script:AnilibertyLinkRe) }
+
+# One release: Id, Alias, Url, Title, English, Year, ShikiId, Kodik (the same release on Kodik, '' when none), Blocked,
+# Episodes (Number, Title, Url = the playlist of the quality that fits best now, Hls = height -> playlist, Duration).
+function Get-AnilibertyRelease([string]$alias) {
+  $alias = $alias.ToLowerInvariant()
+  $hit = $script:AnilibertyReleases[$alias]
+  if ($hit -and ((Get-Date) - $hit.At).TotalMinutes -lt 30) { return $hit.Release }
+  $r = Invoke-MirrorApi $script:AnilibertyHosts $script:AnilibertyState ('/api/v1/anime/releases/' + [Uri]::EscapeDataString($alias)) 'GET' $null 20
+  if ($r.Status -eq 404) { throw 'AniLiberty: 404 (no such release)' }
+  $j = ConvertFrom-JsonDict $r.Text
+  if ($j -isnot [System.Collections.IDictionary]) { throw 'AniLiberty: unexpected answer' }
+  $title = ''; $eng = ''
+  $name = $j['name']
+  if ($name -is [System.Collections.IDictionary]) { $title = ([string]$name['main']).Trim(); $eng = ([string]$name['english']).Trim() }
+  $sid = ''
+  if ($j['shikimori'] -is [System.Collections.IDictionary]) { $sid = [string]$j['shikimori']['id'] }
+  $kodik = ''
+  $ext = ([string]$j['external_player']).Trim()
+  if ($ext.StartsWith('//')) { $ext = 'https:' + $ext }
+  if ($ext -and (Test-KodikUrl $ext)) { $kodik = $ext }
+  $eps = New-Object System.Collections.ArrayList
+  foreach ($e in @($j['episodes'])) {
+    if ($e -isnot [System.Collections.IDictionary]) { continue }
+    $hls = @{}
+    foreach ($h in @(480, 720, 1080)) { $u = [string]$e["hls_$h"]; if ($u -match '^https://') { $hls[$h] = $u } }
+    if ($hls.Count -eq 0) { continue }
+    $num = [string]$e['ordinal']   # 1, 2, ... (12.5 for a recap between two episodes)
+    if ($num -notmatch '^\d+(\.\d+)?$') { $num = [string]($eps.Count + 1) }
+    $dur = 0.0
+    try { $dur = [double]$e['duration'] } catch {}
+    [void]$eps.Add([pscustomobject]@{ Number = $num; Title = ([string]$e['name']).Trim(); Hls = $hls; Url = (Select-AnilibertyHls $hls (Get-QualityCap)); Duration = $dur })
+  }
+  $rel = [pscustomobject]@{
+    Id = [string]$j['id']; Alias = $alias; Url = ($script:AnilibertySite + '/anime/releases/release/' + $alias)
+    Title = $title; English = $eng; Year = [string]$j['year']; ShikiId = $sid; Kodik = $kodik
+    Blocked = ([bool]$j['is_blocked_by_geo'] -or [bool]$j['is_blocked_by_copyrights']); Episodes = $eps.ToArray()
+  }
+  $script:AnilibertyReleases[$alias] = @{ At = (Get-Date); Release = $rel }
+  return $rel
+}
+
+# The playlist to fetch: the tallest one not taller than $cap, else the smallest there is.
+function Select-AnilibertyHls($hls, [int]$cap) {
+  foreach ($h in @(1080, 720, 480)) { if ($h -le $cap -and $hls.ContainsKey($h)) { return $hls[$h] } }
+  foreach ($h in @(480, 720, 1080)) { if ($hls.ContainsKey($h)) { return $hls[$h] } }
+  return $null
+}
+
+function Expand-Aniliberty([string]$u) {
+  $canAsk = Test-CanAsk
+  $alias = [regex]::Match($u, $script:AnilibertyLinkRe).Groups[1].Value
+  if ($canAsk) { Say (T 'Reading the AniLiberty release...') 'Gray' }
+  $r = $null
+  try { $r = Get-AnilibertyRelease $alias }
+  catch {
+    if ($_.Exception.Message -match '404') { throw (T 'AniLiberty has no such release (check the link)') }
+    throw (T 'AniLiberty didn''t answer ({0})' (Get-ShortText $_.Exception.Message 100))
+  }
+  if ($r.Blocked) { throw (T 'AniLiberty has taken this release down (the right holder asked, or it is blocked in your country)') }
+  $eps = @($r.Episodes)
+  if ($eps.Count -eq 0) { throw (T 'AniLiberty hasn''t put up any episodes of it yet') }
+  $title = $r.Title
+  if (-not $title) { $title = $r.English }
+  if (-not $title) { $title = "AniLiberty $($r.Alias)" }
+  if ($canAsk) {
+    Say ''
+    if ($eps.Count -eq 1) { Say (T 'Found on AniLiberty: {0}' $title) 'White' } else { Say (T 'Found on AniLiberty: {0} ({1} episodes)' $title $eps.Count) 'White' }
+  }
+  $startPos = 0
+  $want = [regex]::Match($u, '#episode=([\d.]+)')
+  if ($want.Success) { for ($i = 0; $i -lt $eps.Count; $i++) { if ($eps[$i].Number -eq $want.Groups[1].Value) { $startPos = $i } } }
+  $list = @(Select-SiteEpisodes $eps $startPos $canAsk)
+  $kodikSerial = ($r.Kodik -match '(?i)//[^/]+/serial/')
+  $items = New-Object System.Collections.ArrayList
+  foreach ($e in $list) {
+    $c = New-Cand 'aniliberty' $e.Url '' 'AniLibria'
+    $c | Add-Member -NotePropertyName Hls -NotePropertyValue $e.Hls
+    $c | Add-Member -NotePropertyName Duration -NotePropertyValue $e.Duration
+    $cands = @($c)
+    # The same release on Kodik (AniLiberty names it itself): a backup when its own server doesn't answer.
+    if ($r.Kodik -and $kodikSerial -and $e.Number -match '^\d+$') {
+      $k = New-Cand 'kodik' $r.Kodik '' 'AniLibria'
+      $k.Episode = [int]$e.Number
+      $cands += $k
+    } elseif ($r.Kodik -and -not $kodikSerial -and $eps.Count -eq 1) {
+      $cands += (New-Cand 'kodik' $r.Kodik '' 'AniLibria')
+    }
+    $site = [pscustomobject]@{ Type = 'player'; Cands = $cands }
+    $name = $title
+    if ($eps.Count -gt 1) { $name = (T '{0} - episode {1}' $title $e.Number) }
+    [void]$items.Add((New-SiteItem ($r.Url + '#episode=' + $e.Number) $name $site))
+  }
+  if ($script:SiteChoice -and $items.Count -gt 0) { $items[0].ResumeAt = $script:SiteChoice.Start }
+  return $items.ToArray()
+}
+
+function Get-AnilibertySearchRequest([string]$query, [int]$timeoutSec) {
+  return @{ Url = (Get-MirrorHost $script:AnilibertyHosts $script:AnilibertyState) + (Get-AnilibertySearchPath $query); Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $timeoutSec }
+}
+
+function Get-AnilibertySearchPath([string]$query) { return '/api/v1/app/search/releases?query=' + [Uri]::EscapeDataString($query) }
+
+function ConvertFrom-AnilibertySearch([string]$text, [string]$query) {
+  $d = ConvertFrom-JsonList $text
+  if ($null -eq $d) {
+    $j = ConvertFrom-JsonDict $text
+    if ($j -isnot [System.Collections.IDictionary] -or -not $j.ContainsKey('data')) { throw 'bad answer' }
+    $d = @($j['data'])
+  }
+  $rows = @()
+  foreach ($x in $d) {
+    if ($x -isnot [System.Collections.IDictionary]) { continue }
+    $alias = ([string]$x['alias']).ToLowerInvariant()
+    if ($alias -notmatch '^[a-z0-9][a-z0-9-]*$') { continue }
+    $total = $x['episodes_total']
+    if ($null -eq $total -and -not $x['is_ongoing']) { continue }   # only announced: nothing to watch yet
+    $rus = ''; $eng = ''
+    if ($x['name'] -is [System.Collections.IDictionary]) { $rus = ([string]$x['name']['main']).Trim(); $eng = ([string]$x['name']['english']).Trim() }
+    $title = $rus; if (-not $title) { $title = $eng }
+    if (-not $title) { continue }
+    $type = ''
+    if ($x['type'] -is [System.Collections.IDictionary]) { $type = [string]$x['type']['value'] }
+    $kind = $type
+    if ($type -eq 'TV') { $kind = T 'series' } elseif ($type -eq 'MOVIE') { $kind = T 'film' } elseif ($type -match '(?i)special') { $kind = T 'special' }
+    $n = ConvertTo-KodikInt $total
+    $extra = ''
+    if ($n -gt 1) { $extra = T '{0} ep.' $n }
+    $r = New-SearchRow 'aniliberty' $alias $title ([string]$x['year']) $kind $extra ($script:AnilibertySite + '/anime/releases/release/' + $alias) @($rus, $eng)
+    if ($x['shikimori'] -is [System.Collections.IDictionary]) { $sid = [string]$x['shikimori']['id']; if ($sid -match '^\d+$') { $r.ShikiId = $sid } }
+    $rows += $r
+  }
+  return @(Sort-SearchRows $rows $query)
+}
+
+# ==================================================================================================
+# AnimeVost: its own voice-overs, plain MP4 files, a free JSON API (checked 2026-10-03)
+# ==================================================================================================
+# Search    POST <api>/v1/search    form name=<text>  -> {state, data:[{id, title ("Russian / English [1-24 of 24]",
+#             in Russian), year (text), type ("TV" in Russian, "OVA", ...)}]}; nothing found = HTTP 404 {"error": ...}
+# Info      POST <api>/v1/info      form id=<id>      -> the same shape, one item
+# Playlist  POST <api>/v1/playlist  form id=<id>      -> [{name ("1 seriya" in Russian), hd, std, preview}]
+#   hd (http://video.animetop.info/720/<file>.mp4) is listed for every episode but not always there (404): then std
+#   (http://video.animetop.info/<file>.mp4, 480p). Plain files: Range requests work, no headers needed.
+# The link the tool hands out and understands: https://animevost.org/tip/tv/<id>-<slug>.html
+$script:AnimevostHosts = @('https://api.animetop.info', 'https://api.animevost.org')
+$script:AnimevostState = @{ Good = $null }
+$script:AnimevostSite = 'https://animevost.org'
+$script:AnimevostLinkRe = '^(?i)https?://(?:www\.)?(?:animevost\.(?:org|am)|v\d+\.vost\.pw)/tip/[a-z-]+/(\d+)-'
+
+function Test-AnimevostUrl([string]$u) { return ([string]$u -match $script:AnimevostLinkRe) }
+
+# "Naruto (Russian) / Naruto [1-220 of 220]" -> Rus, Eng, Out (episodes out), All (planned, 0 = not said)
+function Split-AnimevostTitle([string]$t) {
+  $t = ([string]$t).Trim()
+  $out = 0; $all = 0
+  $m = [regex]::Match($t, '\s*\[([^\]]*)\]\s*$')
+  if ($m.Success) {
+    $t = $t.Remove($m.Index).Trim()
+    $b = $m.Groups[1].Value
+    $nums = @([regex]::Matches($b, '\d+') | ForEach-Object { [int]$_.Value })
+    $o = 0; if ($b -match '^\s*\d+\s*-\s*\d+') { $o = 1 }   # "1-12 of 24": 12 out; "1 of 12": 1 out
+    if ($nums.Count -gt $o) { $out = $nums[$o] }
+    if ($nums.Count -gt $o + 1) { $all = $nums[$o + 1] }
+  }
+  $rus = $t; $eng = ''
+  $i = $t.IndexOf(' / ')
+  if ($i -gt 0) { $rus = $t.Substring(0, $i).Trim(); $eng = $t.Substring($i + 3).Trim() }
+  return [pscustomobject]@{ Rus = $rus; Eng = $eng; Out = $out; All = $all }
+}
+
+function Get-AnimevostLink([string]$id, [string]$eng) {
+  $slug = ([regex]::Replace(([string]$eng).ToLowerInvariant(), '[^a-z0-9]+', '-')).Trim('-')
+  if ($slug.Length -gt 60) { $slug = $slug.Substring(0, 60).Trim('-') }
+  if (-not $slug) { $slug = 'anime' }
+  return $script:AnimevostSite + '/tip/tv/' + $id + '-' + $slug + '.html'
+}
+
+function Get-AnimevostSearchRequest([string]$query, [int]$timeoutSec) {
+  return @{ Url = (Get-MirrorHost $script:AnimevostHosts $script:AnimevostState) + '/v1/search'; Method = 'POST'; Body = ('name=' + [Uri]::EscapeDataString($query))
+    ContentType = 'application/x-www-form-urlencoded; charset=UTF-8'; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $timeoutSec }
+}
+
+function ConvertFrom-AnimevostSearch([string]$text, [string]$query) {
+  $j = ConvertFrom-JsonDict $text
+  if ($j -isnot [System.Collections.IDictionary]) { throw 'bad answer' }
+  if (-not $j.ContainsKey('data')) { if ($j.ContainsKey('error')) { return @() }; throw 'bad answer' }   # (nothing found)
+  $tv = [string][char]0x0422 + [char]0x0412   # "TV" in Russian
+  $rows = @()
+  foreach ($x in @($j['data'])) {
+    if ($x -isnot [System.Collections.IDictionary]) { continue }
+    $id = [string]$x['id']
+    if ($id -notmatch '^\d+$') { continue }
+    $t = Split-AnimevostTitle ([string]$x['title'])
+    $title = $t.Rus; if (-not $title) { $title = $t.Eng }
+    if (-not $title) { continue }
+    $type = ([string]$x['type']).Trim()
+    $kind = $type
+    if ($type -eq $tv -or $type -eq 'TV') { $kind = T 'series' } elseif ($type -match '(?i)special') { $kind = T 'special' }
+    $extra = ''
+    if ($t.All -gt $t.Out -and $t.Out -gt 0) { $extra = T '{0} of {1} ep.' $t.Out $t.All } elseif ($t.Out -gt 1) { $extra = T '{0} ep.' $t.Out }
+    $rows += New-SearchRow 'animevost' $id $title ([string]$x['year']) $kind $extra (Get-AnimevostLink $id $t.Eng) @($t.Rus, $t.Eng)
+  }
+  return @(Sort-SearchRows $rows $query)
+}
+
+# One title: Id, Title, Episodes (Number, Title, Hd, Std), in episode order.
+function Get-AnimevostRelease([string]$id) {
+  $info = Invoke-MirrorApi $script:AnimevostHosts $script:AnimevostState '/v1/info' 'POST' ('id=' + $id) 15
+  $title = ''
+  if ($info.Status -eq 200) {
+    $j = ConvertFrom-JsonDict $info.Text
+    if ($j -is [System.Collections.IDictionary] -and $j['data']) {
+      $x = @($j['data'])[0]
+      if ($x -is [System.Collections.IDictionary]) { $t = Split-AnimevostTitle ([string]$x['title']); $title = $t.Rus; if (-not $title) { $title = $t.Eng } }
+    }
+  }
+  $pl = Invoke-MirrorApi $script:AnimevostHosts $script:AnimevostState '/v1/playlist' 'POST' ('id=' + $id) 15
+  if ($pl.Status -eq 404) { throw 'AnimeVost: 404 (no such title)' }
+  $d = ConvertFrom-JsonList $pl.Text
+  if ($null -eq $d) { throw 'AnimeVost: unexpected answer' }
+  $eps = @()
+  foreach ($e in $d) {
+    if ($e -isnot [System.Collections.IDictionary]) { continue }
+    $hd = [string]$e['hd']; $std = [string]$e['std']
+    if ($hd -notmatch '^https?://') { $hd = '' }
+    if ($std -notmatch '^https?://') { $std = '' }
+    if (-not $hd -and -not $std) { continue }
+    $nm = ([string]$e['name']).Trim()
+    $m = [regex]::Match($nm, '^\s*(\d+)')
+    $n = 0; if ($m.Success) { $n = [int]$m.Groups[1].Value }
+    $eps += [pscustomobject]@{ N = $n; Pos = $eps.Count; Title = $nm; Hd = $hd; Std = $std }
+  }
+  # Numbered episodes in order, then the rest (an OVA, a film) as listed; Number = the episode's own number when it has
+  # one, else its place in the list.
+  $sorted = @(@($eps | Where-Object { $_.N -gt 0 } | Sort-Object N, Pos) + @($eps | Where-Object { $_.N -le 0 } | Sort-Object Pos))
+  $out = New-Object System.Collections.ArrayList
+  $used = @{}
+  foreach ($e in $sorted) {
+    $num = [string]$e.N
+    if ($e.N -le 0 -or $used.ContainsKey($num)) { $k = $out.Count + 1; while ($used.ContainsKey([string]$k)) { $k++ }; $num = [string]$k }
+    $used[$num] = $true
+    [void]$out.Add([pscustomobject]@{ Number = $num; Title = $e.Title; Hd = $e.Hd; Std = $e.Std })
+  }
+  return [pscustomobject]@{ Id = $id; Title = $title; Episodes = $out.ToArray() }
+}
+
+function Expand-Animevost([string]$u) {
+  $canAsk = Test-CanAsk
+  $id = [regex]::Match($u, $script:AnimevostLinkRe).Groups[1].Value
+  if ($canAsk) { Say (T 'Reading AnimeVost...') 'Gray' }
+  $r = $null
+  try { $r = Get-AnimevostRelease $id }
+  catch {
+    if ($_.Exception.Message -match '404') { throw (T 'AnimeVost has no such title (check the link)') }
+    throw (T 'AnimeVost didn''t answer ({0})' (Get-ShortText $_.Exception.Message 100))
+  }
+  $eps = @($r.Episodes)
+  if ($eps.Count -eq 0) { throw (T 'AnimeVost hasn''t put up any episodes of it yet') }
+  $title = $r.Title
+  if (-not $title) { $title = "AnimeVost $id" }
+  if ($canAsk) {
+    Say ''
+    if ($eps.Count -eq 1) { Say (T 'Found on AnimeVost: {0}' $title) 'White' } else { Say (T 'Found on AnimeVost: {0} ({1} episodes)' $title $eps.Count) 'White' }
+  }
+  $startPos = 0
+  $want = [regex]::Match($u, '#episode=(\d+)')
+  if ($want.Success) { for ($i = 0; $i -lt $eps.Count; $i++) { if ($eps[$i].Number -eq $want.Groups[1].Value) { $startPos = $i } } }
+  $list = @(Select-SiteEpisodes $eps $startPos $canAsk)
+  $base = $script:AnimevostSite + '/tip/tv/' + $id + '-anime.html'   # (the same key whichever link form was given)
+  $items = New-Object System.Collections.ArrayList
+  foreach ($e in $list) {
+    $url = $e.Hd; if (-not $url) { $url = $e.Std }
+    $c = New-Cand 'animevost' $url '' 'AnimeVost'
+    $c | Add-Member -NotePropertyName Std -NotePropertyValue $e.Std
+    $site = [pscustomobject]@{ Type = 'player'; Cands = @($c) }
+    $name = $title
+    if ($eps.Count -gt 1) { $name = (T '{0} - episode {1}' $title $e.Number) }
+    [void]$items.Add((New-SiteItem ($base + '#episode=' + $e.Number) $name $site))
+  }
+  if ($script:SiteChoice -and $items.Count -gt 0) { $items[0].ResumeAt = $script:SiteChoice.Start }
+  return $items.ToArray()
+}
+
+# Is a file there? (HEAD, so nothing is downloaded.) $false when it isn't or the server doesn't answer.
+function Test-WebFileThere([string]$url) {
+  try { $r = Invoke-Web -Url $url -Method 'HEAD' -TimeoutSec 8; return ($r.Status -eq 200 -or $r.Status -eq 206) } catch { return $false }
+}
+
 # ==================================================================================================
 # Glue: links -> queue items -> possible sources -> a stream ffmpeg can open
 # ==================================================================================================
@@ -3979,8 +4337,8 @@ function ConvertFrom-KodikPartTitle([string]$t) {
 # that could play it, best first) when it is prepared. Start-NextSource in VRChatLinkMaker.ps1 tries them in
 # order with Resolve-Candidate until one works.
 
-$script:ProviderRank = @{ 'dreamcast' = 0; 'kodik' = 1; 'alloha' = 1; 'cvh' = 2; 'aniboom' = 3; 'sibnet' = 4 }
-$script:ProviderNames = @{ 'kodik' = 'Kodik'; 'aniboom' = 'AniBoom'; 'cvh' = 'CVH'; 'sibnet' = 'Sibnet'; 'alloha' = 'Alloha'; 'collaps' = 'Collaps'; 'animelib' = 'AnimeLib'; 'dreamcast' = 'Dream Cast' }
+$script:ProviderRank = @{ 'dreamcast' = 0; 'kodik' = 1; 'alloha' = 1; 'aniliberty' = 1; 'cvh' = 2; 'aniboom' = 3; 'animevost' = 3; 'sibnet' = 4 }
+$script:ProviderNames = @{ 'kodik' = 'Kodik'; 'aniboom' = 'AniBoom'; 'cvh' = 'CVH'; 'sibnet' = 'Sibnet'; 'alloha' = 'Alloha'; 'collaps' = 'Collaps'; 'animelib' = 'AnimeLib'; 'dreamcast' = 'Dream Cast'; 'aniliberty' = 'AniLiberty'; 'animevost' = 'AnimeVost' }
 
 function Get-ProviderRank([string]$p) { if ($script:ProviderRank.ContainsKey($p)) { return $script:ProviderRank[$p] } return 99 }
 function Get-ProviderTitle([string]$p) { if ($script:ProviderNames.ContainsKey($p)) { return $script:ProviderNames[$p] } return $p }
@@ -3989,6 +4347,8 @@ function Test-SiteLink([string]$u) {
   $u = (Split-SiteChoice $u)[0]
   if ($u -match '^(?i)https?://(?:www\.)?animego\.[a-z]{2,10}/anime/') { return $true }
   if (Test-DreamcastUrl $u) { return $true }
+  if (Test-AnilibertyUrl $u) { return $true }
+  if (Test-AnimevostUrl $u) { return $true }
   if (Test-AnimelibUrl $u) { return $true }
   if (Test-WpartyUrl $u) { return $true }
   if (Test-KodikUrl $u) { return $true }
@@ -4225,6 +4585,8 @@ function Expand-SiteLinkNow([string]$u) {
   if ($u -match $script:ShikimoriLinkRe) { return @(Expand-Shikimori $u) }
   if ($u -match '^(?i)https?://(?:www\.)?animego\.') { return @(Expand-Animego $u) }
   if (Test-DreamcastUrl $u) { return @(Expand-Dreamcast $u) }
+  if (Test-AnilibertyUrl $u) { return @(Expand-Aniliberty $u) }
+  if (Test-AnimevostUrl $u) { return @(Expand-Animevost $u) }
   if (Test-AnimelibUrl $u) { return @(Expand-Animelib $u) }
   if (Test-WpartyUrl $u) { return @(Expand-Wparty $u) }
   if ((Test-KodikUrl $u) -and $u -match '(?i)/serial/') { return @(Expand-KodikSerial $u) }
@@ -4658,11 +5020,13 @@ function Expand-KodikSerial([string]$u) {
 #   https://www.kinopoisk.ru/series/<kpId>/?name=<title>  -> WPARTY movieCheck -> Kodik (season/part, voice-over, episodes), else Collaps
 #   https://shikimori.io/animes/<id>?name=<title>         -> Kodik by Shikimori id
 #   https://anilib.me/ru/anime/<slug_url>                 -> Expand-Animelib (it only uses the API, never the page)
+# AniLiberty, AnimeVost and Dream Cast (see their sections) search their own catalogues; their rows play only their own
+# voice-over, so they are listed apart (after the others) and never merged with them.
 $script:ShikimoriBase = 'https://shikimori.io'
 $script:SearchTimeoutSec = 10
-$script:SearchMaxRows = 16
-$script:SearchQuota = @{ 'dreamcast' = 3; 'wparty' = 10; 'shikimori' = 3; 'animelib' = 2 }   # rows per source before the rest fills up
-$script:SearchSourceNames = @{ 'dreamcast' = 'Dream Cast'; 'wparty' = 'WPARTY'; 'shikimori' = 'Shikimori'; 'animelib' = 'AnimeLib' }
+$script:SearchMaxRows = 20
+$script:SearchQuota = @{ 'dreamcast' = 3; 'wparty' = 8; 'shikimori' = 3; 'animelib' = 2; 'aniliberty' = 2; 'animevost' = 2 }   # rows per source before the rest fills up
+$script:SearchSourceNames = @{ 'dreamcast' = 'Dream Cast'; 'wparty' = 'WPARTY'; 'shikimori' = 'Shikimori'; 'animelib' = 'AnimeLib'; 'aniliberty' = 'AniLiberty'; 'animevost' = 'AnimeVost' }
 $script:KinopoiskLinkRe = '^(?i)https?://(?:www\.)?kinopoisk\.ru/(film|series)/(\d+)'
 $script:ShikimoriLinkRe = '^(?i)https?://(?:www\.)?(?:shikimori\.(?:io|one|me)|shiki\.one)/animes/[a-z]*(\d+)'
 $script:MovieCheckCache = @{}     # Kinopoisk id -> movieCheck answer (this session)
@@ -4824,9 +5188,10 @@ function ConvertFrom-AnimelibSearch([string]$text) {
   return $rows
 }
 
-# Searches Dream Cast's catalogue (its own voice-overs, 1080p), WPARTY (films, series, anime by Kinopoisk id),
-# Shikimori and AnimeLib (anime) for a title.
-# Returns up to $script:SearchMaxRows rows: Title, Year, Kind, Extra, Source ('dreamcast'|'wparty'|'shikimori'|'animelib'), Id, Link.
+# Searches WPARTY (films, series, anime by Kinopoisk id), Shikimori and AnimeLib (anime) for a title, and the
+# catalogues of AniLiberty, AnimeVost and Dream Cast (their own voice-overs).
+# Returns up to $script:SearchMaxRows rows: Title, Year, Kind, Extra, Source ('wparty'|'shikimori'|'animelib'|
+# 'aniliberty'|'animevost'|'dreamcast'), Id, Link.
 # A source that doesn't answer gets one short line; the others still show.
 function Find-SiteContent([string]$query) {
   $q = ([string]$query).Trim()
@@ -4835,40 +5200,58 @@ function Find-SiteContent([string]$query) {
   $alApi = 'https://api.cdnlibs.org/api'
   if ($script:AnimelibApiGoodHost) { $alApi = $script:AnimelibApiGoodHost }
   $sec = $script:SearchTimeoutSec
-  $srcs = @('dreamcast', 'wparty', 'shikimori', 'animelib')
+  $srcs = @('dreamcast', 'wparty', 'shikimori', 'animelib', 'aniliberty', 'animevost')
+  $apart = @('dreamcast', 'aniliberty', 'animevost')   # (their own voice-over only: never merged with the others)
   $reqs = @(
     (Get-DreamcastSearchRequest $q $sec),
     @{ Url = $script:WpartyBase + '/api/movieSearch'; Method = 'POST'; Body = (ConvertTo-Json @{ q = $q } -Compress); ContentType = 'application/json'
       Headers = @{ 'Referer' = $script:WpartyBase + '/'; 'Origin' = $script:WpartyBase }; TimeoutSec = $sec },
     @{ Url = $script:ShikimoriBase + '/api/animes?search=' + $esc + '&limit=8'; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $sec },
-    @{ Url = $alApi + '/anime?q=' + $esc + '&site_id[]=' + $script:AnimelibSiteId; Headers = (Get-AnimelibApiHeaders -NoAuth); TimeoutSec = $sec }
+    @{ Url = $alApi + '/anime?q=' + $esc + '&site_id[]=' + $script:AnimelibSiteId; Headers = (Get-AnimelibApiHeaders -NoAuth); TimeoutSec = $sec },
+    (Get-AnilibertySearchRequest $q $sec),
+    (Get-AnimevostSearchRequest $q $sec)
   )
   $answers = @(Invoke-WebParallel $reqs)
   $found = @{}
   for ($i = 0; $i -lt $srcs.Count; $i++) {
     $a = $answers[$i]; $s = $srcs[$i]
     $found[$s] = @()
+    # AnimeVost answers "nothing found" with HTTP 404.
+    $ok = Test-SearchAnswer $s $a
+    if (-not $ok -and ($s -eq 'aniliberty' -or $s -eq 'animevost')) {
+      # Their other addresses, one after the other.
+      $tried = ([Uri]$reqs[$i].Url).GetLeftPart([System.UriPartial]::Authority)
+      try {
+        if ($s -eq 'aniliberty') { $r2 = Invoke-MirrorApi $script:AnilibertyHosts $script:AnilibertyState (Get-AnilibertySearchPath $q) 'GET' $null 6 $tried }
+        else { $r2 = Invoke-MirrorApi $script:AnimevostHosts $script:AnimevostState '/v1/search' 'POST' $reqs[$i].Body 6 $tried }
+        $a = [pscustomobject]@{ Status = $r2.Status; Text = $r2.Text; Error = $null }
+        $ok = Test-SearchAnswer $s $a
+      } catch {}
+    }
     $why = $null
     if ($a.Error) { $why = $a.Error }
-    elseif ($a.Status -ne 200) { $why = "HTTP $($a.Status)" }
+    elseif (-not $ok) { $why = "HTTP $($a.Status)" }
     else {
       try {
         if ($s -eq 'wparty') { $found[$s] = @(ConvertFrom-WpartySearch $a.Text) }
         elseif ($s -eq 'dreamcast') { $found[$s] = @(ConvertFrom-DreamcastSearch $a.Text $q) }
         elseif ($s -eq 'shikimori') { $found[$s] = @(ConvertFrom-ShikimoriSearch $a.Text) }
+        elseif ($s -eq 'aniliberty') { $found[$s] = @(ConvertFrom-AnilibertySearch $a.Text $q) }
+        elseif ($s -eq 'animevost') { $found[$s] = @(ConvertFrom-AnimevostSearch $a.Text $q) }
         else { $found[$s] = @(ConvertFrom-AnimelibSearch $a.Text) }
       } catch { $why = T 'unexpected answer' }
     }
     if ($why) { Say (T '  {0} search isn''t answering ({1}).' $script:SearchSourceNames[$s] (Get-ShortText ([string]$why) 60)) 'DarkGray' }
   }
-  # Drop what an earlier source already has (same title and year, or the same Shikimori id). Dream Cast's rows stay
-  # apart: they play only its own voice-over, the others offer every voice-over (Dream Cast's included).
+  # Drop what an earlier source already has (same title and year, or the same Shikimori id). Dream Cast's, AniLiberty's
+  # and AnimeVost's rows stay apart: they play only their own voice-over, the others offer every voice-over (theirs
+  # included).
   $seen = @{}; $shiki = @{}
   $kept = @{}
   foreach ($s in $srcs) {
     $kept[$s] = New-Object System.Collections.ArrayList
     foreach ($r in $found[$s]) {
-      if ($s -eq 'dreamcast') { [void]$kept[$s].Add($r); continue }
+      if ($apart -contains $s) { [void]$kept[$s].Add($r); continue }
       if ($r.ShikiId -and $shiki.ContainsKey($r.ShikiId)) { continue }
       $keys = @($r.Names | ForEach-Object { (ConvertTo-SearchKey $_) + '|' + $r.Year } | Where-Object { $_ -notmatch '^\|' })
       $dup = $false
@@ -4879,20 +5262,35 @@ function Find-SiteContent([string]$query) {
       [void]$kept[$s].Add($r)
     }
   }
-  # A few from each, then fill up with whatever is left (WPARTY's first, Dream Cast's last). Dream Cast's rows go
+  # A few from each, then fill up with whatever is left (WPARTY's first, Dream Cast's last). The own-voice-over rows go
   # last too: Enter should take the show with every voice-over (picked by DubPriority), not "Overlord 4" from Dream Cast.
-  $order = @($srcs | Where-Object { $_ -ne 'dreamcast' }) + @('dreamcast')
+  $order = @($srcs | Where-Object { $apart -notcontains $_ }) + @($apart | Where-Object { $_ -ne 'dreamcast' }) + @('dreamcast')
   $take = @{}
   $n = 0
   foreach ($s in $srcs) { $take[$s] = [Math]::Min($kept[$s].Count, $script:SearchQuota[$s]); $n += $take[$s] }
   foreach ($s in $order) { while ($n -lt $script:SearchMaxRows -and $take[$s] -lt $kept[$s].Count) { $take[$s]++; $n++ } }
   $rows = @()
   foreach ($s in $order) { if ($take[$s] -gt 0) { $rows += @($kept[$s])[0..($take[$s] - 1)] } }
-  # The exact title typed comes first (stable: the source order stays within each group).
+  # The exact title typed comes first (stable: the source order stays within each group), separately for the
+  # own-voice-over rows, which stay after the others.
   $qk = ConvertTo-SearchKey $q
-  $exact = @($rows | Where-Object { @($_.Names | Where-Object { (ConvertTo-SearchKey $_) -eq $qk }).Count -gt 0 })
-  $rest = @($rows | Where-Object { $exact -notcontains $_ })
-  return @($exact + $rest)
+  $out = @()
+  foreach ($grp in @(@($rows | Where-Object { $apart -notcontains $_.Source }), @($rows | Where-Object { $apart -contains $_.Source }))) {
+    $exact = @($grp | Where-Object { @($_.Names | Where-Object { (ConvertTo-SearchKey $_) -eq $qk }).Count -gt 0 })
+    $out += $exact
+    $out += @($grp | Where-Object { $exact -notcontains $_ })
+  }
+  return $out
+}
+
+# A search answer worth reading: HTTP 200 with JSON (AnimeVost: also 404, its "nothing found"). Anything else (a block
+# or challenge page, an error) makes the sources that have other addresses try those.
+function Test-SearchAnswer([string]$source, $a) {
+  if ($a.Error) { return $false }
+  if (-not ($a.Status -eq 200 -or ($source -eq 'animevost' -and $a.Status -eq 404))) { return $false }
+  if ($source -ne 'aniliberty' -and $source -ne 'animevost') { return $true }
+  $t = ([string]$a.Text).TrimStart()
+  return ($t.StartsWith('{') -or $t.StartsWith('['))
 }
 
 # One result as a line of the list: Title (Year) - kind - extra [source]
@@ -5246,6 +5644,20 @@ function Resolve-Candidate($c) {
     'dreamcast' {
       # Dream Cast's own HLS (AV1 + AAC); Complete-HlsStream picks the quality and works out the length.
       $st = New-Stream $c.Url 'hls' @{ 'Referer' = $script:DreamcastBase + '/' }
+    }
+    'aniliberty' {
+      # One playlist per quality: the tallest one not taller than what is sent.
+      $u = $c.Url
+      if ($c.PSObject.Properties['Hls'] -and $c.Hls) { $u = Select-AnilibertyHls $c.Hls $cap }
+      $st = New-Stream $u 'hls' @{}
+      if ($c.PSObject.Properties['Duration'] -and $c.Duration -gt 0) { $st.Duration = [double]$c.Duration }
+    }
+    'animevost' {
+      # 720p when its file is there (the list names one for every episode, but some are missing), else 480p.
+      $u = $c.Url; $alt = $null
+      if ($c.PSObject.Properties['Std']) { $alt = [string]$c.Std }
+      if ($alt -and $alt -ne $u -and ($cap -le 480 -or -not (Test-WebFileThere $u))) { $u = $alt }
+      $st = New-Stream $u 'file' @{}
     }
     'animelib' {
       $r = Resolve-AnimelibVideo $c.Source $cap -NoProbe
