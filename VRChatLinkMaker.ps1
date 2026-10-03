@@ -1817,7 +1817,35 @@ function Read-EpisodeSelection($list, [int]$defPos) {
 # players that have the chosen voice-over are all checked and the sharpest real picture wins), or a player's name
 # (kodik, aniboom, cvh, sibnet, collaps, animelib, alloha, dreamcast: that one first). The answer holds for the whole session.
 $script:PlayerPref = $null
-$script:AutoWinner = $null   # the player "auto" picked last: the next episodes (prepared while one plays) try it first
+$script:AutoWinner = $null   # the player "auto" picked last (for videos that aren't part of a show)
+$script:ShowWinners = @{}    # show -> the player "auto" picked for it ('' = nothing to compare): its next episodes try it first
+
+# Which show (and voice-over) a web video belongs to, for remembering the player "auto" picked: $null for a lone video.
+function Get-ShowKey($item) {
+  $s = $item.Site
+  if (-not $s) { return $null }
+  switch ("$($s.Type)") {
+    'wparty' { return "kp:$($s.Room.KpId):$($s.Season):$($s.DubName)" }
+    'animego' { return "ag:$($s.AnimeId):$($s.DubName)" }
+    'animelib' { return "al:$($s.Sid):$(@($s.Names)[0]):$($s.DubName)" }
+    'shikimori' { return "sh:$($s.Sid):$($s.DubName)" }
+  }
+  return $null
+}
+
+# The player "auto" picked for this video's show: a name, '' (checked, nothing to pick), or $null (not checked yet).
+function Get-AutoWinner($item) {
+  $k = Get-ShowKey $item
+  if (-not $k) { if ($script:AutoWinner) { return $script:AutoWinner }; return '' }
+  if ($script:ShowWinners.ContainsKey($k)) { return $script:ShowWinners[$k] }
+  return $null
+}
+
+function Set-AutoWinner($item, [string]$prov) {
+  if ($prov) { $script:AutoWinner = $prov }
+  $k = Get-ShowKey $item
+  if ($k) { $script:ShowWinners[$k] = $prov }
+}
 
 # The candidates left that have voice-over $dub (default: the first one left's; other voice-overs are a last resort).
 function Get-SameDubCands($item, $dub = $null) {
@@ -1840,6 +1868,29 @@ function Get-PlayerPref($item) {
   $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false
   if ($i -le 0) { $script:PlayerPref = 'auto' } else { $script:PlayerPref = [string]$provs[$i - 1] }
   return $script:PlayerPref
+}
+
+# A second window (it hands what it found to the streaming one, which can't ask while a video plays) asks here which
+# player to take, like Get-PlayerPref, and the answer goes along with the link (player=...). Without it the streaming
+# window took the first player in the list (Kodik) for videos added while one played. Not asked when config.json names a
+# player, or when the streaming window already has an answer this session (VRCLM_PLAYER, set by Open-AddWindow).
+function Read-HandoverPlayer($items) {
+  $script:LastPlayer = $null
+  $first = @($items | Where-Object { $_.Kind -eq 'site' }) | Select-Object -First 1
+  if (-not $first -or -not (Test-CanAsk)) { return }
+  $v = "$(Get-Prop $script:Cfg 'Player')".Trim().ToLowerInvariant()
+  if ($v -and $v -ne 'ask') { return }
+  $given = "$env:VRCLM_PLAYER".Trim().ToLowerInvariant()
+  if ($given -match '^[a-z]+$') { $script:LastPlayer = $given; return }
+  $cands = @()
+  try { $cands = @(Get-SiteCandidates $first) } catch { return }
+  $provs = @(Get-SameDubCands ([pscustomobject]@{ Cands = $cands; CandIdx = 0 }) | ForEach-Object { $_.Provider } | Select-Object -Unique)
+  if ($provs.Count -lt 2) { return }
+  $opts = @((T 'Auto - check them all and take the sharpest picture (takes a few seconds more)'))
+  foreach ($p in $provs) { $opts += (Get-ProviderTitle $p) }
+  Say ''
+  $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false
+  if ($i -le 0) { $script:LastPlayer = 'auto' } else { $script:LastPlayer = [string]$provs[$i - 1] }
 }
 
 # Puts the candidates of player $prov first among those with the same voice-over.
@@ -1868,7 +1919,7 @@ function Get-ResolvedStream($c) {
 # once), then puts them in order: tallest real picture, then higher bitrate, then the usual order.
 function Invoke-AutoPick($item) {
   $same = @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly } | Select-Object -First 4)
-  if ($same.Count -lt 2) { return }
+  if ($same.Count -lt 2) { Set-AutoWinner $item ''; return }
   Say (T '  Checking {0} players for the sharpest picture...' $same.Count) 'Gray'
   $jobs = New-Object System.Collections.ArrayList
   $failed = New-Object System.Collections.ArrayList
@@ -1912,9 +1963,9 @@ function Invoke-AutoPick($item) {
       "$(Get-ProviderTitle $_.Provider) $q"
     }) -join ', '
   if ($ranked.Count -gt 0) {
-    $script:AutoWinner = $ranked[0].Provider
+    Set-AutoWinner $item $ranked[0].Provider
     Say (T '  Players: {0}  ->  {1}' $txt (Get-ProviderTitle $ranked[0].Provider)) 'Gray'
-  }
+  } else { Set-AutoWinner $item '' }
 }
 
 # The stream from the site broke off (or can't be read): go on with the next player that has the same voice-over and
@@ -1963,11 +2014,23 @@ function Start-NextSource($item) {
   }
   $isCur = ($script:Idx -lt $script:Queue.Count -and [object]::ReferenceEquals($script:Queue[$script:Idx], $item))
   if (-not $item.PSObject.Properties['PlayerPicked'] -and $item.Cands.Count -gt 1) {
+    # (The window that searched for it may have asked already, see Read-HandoverPlayer.)
+    $pref = $null
+    if ($item.PSObject.Properties['PlayerChoice'] -and $item.PlayerChoice) {
+      $pref = [string]$item.PlayerChoice
+      if (-not $script:PlayerPref) { $script:PlayerPref = $pref }   # (the answer holds for the session, as when asked here)
+    } else { $pref = Get-PlayerPref $item }
+    $won = $null
+    if ($pref -eq 'auto' -and -not $isCur) {
+      # No checking while a video streams (it would hold up this window). A show not checked yet waits for its turn:
+      # getting it ready now meant taking the first player in the list (Kodik), whatever "auto" would have picked.
+      $won = Get-AutoWinner $item
+      if ($null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly }).Count -ge 2) { return }
+    }
     $item | Add-Member -NotePropertyName PlayerPicked -NotePropertyValue $true
-    $pref = Get-PlayerPref $item
     if ($pref -ne 'auto') { Set-CandFirst $item $pref }
     elseif ($isCur) { Invoke-AutoPick $item }
-    elseif ($script:AutoWinner) { Set-CandFirst $item $script:AutoWinner }   # (no checking while a video streams: it would hold up this window)
+    elseif ($won) { Set-CandFirst $item $won }
   }
   while ($item.CandIdx -lt $item.Cands.Count) {
     $c = $item.Cands[$item.CandIdx]
@@ -2479,9 +2542,14 @@ function Start-Relay {
   $tail = Initialize-Helper
   $progTo = Get-RelayProgName
   if ($tail) { $progTo = 'pipe:1' }
+  # MediaMTX (VPS, SRT) times each track by when its data arrives, and ffmpeg's MPEG-TS output held the sound back in
+  # ~0.35 s chunks, sent after the picture of the same moment: players that line the tracks up by those times (RTSP's
+  # RTCP) played the sound 0.2-0.65 s late. One audio frame per packet, at most 0.1 s held back: within ~0.07 s.
+  $mux = @()
+  if ((Get-IngestFormat) -eq 'mpegts') { $mux = @('-pes_payload_size', '0', '-muxdelay', '0.1') }
   $argv = @('-hide_banner', '-v', 'error', '-nostats') + $script:RelayStatArgs + @('-progress', $progTo, '-analyzeduration', '500000', '-probesize', '1000000',
     '-f', 'mpegts', '-i', 'pipe:0', '-map', '0:v', '-map', '0:a', '-c:v', 'copy',
-    '-af', 'aresample=async=1:min_hard_comp=0.02:first_pts=0', '-c:a', 'aac', '-b:a', "$([int]$script:Cfg.AudioKbps)k", '-ar', '48000', '-ac', '2',
+    '-af', 'aresample=async=1:min_hard_comp=0.02:first_pts=0', '-c:a', 'aac', '-b:a', "$([int]$script:Cfg.AudioKbps)k", '-ar', '48000', '-ac', '2') + $mux + @(
     '-f', (Get-IngestFormat), '-flvflags', 'no_duration_filesize', (Get-IngestUrl))
   $psi = New-StartInfo $script:FFmpeg $argv $script:TempRoot
   $psi.RedirectStandardInput = $true
@@ -2926,6 +2994,8 @@ function Open-AddWindow([string]$query) {
     $psi.FileName = 'powershell.exe'
     $psi.Arguments = Join-CmdArgs $argv
     $psi.UseShellExecute = $true
+    # This session's answer to "which player", so the new window doesn't ask it again (Read-HandoverPlayer).
+    [Environment]::SetEnvironmentVariable('VRCLM_PLAYER', $script:PlayerPref)
     [void][System.Diagnostics.Process]::Start($psi)
     Say (T '  Opened a second window: search or add videos there, this one keeps streaming.') 'Gray'
   } catch { Say (T '  Couldn''t open a second window: {0}' $_.Exception.Message) 'Yellow' }
@@ -4677,6 +4747,8 @@ function Main {
   if (-not (Enter-SingleInstance)) {
     # Already streaming in another window: add these videos to its queue (this window asks the questions).
     try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - add to the stream') } catch {}
+    # config.json's "DubPriority" and "Player" count here too (only read: the streaming window owns the file).
+    if ([System.IO.File]::Exists((Get-ConfigPath))) { try { $script:Cfg = Get-Config } catch {} }
     if ($entries.Count -eq 0) { $entries = @(Read-Entries) }
     if ($entries.Count -eq 1 -and (Test-IsTitle ([string]$entries[0]))) { $entries = @([string]$entries[0]) }
     $abs = @()
@@ -4685,7 +4757,7 @@ function Main {
       if ($script:Interactive -and $t -notmatch '^(?i)[a-z][a-z0-9+.-]*://' -and (Test-IsTitle $t)) {
         # A title: search, pick, answer the questions here; the streaming window gets the link with the answers.
         $script:LastSearchLink = $null
-        try { [void](Invoke-ContentSearch $t) } catch { if ($script:CtrlCQuit) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+        try { [void](Invoke-ContentSearch $t -AskPlayer) } catch { if ($script:CtrlCQuit) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
         if ($script:LastSearchLink) { $abs += $script:LastSearchLink }
         continue
       }
@@ -4693,9 +4765,10 @@ function Main {
         if ($script:Interactive -and (Test-SiteLink $t)) {
           # The running window can't ask which voice-over / episodes: ask here and hand the answers over.
           try {
-            $script:LastDub = $null; $script:LastEps = $null
+            $script:LastDub = $null; $script:LastEps = $null; $script:LastPlayer = $null
             $its = @(Expand-SiteLink $t)
             if ($its.Count -eq 0) { continue }
+            Read-HandoverPlayer $its
             $choice = Get-SiteChoiceText $its
             if ($choice) { $t = $t + '#vrclm=' + $choice }
           } catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow'; continue }

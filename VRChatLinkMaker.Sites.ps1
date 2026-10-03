@@ -4098,17 +4098,18 @@ function Read-YesNo([string]$q) {
 # ------------------------------------------------------------------ choices (asked here, or handed over by a second window)
 # While a stream runs, its window can't ask questions. A series link dropped on the .bat is set up in that second
 # window instead (it can ask), then handed over with the answers attached:
-#   <link>#vrclm=dub=<name>&eps=<1,2,3>&start=<seconds>&part=<season or part id>
+#   <link>#vrclm=dub=<name>&eps=<1,2,3>&start=<seconds>&part=<season or part id>&player=<auto or a player's name>
 $script:SiteChoice = $null
 $script:LastDub = $null
 $script:LastEps = $null
 $script:LastPart = $null
+$script:LastPlayer = $null
 $script:MaxUnasked = 25
 
 function Split-SiteChoice([string]$u) {
   $i = $u.IndexOf('#vrclm=')
   if ($i -lt 0) { return @($u, $null) }
-  $c = [pscustomobject]@{ Dub = $null; Eps = $null; Start = 0.0; Part = $null }
+  $c = [pscustomobject]@{ Dub = $null; Eps = $null; Start = 0.0; Part = $null; Player = $null }
   foreach ($kv in ($u.Substring($i + 7) -split '&')) {
     $p = $kv.Split([char[]]'=', 2)
     if ($p.Count -lt 2) { continue }
@@ -4116,6 +4117,7 @@ function Split-SiteChoice([string]$u) {
     if ($p[0] -eq 'dub') { $c.Dub = $v }
     elseif ($p[0] -eq 'eps') { $c.Eps = @($v -split ',' | Where-Object { $_ }) }
     elseif ($p[0] -eq 'part') { $c.Part = $v }
+    elseif ($p[0] -eq 'player' -and $v -match '^[a-z]+$') { $c.Player = $v }
     elseif ($p[0] -eq 'start') { $n = 0.0; if ([double]::TryParse($v, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$n)) { $c.Start = $n } }
   }
   return @($u.Substring(0, $i), $c)
@@ -4127,6 +4129,7 @@ function Get-SiteChoiceText($items) {
   if ($script:LastDub) { $parts += 'dub=' + [Uri]::EscapeDataString($script:LastDub) }
   if ($script:LastEps) { $parts += 'eps=' + [Uri]::EscapeDataString((@($script:LastEps) -join ',')) }
   if ($script:LastPart) { $parts += 'part=' + [Uri]::EscapeDataString($script:LastPart) }
+  if ($script:LastPlayer) { $parts += 'player=' + $script:LastPlayer }
   if (@($items).Count -gt 0 -and $items[0].ResumeAt -gt 0) { $parts += 'start=' + [int]$items[0].ResumeAt }
   return ($parts -join '&')
 }
@@ -4209,7 +4212,12 @@ function Expand-SiteLink([string]$u) {
   $parts = Split-SiteChoice $u
   $script:SiteChoice = $parts[1]
   $script:LastPart = $null   # only set by a link that has seasons / parts to pick from
-  try { return @(Expand-SiteLinkNow $parts[0]) } finally { $script:SiteChoice = $null }
+  try {
+    $items = @(Expand-SiteLinkNow $parts[0])
+    # The player the window that searched for it was told to use (see Start-NextSource).
+    if ($parts[1] -and $parts[1].Player) { foreach ($it in $items) { $it | Add-Member -Force -NotePropertyName PlayerChoice -NotePropertyValue $parts[1].Player } }
+    return $items
+  } finally { $script:SiteChoice = $null }
 }
 
 function Expand-SiteLinkNow([string]$u) {
@@ -4898,7 +4906,8 @@ function Format-SearchRow($r) {
 
 # Search -> pick -> questions -> queue items. Only when this window may ask; otherwise (and when cancelled) @().
 # Afterwards $script:LastSearchLink holds the picked link with the answers attached (#vrclm=...), for a running window.
-function Invoke-ContentSearch([string]$query) {
+# -AskPlayer (a window that hands it to the streaming one): also which player, see Read-HandoverPlayer.
+function Invoke-ContentSearch([string]$query, [switch]$AskPlayer) {
   $script:LastSearchLink = $null
   if (-not (Test-CanAsk)) { return @() }
   $q = ([string]$query).Trim().Trim('"').Trim()
@@ -4913,11 +4922,12 @@ function Invoke-ContentSearch([string]$query) {
   $pick = Read-Choice (T 'Which one? (0 = none of these)') @($rows | ForEach-Object { Format-SearchRow $_ }) 0 $true
   if ($pick -lt 0) { return @() }
   $row = $rows[$pick]
-  $script:LastDub = $null; $script:LastEps = $null; $script:LastPart = $null
+  $script:LastDub = $null; $script:LastEps = $null; $script:LastPart = $null; $script:LastPlayer = $null
   $items = @()
   try { $items = @(Expand-SiteLink $row.Link) }
   catch { Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
   if ($items.Count -eq 0) { return @() }
+  if ($AskPlayer) { Read-HandoverPlayer $items }
   $script:LastSearchLink = $row.Link
   $choice = Get-SiteChoiceText $items
   if ($choice) { $script:LastSearchLink += '#vrclm=' + $choice }

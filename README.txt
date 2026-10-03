@@ -72,6 +72,9 @@ Paste a link to one of these like any other link:
 - When an episode is on several players (Kodik, AniBoom, Sibnet...), it asks
   once which one to use. "Auto" checks the real picture size of each (a few
   seconds) and takes the sharpest; the next episodes then use that player.
+  A show added through the second window is asked about there (unless this
+  session already has an answer); with "Auto", its first episode is checked
+  when its turn comes.
 - If the chosen voice-over or player doesn't work for an episode, it uses
   another one and says so in the window.
 - If the stream from a player breaks off mid-episode, it carries on from the
