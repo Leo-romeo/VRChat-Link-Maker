@@ -1214,7 +1214,7 @@ function Set-VpsInteractive($v) {
     Say (T '  Got a connection code from the PC that manages a server? Paste it here instead of the address.') 'Gray'
     $cur = "$(Get-Prop $v 'Address')"
     while ($true) {
-      if ($cur) { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = keep {0})' $cur) }
+      if ($cur) { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = keep the saved address)') }
       else { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = I don''t have one yet)') }
       if (-not $ans) { break }
       if (Test-VpsCodeText $ans) {
@@ -1261,7 +1261,9 @@ function Set-CustomInteractive($c) {
   foreach ($a in $ask) {
     while ($true) {
       $d = $cur[$a.K]
-      if ($d) { $ans = Read-HostLine (T '{0} (just Enter = {1})' $a.Q $d) }
+      # (The address to send to holds the stream key: it is never printed.)
+      if ($d -and $a.K -eq 'IngestUrl') { $ans = Read-HostLine (T '{0} (just Enter = keep the saved link)' $a.Q) }
+      elseif ($d) { $ans = Read-HostLine (T '{0} (just Enter = {1})' $a.Q $d) }
       elseif ($a.Need) { $ans = Read-HostLine (T '{0} (just Enter = cancel)' $a.Q) }
       else { $ans = Read-HostLine (T '{0} (just Enter = none)' $a.Q) }
       if (-not $ans) {
@@ -1464,6 +1466,8 @@ function Get-MtxBusyPorts($ports) {
 
 # MediaMTX (and the test's ffmpeg) are put in a job that Windows closes when this window closes, so they never outlive it.
 function Add-MtxToJob($proc) {
+  # (VRCLM_DEBUG: log.txt notes the start.)
+  if (Get-Command Write-StartLog -CommandType Function -ErrorAction SilentlyContinue) { try { Write-StartLog $proc.StartInfo } catch {} }
   # (The main script puts every program it starts into one such job.)
   if (Get-Command Add-ChildToJob -CommandType Function -ErrorAction SilentlyContinue) { Add-ChildToJob $proc; return }
   try {
@@ -2576,7 +2580,7 @@ function Test-GlobalIPv6([string]$s) {
 
 # Does an adapter name look like a VPN? (Its default route would send the stream out through the VPN.)
 function Test-VpnName([string]$name) {
-  return ($name -match '(?i)vpn|wintun|wireguard|openvpn|tap-windows|tap-win|surfshark|nordlynx|proton|mullvad|expressvpn|hamachi|zerotier|tailscale|anyconnect|fortinet|pangp')
+  return ($name -match '(?i)vpn|wintun|wireguard|openvpn|tap-windows|tap-win|surfshark|nordlynx|proton|mullvad|expressvpn|hamachi|zerotier|tailscale|anyconnect|fortinet|pangp|cloudflare ?warp')
 }
 
 # The VPN adapter the internet traffic goes through right now, or $null.
@@ -3101,6 +3105,7 @@ function Enable-SelfHostFirewall([string]$exe, [int[]]$ports, [switch]$DryRun) {
   $psi.Verb = 'runas'
   $psi.UseShellExecute = $true
   $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+  if (Get-Command Write-StartLog -CommandType Function -ErrorAction SilentlyContinue) { Write-StartLog $psi }
   try {
     $script:FirewallWatch = [System.Diagnostics.Process]::Start($psi)
   } catch {
@@ -3271,6 +3276,7 @@ function Measure-PushSpeed([string]$url, [string]$fmt, [int]$kbps, [int]$seconds
   $psi.RedirectStandardInput = $true
   $psi.RedirectStandardError = $true
   $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+  $psi.CreateNoWindow = $true   # (no console window of its own; 'q' still goes in through stdin)
   $p = $null
   $samples = New-Object System.Collections.ArrayList
   try {
@@ -3419,12 +3425,22 @@ function Save-HostKbps($p, [int]$kbps) {
 
 function Get-Floor50([double]$x) { return [int]([Math]::Floor($x / 50.0) * 50) }
 
+# The answer to "Start the speed test?": just Enter = yes, but = no while viewers would lose the picture ($strict).
+function Test-SpeedTestYes([string]$ans, [bool]$strict) {
+  if ($strict) { return (Test-AnswerYes $ans) }
+  return (-not (Test-AnswerNo $ans))
+}
+
 # The speed test (a menu item). Topaz: a throwaway stream key; vps / custom: the profile's own ingest address;
 # pc: an upload test (viewers pull from this PC, so the upload speed is the limit). -> Kbps (recommended), Saved, Result.
 # -Target / -TargetFormat / -TestKbps override where and how hard it pushes (tests use a local MediaMTX).
-function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]$TargetFormat = '', [int]$TestKbps = 0, [int]$UploadMB = 40, [switch]$NoSave) {
+# -BeforeRun runs once the test is really going to start (after "yes"): the caller stops the stream there.
+# -ViewersWatch: the question says viewers lose the picture meanwhile, and only a real yes starts it (just Enter = no).
+function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]$TargetFormat = '', [int]$TestKbps = 0, [int]$UploadMB = 40, [switch]$NoSave, [scriptblock]$BeforeRun = $null, [switch]$ViewersWatch) {
   $out = [pscustomobject]@{ Kbps = 0; Saved = $false; Result = $null }
-  if (Test-RelayAlive) { Say (T 'Stop the stream first: the speed test needs the whole connection.') 'Yellow'; return $out }
+  if (-not $BeforeRun -and (Test-RelayAlive)) { Say (T 'Stop the stream first: the speed test needs the whole connection.') 'Yellow'; return $out }
+  $q = T 'Start the speed test? [Y/n]'
+  if ($ViewersWatch) { $q = T 'Viewers lose the picture for about 30-40 s meanwhile. Start the speed test? [y/N]' }
   $ask = Test-CanAsk
   $ak = 128
   $x = 0
@@ -3437,7 +3453,8 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   if ($p.Id -eq 'pc' -and -not $Target) {
     Say (T 'Speed test for streaming from this PC: every viewer pulls the stream from your internet line, so what counts is your upload speed.') 'Cyan'
     Say (T 'It sends {0} MB of random test data to speed.cloudflare.com.' $UploadMB) 'Gray'
-    if ($ask -and (Test-AnswerNo (Read-Host (T 'Start the speed test? [Y/n]')))) { return $out }
+    if ($ask -and -not (Test-SpeedTestYes (Read-Host $q) $ViewersWatch)) { return $out }
+    if ($BeforeRun) { & $BeforeRun }
     $u = Measure-UploadSpeed ([long]$UploadMB * 1MB)
     $out.Result = $u
     if (-not $u.Ok) { Say (T 'The speed test did not work ({0}).' $u.Error) 'Yellow'; return $out }
@@ -3491,7 +3508,8 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   }
   Say (T 'Speed test: sends a test picture at {0} kbps to {1} for about {2} s and measures how much gets through.' $kbps $where $Seconds) 'Cyan'
   if ($p.Id -eq 'custom' -and -not $Target) { Say (T 'This uses your own stream address: if it is a public channel (e.g. Twitch), people may see the test picture.') 'Yellow' }
-  if ($ask -and (Test-AnswerNo (Read-Host (T 'Start the speed test? [Y/n]')))) { return $out }
+  if ($ask -and -not (Test-SpeedTestYes (Read-Host $q) $ViewersWatch)) { return $out }
+  if ($BeforeRun) { & $BeforeRun }
   $r = Measure-PushSpeed $url $fmt $kbps $Seconds
   $out.Result = $r
   if (-not $r.Ok) {

@@ -167,6 +167,7 @@ function Restart-AfterUpdate {
     $psi.FileName = 'powershell.exe'
     $psi.Arguments = Join-CmdArgs $argv
     $psi.UseShellExecute = $true
+    if (Get-Command Write-StartLog -CommandType Function -ErrorAction SilentlyContinue) { Write-StartLog $psi }
     [void][System.Diagnostics.Process]::Start($psi)
     return $true
   } catch {

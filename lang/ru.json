@@ -1,4 +1,9 @@
 {
+  "Copy": "Копировать",
+  "Open log.txt": "Открыть log.txt",
+  "Viewers lose the picture for about 30-40 s meanwhile. Start the speed test? [y/N]": "На время теста (около 30-40 с) зрители потеряют картинку. Запустить тест скорости? [д/Н]",
+  "{0} (just Enter = keep the saved link)": "{0} (просто Enter = оставить сохранённую ссылку)",
+  "The VPS's address, or a connection code (just Enter = keep the saved address)": "Адрес VPS или код подключения (просто Enter = оставить сохранённый адрес)",
   "Messages": "Сообщения",
   "Copy all": "Копировать всё",
   "_language": "Русский",

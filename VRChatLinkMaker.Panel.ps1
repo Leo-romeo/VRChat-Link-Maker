@@ -47,6 +47,7 @@ function Test-ControlPanelOpen {
     $s = $script:PanelSync
     if ($null -eq $s) { return $false }
     if ($s.Error -and -not $s.Logged) { $s.Logged = $true; Write-PanelError ([string]$s.Error) }
+    if ($s.Warn) { $w = [string]$s.Warn; $s.Warn = $null; Write-PanelError $w }
     if ($s.Closed) { return $false }
     return (-not ($script:PanelRun -and $script:PanelRun.IsCompleted))
   } catch { return $false }
@@ -57,6 +58,39 @@ function Write-PanelError([string]$text) {
   if (Get-Command Write-LogLine -CommandType Function -ErrorAction SilentlyContinue) { Write-LogLine ('  (control window: ' + $text + ')') }
 }
 
+# A non-fatal error on the window's thread (the window stays): the main thread writes it to log.txt
+# (Test-ControlPanelOpen -> Write-PanelError). Only the first few per window.
+function Write-PanelWarning($err) {
+  try {
+    $sync = $script:PanelSync
+    $q = $script:Panel
+    if ($null -eq $sync -or $sync.Warn -or ($q -and $q.Warned -ge 3)) { return }
+    $why = [string]$err
+    if ($err -is [System.Management.Automation.ErrorRecord]) { $why = $err.Exception.Message + ' (line ' + $err.InvocationInfo.ScriptLineNumber + ')' }
+    elseif ($err -is [System.Exception]) { $why = $err.Message }
+    if ($q) { $q.Warned++ }
+    $sync.Warn = $why
+  } catch {}
+}
+
+# The control that has the keyboard focus (inside nested containers too).
+function Get-PanelFocus {
+  $c = $script:Panel.Form.ActiveControl
+  while ($c -is [System.Windows.Forms.ContainerControl] -and $c.ActiveControl) { $c = $c.ActiveControl }
+  return $c
+}
+
+# Are Space / Left / Right the window's shortcuts right now? Not while typing in a text box or a drop-down;
+# in a list Left / Right scroll it (Space still pauses).
+function Test-PanelKeyOurs([System.Windows.Forms.Keys]$code) {
+  $K = [System.Windows.Forms.Keys]
+  $fc = $null
+  try { $fc = Get-PanelFocus } catch {}
+  if ($fc -is [System.Windows.Forms.TextBoxBase] -or $fc -is [System.Windows.Forms.ComboBox]) { return $false }
+  if (($fc -is [System.Windows.Forms.ListBox] -or $fc -is [System.Windows.Forms.ListView]) -and ($code -eq $K::Left -or $code -eq $K::Right)) { return $false }
+  return $true
+}
+
 # Space / Left / Right / Shift+Left / Shift+Right while the window has focus. $true = the key was ours.
 function Invoke-PanelKey([System.Windows.Forms.Keys]$keyData) {
   $p = $script:Panel
@@ -64,6 +98,7 @@ function Invoke-PanelKey([System.Windows.Forms.Keys]$keyData) {
   $K = [System.Windows.Forms.Keys]
   $code = $keyData -band $K::KeyCode
   $mods = $keyData -band $K::Modifiers
+  if (($code -eq $K::Space -or $code -eq $K::Left -or $code -eq $K::Right) -and -not (Test-PanelKeyOurs $code)) { return $false }
   if ($code -eq $K::Space -and $mods -eq $K::None) {
     if ($p.Big.Enabled) { Add-PanelCommand 'toggle' }
     return $true
@@ -156,7 +191,7 @@ function Set-PanelGridWidths($grid, $buttons, [int]$extra) {
 function New-ControlPanel {
   $WF = 'System.Windows.Forms'
   $p = @{
-    Closed = $false; Link = ''; Mode = ''; RealPos = 0.0; PosText = ''; SeekDur = 0.0; SeekShown = 0.0; SeekOn = $false; SeekPx = -1
+    Closed = $false; Link = ''; Mode = ''; Warned = 0; LogWidest = 0; RealPos = 0.0; PosText = ''; SeekDur = 0.0; SeekShown = 0.0; SeekOn = $false; SeekPx = -1
     Drag = $false; DragPos = 0.0; HoldPos = 0.0; HoldUntil = [DateTime]::MinValue
     StopArmedUntil = [DateTime]::MinValue; CopiedUntil = [DateTime]::MinValue
     PrevCheck = [DateTime]::MinValue; PrevTime = [DateTime]::MinValue; PrevMissing = [DateTime]::MinValue
@@ -392,6 +427,7 @@ function New-ControlPanel {
   $lg.MinimumSize = New-Object System.Drawing.Size(0, [int]($fh * 3))
   $lg.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
   $lg.ItemHeight = $lg.Font.Height + 1
+  $lg.SelectionMode = [System.Windows.Forms.SelectionMode]::MultiExtended
   $p.LogColors = New-Object 'System.Collections.Generic.List[string]'
   $p.LogPal = @{
     Red = (New-PanelColor 240 110 110); DarkRed = (New-PanelColor 240 110 110); Yellow = (New-PanelColor 232 200 90); DarkYellow = (New-PanelColor 232 200 90)
@@ -407,10 +443,22 @@ function New-ControlPanel {
       $col = $q.Colors.Text
       if ($e.Index -lt $q.LogColors.Count) { $n = $q.LogColors[$e.Index]; if ($n -and $q.LogPal.ContainsKey($n)) { $col = $q.LogPal[$n] } }
       if (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0) { $col = [System.Drawing.SystemColors]::HighlightText }
-      [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, [string]$sender.Items[$e.Index], $e.Font, $e.Bounds, $col, [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter)
+      # (as wide as the widest line, so a line scrolled sideways isn't cut off at the list's edge)
+      $b = $e.Bounds
+      $rect = New-Object System.Drawing.Rectangle($b.X, $b.Y, [Math]::Max($b.Width, $sender.HorizontalExtent), $b.Height)
+      [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, [string]$sender.Items[$e.Index], $e.Font, $rect, $col, [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter)
     } catch {}
   })
+  # Right-click: copy the selected lines or all of them, or open log.txt (the whole session).
   $lcm = New-Object "$WF.ContextMenuStrip"
+  $p.LogCopy = New-Object "$WF.ToolStripMenuItem"
+  $p.LogCopy.Text = T 'Copy'
+  $p.LogCopy.Add_Click({
+    try {
+      $t = (@($script:Panel.Log.SelectedItems) | ForEach-Object { [string]$_ }) -join "`r`n"
+      if ($t) { [System.Windows.Forms.Clipboard]::SetDataObject($t, $true, 5, 100) }
+    } catch {}
+  })
   $lmi = New-Object "$WF.ToolStripMenuItem"
   $lmi.Text = T 'Copy all'
   $lmi.Add_Click({
@@ -419,7 +467,30 @@ function New-ControlPanel {
       if ($t) { [System.Windows.Forms.Clipboard]::SetDataObject($t, $true, 5, 100) }
     } catch {}
   })
+  $p.LogOpen = New-Object "$WF.ToolStripMenuItem"
+  $p.LogOpen.Text = T 'Open log.txt'
+  $p.LogOpen.Add_Click({
+    try {
+      $f = [string]$script:PanelSync.LogPath
+      if ($f -and [System.IO.File]::Exists($f)) {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $f
+        $psi.UseShellExecute = $true
+        [void][System.Diagnostics.Process]::Start($psi)
+      }
+    } catch { Write-PanelWarning $_ }
+  })
+  [void]$lcm.Items.Add($p.LogCopy)
   [void]$lcm.Items.Add($lmi)
+  [void]$lcm.Items.Add($p.LogOpen)
+  $lcm.Add_Opening({
+    try {
+      $q = $script:Panel
+      $q.LogCopy.Enabled = ($q.Log.SelectedIndices.Count -gt 0)
+      $f = [string]$script:PanelSync.LogPath
+      $q.LogOpen.Enabled = [bool]($f -and [System.IO.File]::Exists($f))
+    } catch {}
+  })
   $lg.ContextMenuStrip = $lcm
   $p.Log = $lg
   $root.Controls.Add($lg, 0, 9)
@@ -488,7 +559,7 @@ function New-ControlPanel {
   })
   $f.Add_KeyUp({
     param($sender, $e)
-    try { if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Space) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch {}
+    try { if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Space -and (Test-PanelKeyOurs $e.KeyCode)) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch {}
   })
   $f.Add_FormClosed({ try { $script:Panel.Closed = $true; $script:PanelSync.Closed = $true; Remove-PanelImage } catch {} })
   Add-PanelKeyHook $f
@@ -686,6 +757,8 @@ function Open-ControlPanel {
     }
     # The message pane: the queue outlives the window; a new window starts from the ring of recent lines.
     $backlog = $null
+    $logPath = ''
+    try { if ($script:DataDir) { $logPath = [System.IO.Path]::Combine([string]$script:DataDir, 'log.txt') } } catch {}
     try {
       if ($null -ne $script:UiLogRing) { $backlog = $script:UiLogRing.ToArray() }
       $drop = $null
@@ -693,8 +766,8 @@ function Open-ControlPanel {
     } catch {}
     $sync = [hashtable]::Synchronized(@{
       State = $null; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]')
-      Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false
-      Log = $script:UiLog; Backlog = $backlog
+      Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
+      Log = $script:UiLog; Backlog = $backlog; LogPath = $logPath
     })
     $self = $script:PanelSelf
     if (-not $self) { $self = $script:PanelFile }
@@ -780,11 +853,14 @@ function Invoke-PanelTick {
     Stop-PanelAfterError $_
     return
   }
-  Update-PanelView $sync.State
-  try { Update-PanelLog $sync } catch {}
+  # (Each on its own: an error in one doesn't skip the other.)
+  try { Update-PanelView $sync.State } catch { Write-PanelWarning $_ }
+  if ($q.Closed) { return }
+  try { Update-PanelLog $sync } catch { Write-PanelWarning $_ }
 }
 
-# New message lines for the pane (at most 300 per tick); it keeps the last 1500 and follows the end unless scrolled up.
+# New message lines for the pane (at most 300 per tick). Past 1500 lines it drops the oldest down to 1200 (at once, not
+# one per new line). It follows the end unless scrolled up.
 function Update-PanelLog($sync) {
   $q = $script:Panel
   $lg = $q.Log
@@ -801,18 +877,42 @@ function Update-PanelLog($sync) {
   if ($new.Count -eq 0) { return }
   $rows = [Math]::Max(1, [int][Math]::Floor($lg.ClientSize.Height / [Math]::Max(1, $lg.ItemHeight)))
   $atEnd = ($lg.Items.Count -eq 0) -or (($lg.TopIndex + $rows) -ge ($lg.Items.Count - 1))
+  $flags = [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
+  $widest = $q.LogWidest
+  $failed = $null
   $lg.BeginUpdate()
   try {
+    # (The lines are already out of the queue: one that can't be added is skipped, the rest still go in.)
     foreach ($e in $new) {
-      foreach ($ln in (([string]$e[0]) -split "`r?`n")) { [void]$lg.Items.Add($ln); $q.LogColors.Add([string]$e[1]) }
+      try {
+        foreach ($ln in (([string]$e[0]) -split "`r?`n")) {
+          try {
+            [void]$lg.Items.Add($ln)
+            $q.LogColors.Add([string]$e[1])
+            # Each line is measured once, as it comes in: the widest one sets how far the list scrolls sideways.
+            if ($ln.Length -gt 0) { $widest = [Math]::Max($widest, [System.Windows.Forms.TextRenderer]::MeasureText($ln, $lg.Font, [System.Drawing.Size]::Empty, $flags).Width) }
+          } catch { if (-not $failed) { $failed = $_ } }
+        }
+      } catch { if (-not $failed) { $failed = $_ } }
     }
-    $over = $lg.Items.Count - 1500
-    if ($over -gt 0) {
-      for ($i = 0; $i -lt $over; $i++) { $lg.Items.RemoveAt(0) }
-      $q.LogColors.RemoveRange(0, $over)
+    if ($lg.Items.Count -gt 1500) {
+      $keep = 1200
+      $drop = $lg.Items.Count - $keep
+      # (A view scrolled up and the selected lines stay where they were, on the same lines.)
+      $top = $lg.TopIndex
+      $sel = @(foreach ($i in $lg.SelectedIndices) { [int]$i })
+      $rest = New-Object object[] $keep
+      for ($i = 0; $i -lt $keep; $i++) { $rest[$i] = $lg.Items[$drop + $i] }
+      $lg.Items.Clear()
+      $lg.Items.AddRange($rest)
+      if ($q.LogColors.Count -gt $keep) { $q.LogColors.RemoveRange(0, $q.LogColors.Count - $keep) }
+      foreach ($i in $sel) { if ($i -ge $drop) { $lg.SetSelected($i - $drop, $true) } }
+      if (-not $atEnd) { $lg.TopIndex = [Math]::Max(0, $top - $drop) }
     }
+    if ($widest -gt $q.LogWidest) { $q.LogWidest = $widest; $lg.HorizontalExtent = $widest + 6 }
     if ($atEnd) { $lg.TopIndex = [Math]::Max(0, $lg.Items.Count - $rows) }
   } finally { $lg.EndUpdate() }
+  if ($failed) { Write-PanelWarning $failed }
 }
 
 function Show-PanelWindow {
@@ -834,7 +934,8 @@ function Remove-PanelResources {
 }
 
 # $s (from the main thread, $null before the first update): Mode ('content'|'paused'|'hold'|'waiting'|'reconnect'|
-# 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]), Link, Clock (bool), CanSeek (bool).
+# 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]), Link, Clock (bool), CanSeek (bool),
+# Prompt (bool: start questions in the tool's window, Next / Stop / Resync / Settings off).
 function Update-PanelView($s) {
   try {
     if ($null -eq $s) { $s = @{} }
@@ -850,6 +951,8 @@ function Update-PanelView($s) {
     if ([double]::IsNaN($pos) -or [double]::IsInfinity($pos) -or $pos -lt 0) { $pos = 0.0 }
     $canSeek = [bool]$s['CanSeek']
     $on = ($mode -ne 'off')
+    # (Prompt: the tool's own window still asks its start questions, nothing plays yet: no commands meanwhile.)
+    $cmdOn = ($on -and -not [bool]$s['Prompt'])
 
     Set-PanelMode $mode
     $title = [string]$s['Title']
@@ -859,10 +962,10 @@ function Update-PanelView($s) {
 
     $rel = ($canSeek -and ($mode -eq 'content' -or $mode -eq 'paused' -or $mode -eq 'hold'))
     foreach ($b in @($q.Back30, $q.Back10, $q.Fwd10, $q.Fwd30)) { Set-PanelProp ('en' + $b.GetHashCode()) $b 'Enabled' $rel }
-    Set-PanelProp 'next' $q.Next 'Enabled' $on
-    Set-PanelProp 'stop' $q.Stop 'Enabled' $on
-    Set-PanelProp 'resync' $q.Resync 'Enabled' $on
-    if ($q.StopArmedUntil -ne [DateTime]::MinValue -and ($now -ge $q.StopArmedUntil -or -not $on)) {
+    Set-PanelProp 'next' $q.Next 'Enabled' $cmdOn
+    Set-PanelProp 'stop' $q.Stop 'Enabled' $cmdOn
+    Set-PanelProp 'resync' $q.Resync 'Enabled' $cmdOn
+    if ($q.StopArmedUntil -ne [DateTime]::MinValue -and ($now -ge $q.StopArmedUntil -or -not $cmdOn)) {
       $q.StopArmedUntil = [DateTime]::MinValue
       Reset-PanelStop
     }
@@ -885,7 +988,7 @@ function Update-PanelView($s) {
     if ([bool]$s['QualityLow']) { $qc = (New-PanelColor 235 150 50) }
     Set-PanelProp 'qualitycol' $q.Quality 'ForeColor' $qc
     if ($script:PanelLast['qtip'] -cne [string]$s['QualityTip']) { $script:PanelLast['qtip'] = [string]$s['QualityTip']; $q.Tips.SetToolTip($q.Quality, [string]$s['QualityTip']) }
-    Set-PanelProp 'more' $q.More 'Enabled' ($mode -eq 'waiting')
+    Set-PanelProp 'more' $q.More 'Enabled' ($cmdOn -and $mode -eq 'waiting')
 
     $up = @()
     if ($null -ne $s['Upcoming']) { $up = @(foreach ($u in @($s['Upcoming'])) { [string]$u }) }

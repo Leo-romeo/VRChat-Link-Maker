@@ -481,9 +481,16 @@ function Start-Child($psi) {
   # A program whose output is all read by the tool needs no console of its own (with some terminals it would get a
   # window of its own otherwise).
   if ($psi.RedirectStandardOutput -and $psi.RedirectStandardError) { $psi.CreateNoWindow = $true }
+  Write-StartLog $psi
   $p = [System.Diagnostics.Process]::Start($psi)
   Add-ChildToJob $p
   return $p
+}
+
+# VRCLM_DEBUG: one log.txt line per program started, to see which one could open a console window of its own.
+function Write-StartLog($psi) {
+  if (-not $env:VRCLM_DEBUG -or -not $psi) { return }
+  try { Write-LogLine ('  (start: {0}  CreateNoWindow={1}  UseShellExecute={2})' -f [System.IO.Path]::GetFileName([string]$psi.FileName), $psi.CreateNoWindow, $psi.UseShellExecute) } catch {}
 }
 
 function New-StartInfo([string]$exe, [string[]]$argv, [string]$workDir) {
@@ -589,6 +596,7 @@ function Invoke-Winget([string]$id) {
   if (-not $wg) { return $false }
   Say (T 'Installing {0} with winget (can take a minute)...' $id) 'Gray'
   $psi = New-StartInfo $wg.Path @('install', '-e', '--id', $id, '--accept-source-agreements', '--accept-package-agreements')
+  Write-StartLog $psi
   $p = [System.Diagnostics.Process]::Start($psi)
   $p.WaitForExit()
   Update-PathFromRegistry
@@ -1367,9 +1375,9 @@ function Resolve-Entries([string[]]$entries) {
     $full = $null
     try { $full = [System.IO.Path]::GetFullPath($e) } catch { Say (T '  Skipping (not a valid path): {0}' $e) 'Yellow'; continue }
     if ([System.IO.Directory]::Exists($full)) {
-      $found = @(Get-MediaInFolder $full)
-      if ($found.Count -eq 0) { Say (T '  No videos found in folder: {0}' $full) 'Yellow' }
-      foreach ($f in $found) { if (-not $videos.Contains($f)) { [void]$videos.Add($f) } }
+      $inDir = @(Get-MediaInFolder $full)
+      if ($inDir.Count -eq 0) { Say (T '  No videos found in folder: {0}' $full) 'Yellow' }
+      foreach ($f in $inDir) { if (-not $videos.Contains($f)) { [void]$videos.Add($f) } }
       continue
     }
     if ([System.IO.File]::Exists($full)) {
@@ -2574,6 +2582,7 @@ function Start-Relay {
   $psi.RedirectStandardError = $true
   $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
   if ($tail) { $psi.RedirectStandardOutput = $true }
+  $psi.CreateNoWindow = $true   # (also without the helper, when its progress goes to a file)
   $script:Relay = Start-Child $psi
   $script:RelayTail = $null
   if ($tail) { $script:RelayTail = New-Object VRCLinkMaker.TailReader($script:Relay.StandardOutput.BaseStream, 4096) }
@@ -2723,7 +2732,17 @@ function Wait-RelayRetry([bool]$video = $true) {
   else { Say (T 'Lost the connection to the stream server - reconnecting in {0} s.' $delay) 'Yellow' }
   if ($why) { Say "  ($why)" 'DarkGray' }
   $script:ReconnectNote = $true
-  Wait-Pump $delay
+  # The control window shows "Reconnecting" meanwhile, then what it showed before (until the next update).
+  $before = $script:PanelState
+  $rs = $null
+  if ($script:PanelShown) {
+    $rs = @{ Link = $script:ShownLink }
+    if ($before) { $rs = $before.Clone() }
+    $rs.Mode = 'reconnect'
+    $rs.Status = T 'Lost the connection to the stream server - reconnecting in {0} s.' $delay
+    $script:PanelState = $rs
+  }
+  try { Wait-Pump $delay } finally { if ($script:PanelShown -and $script:PanelState -eq $rs) { $script:PanelState = $before; Invoke-PanelPump } }
   return $true
 }
 
@@ -2735,7 +2754,21 @@ function Wait-Pump([double]$seconds) {
 
 function Invoke-PanelPump {
   if (-not $script:PanelShown) { return }
-  try { Update-ControlPanel $script:PanelState } catch {}
+  try {
+    # (While a question waits nothing else updates the window: on / off and the link follow here.)
+    $s = $script:PanelState
+    if ($s -and ($s.Mode -eq 'waiting' -or $s.Mode -eq 'off')) {
+      $mode = 'off'
+      if (Test-RelayAlive) { $mode = 'waiting' }
+      if ($s.Mode -ne $mode -or $s.Link -ne $script:ShownLink) {
+        $s = $s.Clone()
+        $s.Mode = $mode
+        $s.Link = $script:ShownLink
+        $script:PanelState = $s
+      }
+    }
+    Update-ControlPanel $script:PanelState
+  } catch {}
 }
 
 # Questions in this window (Read-Host) while the control window is open: the keys are read here, so the control
@@ -2880,11 +2913,15 @@ function Start-Standby {
   if ($script:Src) {
     $running = $false
     try { $running = -not $script:Src.Proc.HasExited } catch {}
-    if ($running) { return }
+    # (One still running into a relay that ended is stuck: both start again.)
+    if ($running -and (Test-RelayAlive)) { return }
     [void](Stop-Source $script:Src -Now)
   }
   try {
-    if (-not (Test-RelayAlive)) { Start-Relay }
+    if (-not (Test-RelayAlive)) {
+      if ($script:Relay) { Stop-Relay }
+      Start-Relay
+    }
     [void](Start-Source 'waiting')
   } catch {
     if ($env:VRCLM_DEBUG) { Say ("standby: " + $_.Exception.Message) 'DarkGray' }
@@ -3013,6 +3050,7 @@ function Open-AddWindow([string]$query) {
     $psi.UseShellExecute = $true
     # This session's answer to "which player", so the new window doesn't ask it again (Read-HandoverPlayer).
     [Environment]::SetEnvironmentVariable('VRCLM_PLAYER', $script:PlayerPref)
+    Write-StartLog $psi
     [void][System.Diagnostics.Process]::Start($psi)
     Say (T '  Opened a second window: search or add videos there, this one keeps streaming.') 'Gray'
   } catch { Say (T '  Couldn''t open a second window: {0}' $_.Exception.Message) 'Yellow' }
@@ -4192,11 +4230,21 @@ function Invoke-Queue {
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { break }
       if ($r.Outcome -eq 'stop') { Say (T '  Nothing is playing. Q Q ends the stream.') 'Gray'; continue }
       if ($r.Outcome -eq 'resync') { Restart-RelayForResync 'waiting'; continue }
-      if ($r.Outcome -eq 'host') { Invoke-HostMenu; continue }
-      if ($r.Outcome -eq 'newlink') { Invoke-NewLinkMenu; continue }
-      if ($r.Outcome -eq 'res') { Invoke-ResolutionMenu; continue }
-      if ($r.Outcome -eq 'speedtest') { Invoke-SpeedTestMenu; continue }
-      if ($r.Outcome -eq 'relay') {
+      # The Settings menus ask in this window: the waiting screen goes on meanwhile (a server drops viewers of a
+      # stream that stops sending). A menu that changes the stream stops / restarts it itself.
+      $lost = ($r.Outcome -eq 'relay')
+      if (@('host', 'newlink', 'res', 'speedtest') -contains $r.Outcome) {
+        $alive = Test-RelayAlive
+        if ($alive) { Start-Standby }
+        if ($r.Outcome -eq 'host') { Invoke-HostMenu }
+        elseif ($r.Outcome -eq 'newlink') { Invoke-NewLinkMenu }
+        elseif ($r.Outcome -eq 'res') { Invoke-ResolutionMenu }
+        else { Invoke-SpeedTestMenu }
+        # (The connection broke while the menu waited: reconnect as below, instead of ending the stream.)
+        $lost = $alive -and -not (Test-RelayAlive)
+        if (-not $lost) { continue }
+      }
+      if ($lost) {
         # Back on the air with the waiting screen; the next video waits until the players are back (or, if no video
         # played on this connection yet, until they show the stream at all).
         $fresh = $script:RelayFresh
@@ -4639,21 +4687,36 @@ function Use-VpsCode([string]$line) {
   } finally { $script:PromptOk = $was }
 }
 
-# The upload speed test (T): nothing else may use the upload meanwhile, so the waiting screen pauses.
+# The upload speed test (T): nothing else may use the upload meanwhile, so the stream goes off for it (only once the
+# answer is yes: until then the waiting screen stays on).
 function Invoke-SpeedTestMenu {
   if (-not (Test-HostModule) -or -not $script:HostP) { return }
   $was = $script:PromptOk
   $script:PromptOk = $true
   try {
     $wasOn = Test-RelayAlive
-    if ($wasOn) { Stop-Relay }
+    $fresh = $script:RelayFresh
+    # Someone may be watching whenever the stream is on (the link may be in a player already: the log here isn't
+    # read during questions), so the question warns and just Enter keeps the stream on.
+    $watched = $wasOn
+    $testRan = @{ Yes = $false }
     $r = $null
-    try { $r = Invoke-SpeedTest $script:HostP } catch { if ($script:CtrlCQuit) { throw }; Say (T '  The speed test didn''t work: {0}' $_.Exception.Message) 'Yellow' }
-    $script:HostP = Get-HostProfile $script:HostP.Id
-    if ($script:HostIpv6Only) { Use-Ipv6Links $script:HostP }
-    Update-StreamQuality
-    Show-StreamQuality
+    try { $r = Invoke-SpeedTest $script:HostP -BeforeRun { $testRan.Yes = $true; Stop-Relay } -ViewersWatch:$watched } catch { if ($script:CtrlCQuit) { throw }; Say (T '  The speed test didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+    # (Also a relay that ended by itself while the question waited: Start-Standby below starts a new one.)
+    $stopped = $wasOn -and -not (Test-RelayAlive)
+    if ($testRan.Yes) {
+      # (Only after a test: on "no" the stream's settings stay as they are on this connection.)
+      $script:HostP = Get-HostProfile $script:HostP.Id
+      if ($script:HostIpv6Only) { Use-Ipv6Links $script:HostP }
+      Update-StreamQuality
+      Show-StreamQuality
+    }
     if ($wasOn) { Start-Standby }
+    if ($stopped) {
+      # A new connection: the next video waits until the players are back (as after a lost connection).
+      $script:RelayFresh = $fresh
+      if (-not $fresh -and -not ($script:PendingHold -and $script:PendingHold.Reason -eq 'start')) { $script:PendingHold = New-Hold 'reload' }
+    }
   } finally { $script:PromptOk = $was }
 }
 
@@ -4848,6 +4911,12 @@ function Main {
     Start-Standby
     if (Test-RelayAlive) { Say (T '  The stream is on the air (waiting screen), so you can put the link in the world''s player now.') 'DarkGray' }
   }
+  # The control window shows the link and the waiting screen (or 'Off') during the questions below too, with Next /
+  # Stop / Resync / Settings off until the first source updates it (they'd be about nothing playing yet).
+  if ($script:PanelShown) {
+    Update-Panel 'waiting' $null 0 ''
+    if ($script:PanelState) { $script:PanelState.Prompt = $true; try { Update-ControlPanel $script:PanelState } catch {} }
+  }
 
   $script:PromptOk = $true
   try {
@@ -4858,6 +4927,18 @@ function Main {
     Show-Queue
     Invoke-ResumeOffer
   } finally { $script:PromptOk = $false }
+  # Next / Stop / Resync / Settings clicked in the control window during those questions were about nothing playing
+  # yet: dropped, so they don't hit the first video. Add, viewer preview and clock still happen.
+  if ($script:PanelShown) {
+    $keep = @()
+    for ($i = 0; $i -lt 200; $i++) {
+      $p = $null
+      try { $p = Read-PanelCommand } catch {}
+      if (-not $p) { break }
+      if (@('add', 'viewer', 'clock') -contains $p.Cmd) { $keep += $p }
+    }
+    foreach ($p in $keep) { try { Add-PanelCommand $p.Cmd $p.Arg } catch {} }
+  }
   Invoke-Queue
   if ($script:QueueFinished -and $script:Idx -ge $script:Queue.Count) { Clear-State }
   Say ''
