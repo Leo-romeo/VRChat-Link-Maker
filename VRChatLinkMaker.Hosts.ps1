@@ -10,6 +10,8 @@
 #   topaz  - Topaz Chat (the default): free, trusted by VRChat, plays in every instance (Public too). About 1.4 Mbps.
 #   pc     - MediaMTX on this PC. Viewers connect to this PC (they see its internet address). Not for Public instances.
 #   vps    - MediaMTX on the user's own server on the internet; this PC sends the stream there (SRT with a passphrase).
+#            One server carries several streams at once (one per PC, each with its own link); other PCs get theirs as a
+#            connection code (see "my VPS: streams and connection codes").
 #   custom - links typed in by hand (IngestUrl / PcUrl / QuestUrl / VlcUrl in config.json), e.g. Twitch.
 # Get-HostProfile turns the config into one object with every link and limit of the active host (see HOSTS.md).
 # The pc / vps links carry a secret token (New-LinkToken); "new link" (Reset-StreamLink) replaces it.
@@ -20,6 +22,9 @@ $script:TopazRe = '^(?i)[a-z][a-z0-9+.-]*://(?:[^/@]*@)?(?:[^/:?#@]+\.)?topaz\.c
 # custom host may use. "x" also stands for "*.x". Unknown hosts count as untrusted (the safe mistake).
 $script:HostAllowlist = @('topaz.chat', 'twitch.tv', 'ttvnw.net', 'twitchcdn.net', 'jtvnw.net', 'youtube.com', 'youtu.be', 'googlevideo.com')
 $script:HostSecretRe = '^[A-Za-z0-9._~-]+$'   # passwords / passphrases: nothing that breaks a link or SRT's streamid (":")
+$script:VpsSafeRe = '^[A-Za-z0-9_-]+$'          # what the server's config takes (Assert-MtxSecret): the further streams' secrets
+$script:VpsCodePrefix = 'vrclm-vps1:'
+$script:VpsMaxStreams = 10                      # streams on one VPS in all, this PC's own one included
 # Cyrillic letters for Test-AnswerYes (these files stay plain ASCII): "d" of "da" (yes), and "n" (what the Y key types
 # on a Russian keyboard layout).
 $script:HostYesDa = '[' + [char]0x0434 + [char]0x0414 + ']'
@@ -98,7 +103,13 @@ function ConvertTo-HostAddress([string]$s) {
   $ip = $null
   if ($s -match '^\[([0-9A-Fa-f:.]+)\](?::\d+)?$') { $s = $matches[1] }
   elseif ($s -match '^([^:]+):\d+$') { $s = $matches[1] }
-  if ([System.Net.IPAddress]::TryParse($s, [ref]$ip)) { return $ip.ToString() }
+  if ([System.Net.IPAddress]::TryParse($s, [ref]$ip)) {
+    # (TryParse also takes "12345" or "1.2.3" as IPv4 shorthand, and IPv6 zone ids like "%12": none of them work in a link.)
+    if ($s -notmatch ':' -and $s -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { return '' }
+    if ($s -notmatch ':' -and $s -match '(^|\.)0\d') { return '' }   # (.NET reads "010" as octal: 8)
+    if ($s.Contains('%')) { return '' }
+    return $ip.ToString()
+  }
   $s = $s.TrimEnd('.').ToLowerInvariant()
   if ($s.Length -le 253 -and $s -match '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$') { return $s }
   return ''
@@ -256,17 +267,37 @@ function Initialize-HostConfig {
     Set-HostField $c 'Vps' $v ([ref]$chg)
   }
   Set-HostField $v 'Address' (ConvertTo-HostAddress (Get-Prop $v 'Address')) ([ref]$chg)
-  if (-not (Test-LinkToken (Get-Prop $v 'Token'))) { Set-HostField $v 'Token' (New-LinkToken) ([ref]$chg) }
+  # (A secret that was there but isn't valid is replaced too - and then the server no longer matches: say so.)
+  $remade = New-Object System.Collections.ArrayList
+  $t = "$(Get-Prop $v 'Token')"
+  if (-not (Test-LinkToken $t)) {
+    if ($t) { [void]$remade.Add('Token') }
+    Set-HostField $v 'Token' (New-LinkToken) ([ref]$chg)
+  }
   $u = "$(Get-Prop $v 'PublishUser')".Trim()
-  if ($u -notmatch '^[A-Za-z0-9._-]{1,32}$') { $u = 'vrclm' }
+  if ($u -notmatch '^[A-Za-z0-9._-]{1,32}$' -or $u -ieq 'any') {   # ("any" = MediaMTX's everybody)
+    if ($u) { [void]$remade.Add('PublishUser') }
+    $u = 'vrclm'
+  }
   Set-HostField $v 'PublishUser' $u ([ref]$chg)
   $pw = "$(Get-Prop $v 'PublishPass')"
-  if ($pw.Length -lt 12 -or $pw.Length -gt 64 -or $pw -notmatch $script:HostSecretRe) { $pw = New-HostSecret 24 }
+  if (-not (Test-VpsSecret $pw 12 64 $script:HostSecretRe)) {
+    if ($pw) { [void]$remade.Add('PublishPass') }
+    $pw = New-HostSecret 24
+  }
   Set-HostField $v 'PublishPass' $pw ([ref]$chg)
   foreach ($k in @('SrtPassphrase', 'ReadPassphrase')) {
     $pp = "$(Get-Prop $v $k)"
-    if ($pp.Length -lt 16 -or $pp.Length -gt 79 -or $pp -notmatch $script:HostSecretRe) { $pp = New-HostSecret 32 }   # (SRT takes 10-79)
+    if (-not (Test-VpsSecret $pp 16 79 $script:HostSecretRe)) {   # (SRT takes 10-79)
+      if ($pp) { [void]$remade.Add($k) }
+      $pp = New-HostSecret 32
+    }
     Set-HostField $v $k $pp ([ref]$chg)
+  }
+  if ("$($v.SrtPassphrase)" -ceq "$($v.ReadPassphrase)") { Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg) }
+  if ($remade.Count -gt 0 -and "$(Get-Prop $v 'Address')") {
+    if ("$(Get-Prop $v 'Role')" -eq 'guest') { Say (T 'config.json: Vps {0} wasn''t valid, so a new one was made. The VPS doesn''t know it: ask whoever manages the server for the connection code and paste it again (H -> My VPS).' ($remade -join ', ')) 'Yellow' }
+    else { Say (T 'config.json: Vps {0} wasn''t valid, so a new one was made. Your VPS doesn''t know it: paste install.sh on the server again, or the connection code again.' ($remade -join ', ')) 'Yellow' }
   }
   $ports = @((ConvertTo-HostInt (Get-Prop $v 'SrtPort') 8890 1 65535), (ConvertTo-HostInt (Get-Prop $v 'RtspPort') 8554 1 65535),
     (ConvertTo-HostInt (Get-Prop $v 'RtmpPort') 1935 1 65535), (ConvertTo-HostInt (Get-Prop $v 'HlsPort') 8888 1 65535))
@@ -281,6 +312,25 @@ function Initialize-HostConfig {
   Set-HostField $v 'Hls' (ConvertTo-HostBool (Get-Prop $v 'Hls') $false) ([ref]$chg)
   Set-HostField $v 'MaxReaders' (ConvertTo-HostInt (Get-Prop $v 'MaxReaders') 30 1 1000) ([ref]$chg)
   Set-HostField $v 'VideoKbps' (ConvertTo-HostInt (Get-Prop $v 'VideoKbps') 4000 200 100000) ([ref]$chg)
+  # owner = this PC set the server up (it writes install.sh); guest = it streams with a connection code from that PC.
+  $role = "$(Get-Prop $v 'Role')".Trim().ToLowerInvariant()
+  if ($role -notin @('owner', 'guest')) { $role = 'owner' }
+  Set-HostField $v 'Role' $role ([ref]$chg)
+  Set-HostField $v 'Name' (ConvertTo-VpsStreamName (Get-Prop $v 'Name')) ([ref]$chg)
+  # The further streams on the server, for other PCs (only the PC that manages the server keeps them).
+  $old = @(@(Get-Prop $v 'Streams') | Where-Object { $null -ne $_ })
+  $keep = New-Object System.Collections.ArrayList
+  if ($role -eq 'owner') {
+    $seenTok = New-VpsSeenSet; [void]$seenTok.Add("$($v.Token)")
+    $seenUser = New-VpsSeenSet; [void]$seenUser.Add("$($v.PublishUser)".ToLowerInvariant())
+    foreach ($e in $old) {
+      if ($e -isnot [System.Management.Automation.PSCustomObject] -or $keep.Count + 1 -ge $script:VpsMaxStreams) { continue }
+      Repair-VpsStream $e (T 'Stream {0}' ($keep.Count + 2)) $seenTok $seenUser "$($v.ReadPassphrase)" ([ref]$chg)
+      [void]$keep.Add($e)
+    }
+  }
+  $sp = $v.PSObject.Properties['Streams']
+  if (-not $sp -or $sp.Value -isnot [array] -or $keep.Count -ne $old.Count) { Set-VpsStreamList $v $keep.ToArray() ([ref]$chg) }
   return [bool]$chg
 }
 
@@ -537,12 +587,407 @@ function Set-SelfHostNameInteractive($s) {
   }
 }
 
-# Makes the VPS setup files (part 2) and says where they are and what to do with them.
-function Show-VpsBundle($v) {
+# ------------------------------------------------------------------ my VPS: streams and connection codes
+# One VPS carries several streams at the same time, each with its own link (token), publish user + password and SRT
+# passphrase, so several PCs can stream at once without taking the stream from each other:
+#   - this PC's own stream: Vps.Token / PublishUser / PublishPass / SrtPassphrase (Vps.Name = its name, optional);
+#   - Vps.Streams: the further ones, made here for other PCs ("Add a stream for another PC").
+# Vps.Role 'owner' = this PC set the server up: its install.sh (New-VpsSetupBundle) carries every stream. 'guest' = this
+# PC got one stream as a connection code from that PC: it streams, but never writes install.sh (that would wipe the rest).
+# A connection code is "vrclm-vps1:" + base64url of a small JSON: the address, the ports and one stream's secrets
+# (a, sp, rp, mp, hp, h; n = name, t, u, p, s). A "whole server" code adds r (the read passphrase), m (MaxReaders) and
+# x (the further streams), so another PC of the same person can manage the server too.
+# Codes are as secret as the vps-setup files: they are shown with Write-Host only (Say would put them into log.txt).
+
+function Test-VpsSecret([string]$s, [int]$min, [int]$max, [string]$re = $script:VpsSafeRe) {
+  return ($s.Length -ge $min -and $s.Length -le $max -and $s -match $re)
+}
+
+# A stream's name for the menus: letters, digits, spaces and . _ - ( ), at most 32 characters ('' = $default).
+function ConvertTo-VpsStreamName($s, [string]$default = '') {
+  $n = (("$s" -replace '[^\p{L}\p{Nd} ._()-]', '') -replace '\s+', ' ').Trim()
+  if ($n.Length -gt 32) { $n = $n.Substring(0, 32).Trim() }
+  if (-not $n) { return $default }
+  return $n
+}
+
+# A set of tokens / user names (exact case: links are case-sensitive).
+function New-VpsSeenSet { return , (New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)) }
+
+function New-VpsUserName($seen) {
+  $i = 2
+  while ($seen.Contains("vrclm$i")) { $i++ }
+  return "vrclm$i"
+}
+
+# One of Vps.Streams: what is missing or broken is made (a new token = a new link for that stream). $seenTok / $seenUser
+# = the tokens / user names (lower case) taken already: no two streams may share one.
+function Repair-VpsStream($e, [string]$defName, $seenTok, $seenUser, [string]$readPass, [ref]$chg) {
+  Set-HostField $e 'Name' (ConvertTo-VpsStreamName (Get-Prop $e 'Name') $defName) $chg
+  $t = "$(Get-Prop $e 'Token')"
+  if (-not (Test-LinkToken $t) -or $seenTok.Contains($t)) { $t = New-LinkToken }
+  [void]$seenTok.Add($t)
+  Set-HostField $e 'Token' $t $chg
+  $u = "$(Get-Prop $e 'PublishUser')".Trim()
+  if ($u -notmatch '^[A-Za-z0-9_-]{1,32}$' -or $u -ieq 'any' -or $seenUser.Contains($u.ToLowerInvariant())) { $u = New-VpsUserName $seenUser }
+  [void]$seenUser.Add($u.ToLowerInvariant())
+  Set-HostField $e 'PublishUser' $u $chg
+  $pw = "$(Get-Prop $e 'PublishPass')"
+  if (-not (Test-VpsSecret $pw 16 64)) { $pw = New-HostSecret 24 }
+  Set-HostField $e 'PublishPass' $pw $chg
+  $pp = "$(Get-Prop $e 'SrtPassphrase')"
+  if (-not (Test-VpsSecret $pp 16 79) -or $pp -ceq $readPass) { $pp = New-HostSecret 32 }
+  Set-HostField $e 'SrtPassphrase' $pp $chg
+}
+
+# Vps.Streams = $list (always an array, so config.json keeps its [ ] with a single stream too).
+function Set-VpsStreamList($v, $list, [ref]$chg) {
+  $arr = [object[]]@(@($list) | Where-Object { $null -ne $_ })
+  $p = $v.PSObject.Properties['Streams']
+  if ($p) { $p.Value = $arr } else { $v | Add-Member -NotePropertyName 'Streams' -NotePropertyValue $arr }
+  $chg.Value = $true
+}
+
+# This PC's stream first, then (on the PC that manages the server) the further ones -> Name, Token, PublishUser,
+# PublishPass, SrtPassphrase, Own.
+function Get-VpsStreams($v) {
+  $list = New-Object System.Collections.ArrayList
+  [void]$list.Add([pscustomobject]@{ Name = (ConvertTo-VpsStreamName (Get-Prop $v 'Name')); Token = "$(Get-Prop $v 'Token')"
+      PublishUser = "$(Get-Prop $v 'PublishUser')"; PublishPass = "$(Get-Prop $v 'PublishPass')"; SrtPassphrase = "$(Get-Prop $v 'SrtPassphrase')"; Own = $true
+    })
+  if ("$(Get-Prop $v 'Role')" -ne 'guest') {
+    foreach ($e in @(Get-Prop $v 'Streams')) {
+      if ($e -isnot [System.Management.Automation.PSCustomObject]) { continue }
+      [void]$list.Add([pscustomobject]@{ Name = "$(Get-Prop $e 'Name')"; Token = "$(Get-Prop $e 'Token')"; PublishUser = "$(Get-Prop $e 'PublishUser')"
+          PublishPass = "$(Get-Prop $e 'PublishPass')"; SrtPassphrase = "$(Get-Prop $e 'SrtPassphrase')"; Own = $false
+        })
+    }
+  }
+  return $list.ToArray()
+}
+
+# $stream (one of Get-VpsStreams) -> its connection code. $manage: the whole server (every stream + the read passphrase).
+function ConvertTo-VpsConnectCode($v, $stream, [bool]$manage = $false) {
+  $o = [ordered]@{
+    a = "$(Get-Prop $v 'Address')"; sp = [int]$v.SrtPort; rp = [int]$v.RtspPort; mp = [int]$v.RtmpPort; hp = [int]$v.HlsPort
+    h = [bool](ConvertTo-HostBool (Get-Prop $v 'Hls') $false)
+    n = "$($stream.Name)"; t = "$($stream.Token)"; u = "$($stream.PublishUser)"; p = "$($stream.PublishPass)"; s = "$($stream.SrtPassphrase)"
+  }
+  if ($manage) {
+    $o.r = "$(Get-Prop $v 'ReadPassphrase')"
+    $o.m = ConvertTo-HostInt (Get-Prop $v 'MaxReaders') 30 1 1000
+    $x = New-Object System.Collections.ArrayList
+    foreach ($e in @(Get-VpsStreams $v)) {
+      if ($e.Own -or $e.Token -eq $stream.Token) { continue }
+      [void]$x.Add([ordered]@{ n = $e.Name; t = $e.Token; u = $e.PublishUser; p = $e.PublishPass; s = $e.SrtPassphrase })
+    }
+    $o.x = $x.ToArray()
+  }
+  $json = ConvertTo-Json -InputObject $o -Compress -Depth 4
+  $b = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+  return $script:VpsCodePrefix + $b
+}
+
+function Test-VpsCodeText([string]$s) { return ($s -match '(?i)vrclm-vps\d*:') }
+
+# One stream inside a code -> Name, Token, PublishUser, PublishPass, SrtPassphrase (checked with the same rules as
+# config.json: Initialize-HostConfig for this PC's own stream, Repair-VpsStream for the further ones).
+function ConvertFrom-VpsCodeStream($e, [bool]$own, [string]$bad) {
+  if ($e -isnot [System.Management.Automation.PSCustomObject]) { throw $bad }
+  $r = [pscustomobject]@{ Name = (ConvertTo-VpsStreamName (Get-Prop $e 'n')); Token = "$(Get-Prop $e 't')"; PublishUser = "$(Get-Prop $e 'u')"
+    PublishPass = "$(Get-Prop $e 'p')"; SrtPassphrase = "$(Get-Prop $e 's')"
+  }
+  if ($own) { $ok = ($r.PublishUser -match '^[A-Za-z0-9._-]{1,32}$') -and (Test-VpsSecret $r.PublishPass 12 64 $script:HostSecretRe) -and (Test-VpsSecret $r.SrtPassphrase 16 79 $script:HostSecretRe) }
+  else { $ok = ($r.PublishUser -match '^[A-Za-z0-9_-]{1,32}$') -and (Test-VpsSecret $r.PublishPass 16 64) -and (Test-VpsSecret $r.SrtPassphrase 16 79) }
+  if (-not $ok -or $r.PublishUser -ieq 'any' -or -not (Test-LinkToken $r.Token)) { throw $bad }
+  return $r
+}
+
+# Pasted text with a connection code in it -> the settings it carries (Address, SrtPort, RtspPort, RtmpPort, HlsPort, Hls,
+# Name, Token, PublishUser, PublishPass, SrtPassphrase, Manage; for a whole-server code ReadPassphrase, MaxReaders and
+# Streams too). Throws a message in plain words when it isn't a usable code.
+function ConvertFrom-VpsConnectCode([string]$text) {
+  $bad = T 'That connection code is incomplete or damaged - copy all of it again (it is one long line).'
+  # As pasted, else without spaces / line breaks (a chat window may have wrapped it).
+  $o = $null
+  foreach ($cand in @("$text", ("$text" -replace '\s', ''))) {
+    $m = [regex]::Match($cand, '(?i)vrclm-vps(\d+):([A-Za-z0-9_-]*)')
+    if (-not $m.Success) { continue }
+    if ($m.Groups[1].Value -ne '1') { throw (T 'That connection code is from a newer VRChat Link Maker: update this one first.') }
+    $b = $m.Groups[2].Value
+    if ($b.Length -lt 40 -or $b.Length -gt 8000 -or $b.Length % 4 -eq 1) { continue }
+    $b = $b.Replace('-', '+').Replace('_', '/') + ('=' * ((4 - $b.Length % 4) % 4))
+    try { $o = ConvertFrom-Json ((New-Object System.Text.UTF8Encoding($false, $true)).GetString([Convert]::FromBase64String($b))) } catch { $o = $null }
+    if ($o -is [System.Management.Automation.PSCustomObject]) { break }
+    $o = $null
+  }
+  if (-not $o) { throw $bad }
+  $addr = ConvertTo-HostAddress "$(Get-Prop $o 'a')"
+  if (-not $addr) { throw $bad }
+  $ports = @{}
+  foreach ($k in @('sp', 'rp', 'mp', 'hp')) {
+    $ports[$k] = ConvertTo-HostInt (Get-Prop $o $k) 0 1 65535
+    if ($ports[$k] -eq 0) { throw $bad }
+  }
+  if (@($ports.rp, $ports.mp, $ports.hp | Select-Object -Unique).Count -ne 3) { throw $bad }
+  $main = ConvertFrom-VpsCodeStream $o $true $bad
+  $k = [ordered]@{
+    Address = $addr; SrtPort = $ports.sp; RtspPort = $ports.rp; RtmpPort = $ports.mp; HlsPort = $ports.hp
+    Hls = [bool](ConvertTo-HostBool (Get-Prop $o 'h') $false); Name = $main.Name; Token = $main.Token; PublishUser = $main.PublishUser
+    PublishPass = $main.PublishPass; SrtPassphrase = $main.SrtPassphrase; Manage = $false; ReadPassphrase = ''; MaxReaders = 30; Streams = @()
+  }
+  $rp = Get-Prop $o 'r'
+  if ($null -ne $rp) {
+    $rp = "$rp"
+    if (-not (Test-VpsSecret $rp 16 79 $script:HostSecretRe) -or $rp -ceq $main.SrtPassphrase) { throw $bad }
+    $seenTok = New-VpsSeenSet; [void]$seenTok.Add($main.Token)
+    $seenUser = New-VpsSeenSet; [void]$seenUser.Add($main.PublishUser.ToLowerInvariant())
+    $xs = New-Object System.Collections.ArrayList
+    foreach ($e in @(Get-Prop $o 'x')) {
+      if ($null -eq $e) { continue }
+      $st = ConvertFrom-VpsCodeStream $e $false $bad
+      if (-not $seenTok.Add($st.Token) -or -not $seenUser.Add($st.PublishUser.ToLowerInvariant()) -or $st.SrtPassphrase -ceq $rp) { throw $bad }
+      [void]$xs.Add($st)
+    }
+    if ($xs.Count + 1 -gt $script:VpsMaxStreams) { throw $bad }
+    $k.Manage = $true; $k.ReadPassphrase = $rp; $k.MaxReaders = ConvertTo-HostInt (Get-Prop $o 'm') 30 1 1000; $k.Streams = $xs.ToArray()
+  }
+  return [pscustomobject]$k
+}
+
+# Takes a code's settings over ($k from ConvertFrom-VpsConnectCode). This PC's own preferences (Push, VideoKbps) stay.
+function Import-VpsConnectCode($v, $k) {
+  $chg = $false
+  foreach ($f in @('Address', 'SrtPort', 'RtspPort', 'RtmpPort', 'HlsPort', 'Hls', 'Name', 'Token', 'PublishUser', 'PublishPass', 'SrtPassphrase')) {
+    Set-HostField $v $f $k.$f ([ref]$chg)
+  }
+  $list = @()
+  if ($k.Manage) {
+    Set-HostField $v 'Role' 'owner' ([ref]$chg)
+    Set-HostField $v 'ReadPassphrase' $k.ReadPassphrase ([ref]$chg)
+    Set-HostField $v 'MaxReaders' ([int]$k.MaxReaders) ([ref]$chg)
+    $list = @($k.Streams | ForEach-Object { [pscustomobject][ordered]@{ Name = $_.Name; Token = $_.Token; PublishUser = $_.PublishUser; PublishPass = $_.PublishPass; SrtPassphrase = $_.SrtPassphrase } })
+  } else {
+    Set-HostField $v 'Role' 'guest' ([ref]$chg)
+    # (A guest never uses it; it only has to differ from the publish passphrase.)
+    if ("$(Get-Prop $v 'ReadPassphrase')" -ceq $k.SrtPassphrase) { Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg) }
+  }
+  Set-VpsStreamList $v $list ([ref]$chg)
+}
+
+# New secrets for this PC's own stream and no further streams (a new server of its own, set up with install.sh).
+function Reset-VpsOwnSecrets($v) {
+  $chg = $false
+  Set-HostField $v 'Token' (New-LinkToken) ([ref]$chg)
+  Set-HostField $v 'PublishUser' 'vrclm' ([ref]$chg)
+  Set-HostField $v 'PublishPass' (New-HostSecret 24) ([ref]$chg)
+  Set-HostField $v 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
+  Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg)
+  Set-HostField $v 'Name' '' ([ref]$chg)
+  Set-HostField $v 'Role' 'owner' ([ref]$chg)
+  Set-VpsStreamList $v @() ([ref]$chg)
+}
+
+function Save-VpsConfig {
+  try { Save-Config $script:Cfg } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red' }
+}
+
+# Shows a connection code (on the screen only, never in log.txt) and copies it to the clipboard.
+# The code onto the clipboard, but not into Windows' clipboard history or cloud clipboard (Win+V): it is a password.
+# (Needs the STA thread the .bat starts; $false = not copied.)
+function Set-VpsClipboard([string]$text) {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    $d = New-Object System.Windows.Forms.DataObject
+    $d.SetData([System.Windows.Forms.DataFormats]::UnicodeText, $text)
+    foreach ($f in @('CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard', 'ExcludeClipboardContentFromMonitorProcessing')) {
+      $d.SetData($f, (New-Object System.IO.MemoryStream(, [BitConverter]::GetBytes([int]0))))
+    }
+    [System.Windows.Forms.Clipboard]::SetDataObject($d, $true)
+    return $true
+  } catch { return $false }
+}
+
+function Show-VpsCode([string]$code) {
+  Say ''
+  Write-Host "      $code" -ForegroundColor Green
+  Say ''
+  if (Set-VpsClipboard $code) { Say (T '  (The code is copied to your clipboard.)') 'DarkGray' }
+  else { Say (T '  (Select the code above with the mouse and copy it: it is one long line.)') 'DarkGray' }
+  Say (T '  The code works like a password for that stream: send it only to whoever streams with it (in a private message).') 'Yellow'
+}
+
+# ------------------------------------------------------------------ my VPS: is it ready?
+# One RTSP request to the VPS (a name, an IPv4 or an IPv6 address) -> Code (the status, e.g. 404; 0 = no connection or no
+# answer) and Detail. Its own small client: Send-MtxRtspAnnounce only does IPv4 addresses.
+function Invoke-VpsRtsp([string]$addr, [int]$port, [string]$request, [int]$ms) {
+  $sock = $null
+  try {
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($addr, [ref]$ip)) {
+      $ar = [System.Net.Dns]::BeginGetHostAddresses($addr, $null, $null)
+      if (-not $ar.AsyncWaitHandle.WaitOne($ms)) { return [pscustomobject]@{ Code = 0; Detail = 'name lookup timed out' } }
+      $all = @([System.Net.Dns]::EndGetHostAddresses($ar))
+      $ip = @(@($all | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork }) +
+        @($all | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6 })) | Select-Object -First 1
+      if (-not $ip) { return [pscustomobject]@{ Code = 0; Detail = 'name not found' } }
+    }
+    $sock = New-Object System.Net.Sockets.Socket($ip.AddressFamily, [System.Net.Sockets.SocketType]::Stream, [System.Net.Sockets.ProtocolType]::Tcp)
+    $ar = $sock.BeginConnect($ip, $port, $null, $null)
+    if (-not $ar.AsyncWaitHandle.WaitOne($ms)) { return [pscustomobject]@{ Code = 0; Detail = 'connection timed out' } }
+    $sock.EndConnect($ar)
+    $sock.ReceiveTimeout = $ms
+    $sock.SendTimeout = $ms
+    [void]$sock.Send([System.Text.Encoding]::ASCII.GetBytes($request))
+    $buf = New-Object byte[] 4096
+    $got = ''
+    while ($got -notmatch "`r`n`r`n" -and $got.Length -lt 65536) {
+      $n = $sock.Receive($buf)
+      if ($n -le 0) { break }
+      $got += [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+    }
+    $m = [regex]::Match($got, '^RTSP/1\.0 (\d{3})[^\r\n]*')
+    if ($m.Success) { return [pscustomobject]@{ Code = [int]$m.Groups[1].Value; Detail = $m.Value } }
+    return [pscustomobject]@{ Code = 0; Detail = 'no RTSP answer' }
+  } catch {
+    return [pscustomobject]@{ Code = 0; Detail = $_.Exception.Message }
+  } finally { if ($sock) { try { $sock.Close() } catch {} } }
+}
+
+# What the VPS says about a stream's link (anyone may ask: reading needs no password) -> State, Code, Detail, PassOk:
+#   'live' (200) = someone streams on it right now; 'idle' (404) = the server knows the link, nobody streams on it;
+#   'unknown' (400 "path is not configured") = the server doesn't know the link (another token, or install.sh wasn't
+#   pasted again since); 'down' = no connection or no answer; 'other' = any other answer (Code).
+# With $user / $pass it also sends them in an ANNOUNCE (the first step of publishing, without RECORD, so it doesn't take
+# a live stream over) -> PassOk $true (200) / $false (401) / $null (not checked). Checked with MediaMTX v1.21.1.
+function Test-VpsStream([string]$addr, [int]$port, [string]$token, [string]$user = '', [string]$pass = '', [int]$ms = 4000) {
+  $url = "rtsp://$(Format-HostForUrl $addr):$port/live/$token"
+  $d = Invoke-VpsRtsp $addr $port "DESCRIBE $url RTSP/1.0`r`nCSeq: 1`r`nAccept: application/sdp`r`nUser-Agent: VRChatLinkMaker`r`n`r`n" $ms
+  $state = 'other'
+  switch ($d.Code) { 0 { $state = 'down' } 200 { $state = 'live' } 404 { $state = 'idle' } 400 { $state = 'unknown' } }
+  $r = [pscustomobject]@{ State = $state; Code = $d.Code; Detail = $d.Detail; PassOk = $null }
+  if ($user -and $pass -and ($state -eq 'live' -or $state -eq 'idle')) {
+    $sdp = "v=0`r`no=- 0 0 IN IP4 127.0.0.1`r`ns=vrclm-check`r`nc=IN IP4 0.0.0.0`r`nt=0 0`r`nm=video 0 RTP/AVP 96`r`n" +
+      "a=rtpmap:96 H264/90000`r`na=fmtp:96 packetization-mode=1`r`na=control:trackID=0`r`n"
+    $auth = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("${user}:$pass"))
+    # (MediaMTX answers a wrong password only after a pause of a few seconds.)
+    $a = Invoke-VpsRtsp $addr $port ("ANNOUNCE $url RTSP/1.0`r`nCSeq: 1`r`nUser-Agent: VRChatLinkMaker`r`nAuthorization: Basic $auth`r`n" +
+      "Content-Type: application/sdp`r`nContent-Length: $($sdp.Length)`r`n`r`n$sdp") ([Math]::Max($ms, 8000))
+    if ($a.Code -eq 200) { $r.PassOk = $true } elseif ($a.Code -eq 401 -or $a.Code -eq 403) { $r.PassOk = $false }
+  }
+  return $r
+}
+
+# This PC's stream on its VPS, from config.json -> Test-VpsStream's answer ($null = no address).
+function Test-VpsOwnStream([bool]$withPass, [int]$ms = 4000) {
+  $v = Get-Prop $script:Cfg 'Vps'
+  $addr = ConvertTo-HostAddress "$(Get-Prop $v 'Address')"
+  if (-not $addr) { return $null }
+  $user = ''; $pass = ''
+  if ($withPass) { $user = "$(Get-Prop $v 'PublishUser')"; $pass = "$(Get-Prop $v 'PublishPass')" }
+  return (Test-VpsStream $addr (ConvertTo-HostInt (Get-Prop $v 'RtspPort') 8554 1 65535) "$(Get-Prop $v 'Token')" $user $pass $ms)
+}
+
+# What's wrong when the VPS won't take this PC's stream, in plain words ('' = nothing found).
+function Get-VpsProblemText($r) {
+  $v = Get-Prop $script:Cfg 'Vps'
+  $guest = ("$(Get-Prop $v 'Role')" -eq 'guest')
+  if (-not $r) { return (T '  The VPS address isn''t set yet: choose "My VPS" in the host menu (H) and type it in.') }
+  switch ($r.State) {
+    'down' { return (T '  Your VPS ({0}) doesn''t answer on port {1}: is the server on, is MediaMTX installed there (install.sh), and are its ports open?' $v.Address $v.RtspPort) }
+    'unknown' {
+      if ($guest) { return (T '  The VPS doesn''t know your link: ask whoever manages the server for a new connection code (they may have to paste install.sh on the server again first).') }
+      return (T '  The VPS doesn''t know this PC''s link. Set up from this PC? Then paste install.sh from the vps-setup folder on the server again. Set up from another PC? Then paste that PC''s connection code here (H -> My VPS) instead.')
+    }
+  }
+  if ($r.PassOk -eq $false) {
+    if ($guest) { return (T '  The VPS refused your stream''s password: ask whoever manages the server for a new connection code.') }
+    return (T '  The VPS refused this PC''s publish password: paste install.sh on the server again, or the connection code from the PC that manages it.')
+  }
+  return ''
+}
+
+# Before streaming to the VPS (Start-HostServer): does it answer, know this PC's link and take its password, and is
+# nobody else on that link? -> $true (stream there), $false (through Topaz Chat this time) or 'menu' (choose another host).
+function Test-VpsReady($p) {
+  if (-not (ConvertTo-HostAddress "$(Get-Prop (Get-Prop $script:Cfg 'Vps') 'Address')")) {
+    Say (T 'The VPS address isn''t set yet, so this time it streams through Topaz Chat (H on the start screen = type it in).') 'Yellow'
+    return $false
+  }
+  Say (T 'Checking your VPS...') 'Gray'
+  $r = Test-VpsOwnStream $true
+  if ($r.State -eq 'live') {
+    # Maybe only this PC's last run still ending on the server (it lets a lost publisher go after about 10 s).
+    $until = (Get-Date).AddSeconds(12)
+    while ($r.State -eq 'live' -and (Get-Date) -lt $until) { Wait-HostPump 2000; $r = Test-VpsOwnStream $false }
+    if ($r.State -eq 'live' -or $r.State -eq 'idle') { $r = Test-VpsOwnStream $true }
+  }
+  $canAsk = (Test-HostFn 'Test-CanAsk') -and (Test-CanAsk) -and (Test-HostFn 'Read-Choice')
+  $problem = Get-VpsProblemText $r
+  if ($problem) {
+    Say $problem 'Yellow'
+    if (-not $canAsk) { Say (T '  This time it streams through Topaz Chat.') 'Yellow'; return $false }
+    $pick = Read-Choice (T 'Stream to the VPS anyway?') @((T 'No - stream through Topaz Chat this time'), (T 'Yes - try the VPS anyway'), (T 'Choose another host')) 0 $false
+    if ($pick -eq 1) { return $true }
+    if ($pick -eq 2) { return 'menu' }
+    return $false
+  }
+  if ($r.State -eq 'live') {
+    Say (T '  Someone is streaming on this VPS link right now (another PC with the same connection code?). Streaming from here takes the stream over.') 'Yellow'
+    if (-not $canAsk) { Say (T '  This time it streams through Topaz Chat.') 'Yellow'; return $false }
+    $pick = Read-Choice (T 'Take the stream over?') @((T 'No - stream through Topaz Chat this time'), (T 'Yes - take it over'), (T 'Choose another host')) 0 $false
+    if ($pick -eq 1) { return $true }
+    if ($pick -eq 2) { return 'menu' }
+    return $false
+  }
+  if ($r.State -eq 'idle') { Say (T '  Your VPS is ready.') 'DarkGray' }
+  return $true
+}
+
+# After the relay to the VPS broke (Wait-RelayRetry): why, as the server sees it. $sent = the relay had been sending;
+# $endedItself = the server or the network ended it (not this tool: a stall, a resync...).
+# -> $null, or Why (a reason in plain words) and Stop + Message: another PC streams on the same link and took it twice
+# within 3 minutes, so this PC gives way instead of taking it back again and again (both would keep kicking each other).
+# (The server still lists a lost connection for up to about 10 s, so "live" right after a break may be this PC's own.)
+$script:VpsTakeoverAt = $null
+function Get-VpsRelayVerdict([bool]$sent, [bool]$endedItself = $true) {
+  $r = Test-VpsOwnStream (-not $sent) 2500
+  if (-not $r) { return $null }
+  $why = ''
+  if ($r.State -eq 'down') { $why = T 'your VPS doesn''t answer' }
+  elseif ($r.State -eq 'unknown') { $why = T 'the VPS doesn''t know this link (H -> My VPS says what to do)' }
+  elseif ($r.PassOk -eq $false) { $why = T 'the VPS refused the publish password (H -> My VPS says what to do)' }
+  elseif (-not $endedItself) { return $null }   # (this tool ended it - a stall, a resync: that reason stands)
+  elseif (-not $sent) {
+    if ($r.PassOk -eq $true -and "$($script:HostP.IngestUrl)" -match '^(?i)srt://') { $why = T 'the VPS didn''t take the stream: UDP port {0} (SRT) may be closed in its firewall, or the SRT passphrase doesn''t match' (Get-Prop (Get-Prop $script:Cfg 'Vps') 'SrtPort') }
+  } elseif ($r.State -eq 'live') {
+    $now = Get-Date
+    if ($script:VpsTakeoverAt -and ($now - $script:VpsTakeoverAt).TotalSeconds -lt 180) {
+      # Taken again soon: wait until this PC's own lost connection would be gone from the server, then give way.
+      $until = $now.AddSeconds(12)
+      do { Wait-HostPump 2000; $r2 = Test-VpsOwnStream $false 2500 } while ($r2 -and $r2.State -eq 'live' -and (Get-Date) -lt $until)
+      if ($r2 -and $r2.State -eq 'live') {
+        $msg = T 'Another PC is streaming on your VPS link (it uses the same connection code), so this PC stopped sending - otherwise both would keep taking the stream from each other. Each PC needs its own stream: on the PC that manages the server choose H -> My VPS -> "Add a stream for another PC".'
+        return [pscustomobject]@{ Why = ''; Stop = $true; Message = $msg }
+      }
+      return $null
+    }
+    # (Only noted: it may be this PC's own connection still listed. Reconnecting takes the link over either way.)
+    $script:VpsTakeoverAt = $now
+  }
+  if (-not $why) { return $null }
+  return [pscustomobject]@{ Why = $why; Stop = $false; Message = '' }
+}
+
+# ------------------------------------------------------------------ my VPS: the menus
+# Makes the VPS setup files (part 2) and says where they are and what to do with them. Not on a PC that streams with a
+# connection code: the server is managed on another PC, and this one's install.sh would replace everything there.
+function Show-VpsBundle($v, [switch]$Quiet) {
   if (-not (Test-HostFn 'New-VpsSetupBundle')) { return }
+  if ("$(Get-Prop $v 'Role')" -eq 'guest') { return }
   $dir = $null
   try { $dir = New-VpsSetupBundle $v } catch { Say (T '  Couldn''t make the VPS setup files: {0}' $_.Exception.Message) 'Red'; return }
-  if (-not $dir) { return }
+  if (-not $dir -or $Quiet) { return }
   $tcp = "$($v.RtspPort), $($v.RtmpPort)"
   if (ConvertTo-HostBool (Get-Prop $v 'Hls') $false) { $tcp += ", $($v.HlsPort)" }
   Say ''
@@ -553,26 +998,247 @@ function Show-VpsBundle($v) {
   Say (T '  Keep these files to yourself: they contain your VPS''s passwords.') 'Yellow'
 }
 
-# vps: the address, then the setup files (README-VPS.txt, install.sh, mediamtx.yml). $false = no address yet.
+# The VPS settings so far, kept in config.json as "VpsBefore" before a code or a new server replaces them.
+function Save-VpsBefore($v) {
+  # (Not Set-HostField: it compares objects by their text, which leaves the Streams list out.)
+  $copy = $v | ConvertTo-Json -Depth 6 | ConvertFrom-Json
+  $p = $script:Cfg.PSObject.Properties['VpsBefore']
+  if ($p) { $p.Value = $copy } else { $script:Cfg | Add-Member -NotePropertyName 'VpsBefore' -NotePropertyValue $copy }
+}
+
+# A pasted code: checked, then taken over (after asking, if it would replace the server this PC manages). $true = done.
+function Invoke-VpsCodeImport($v, [string]$text) {
+  try { $k = ConvertFrom-VpsConnectCode $text } catch { Say ('   ' + $_.Exception.Message) 'Yellow'; return $false }
+  $isOwner = ("$(Get-Prop $v 'Role')" -ne 'guest')
+  $addrNow = ConvertTo-HostAddress "$(Get-Prop $v 'Address')"
+  if ($isOwner -and $addrNow) {
+    # Only a whole-server code for this same server that knows every stream this PC knows replaces nothing.
+    $kept = @($k.Streams | ForEach-Object { $_.Token })
+    $lost = @(Get-VpsStreams $v | Where-Object { -not $_.Own -and $kept -notcontains $_.Token } | ForEach-Object { $_.Name })
+    $same = ($k.Address -eq $addrNow -and $k.Token -ceq "$($v.Token)")
+    if (-not ($k.Manage -and $same -and $lost.Count -eq 0)) {
+      if (-not $k.Manage) { Say (T '  This PC manages the VPS {0} now. With this code it only streams on one stream of a server, and can''t change {0} any more (its streams keep running).' $addrNow) 'Yellow' }
+      elseif ($lost.Count -gt 0) { Say (T '  This code replaces this PC''s VPS settings. These streams are only known here and would be dropped: {0}.' ($lost -join ', ')) 'Yellow' }
+      else { Say (T '  This code replaces this PC''s VPS settings (this PC then uses the link in the code).') 'Yellow' }
+      Say (T '  (The settings so far are kept in config.json as "VpsBefore".)') 'DarkGray'
+      if (-not (Test-AnswerYes (Read-HostLine (T 'Use the code anyway? [y/N]')))) { return $false }
+      Save-VpsBefore $v
+    }
+  }
+  Import-VpsConnectCode $v $k
+  Save-VpsConfig
+  if ($k.Manage) { Show-VpsBundle $v -Quiet }
+  if ($k.Manage) {
+    Say (T '  Done: this PC manages the VPS {0} too ({1} streams on it).' $k.Address ($k.Streams.Count + 1)) 'Green'
+    Say (T '  It uses the same link as the PC the code came from (only one of the two can stream on it at a time). Change the streams on one PC only: the server gets the streams of the PC that pasted install.sh last.') 'Yellow'
+  }
+  elseif ($k.Name) { Say (T '  Done: this PC streams on "{0}" on the VPS {1}.' $k.Name $k.Address) 'Green' }
+  else { Say (T '  Done: this PC streams on the VPS {0}.' $k.Address) 'Green' }
+  Show-VpsDiagnosis $true
+  return $true
+}
+
+# Asks the VPS about this PC's stream and says what's wrong. $okLine: also say so when all is well.
+function Show-VpsDiagnosis([bool]$okLine) {
+  Say (T 'Checking your VPS...') 'Gray'
+  $r = Test-VpsOwnStream $true
+  $problem = Get-VpsProblemText $r
+  if ($problem) { Say $problem 'Yellow'; return }
+  if (-not $okLine) { return }
+  if ($r.PassOk -eq $true) { Say (T '  The VPS knows this stream and takes its password.') 'DarkGreen' }
+  elseif ($r.State -eq 'idle' -or $r.State -eq 'live') { Say (T '  The VPS knows this stream.') 'DarkGreen' }
+}
+
+# The streams on the server this PC manages: their state on the server, and add / show a code / remove.
+function Get-VpsStreamStates($v, $list) {
+  $addr = ConvertTo-HostAddress "$(Get-Prop $v 'Address')"
+  $port = ConvertTo-HostInt (Get-Prop $v 'RtspPort') 8554 1 65535
+  $out = @()
+  $down = $false
+  foreach ($e in $list) {
+    if (-not $addr -or $down) { $out += 'down'; continue }
+    $r = Test-VpsStream $addr $port $e.Token '' '' 3000
+    if ($r.State -eq 'down') { $down = $true }
+    $out += $r.State
+  }
+  return $out
+}
+
+function Format-VpsStreamLine($e, [string]$state) {
+  $name = $e.Name
+  if ($e.Own -and $e.Name) { $name = T '{0} (this PC)' $e.Name }
+  elseif ($e.Own) { $name = T 'this PC' }
+  switch ($state) {
+    'live' { return (T '{0} - on the air now' $name) }
+    'idle' { return (T '{0} - ready' $name) }
+    'unknown' { return (T '{0} - not on the server yet: paste install.sh there again' $name) }
+    'down' { return (T '{0} - the server doesn''t answer' $name) }
+  }
+  return $name
+}
+
+function Add-VpsStream($v) {
+  $list = @(Get-VpsStreams $v)
+  if ($list.Count -ge $script:VpsMaxStreams) { Say (T '  That''s {0} streams already, the most this tool puts on one server.' $script:VpsMaxStreams) 'Yellow'; return }
+  $taken = @($list | ForEach-Object { $_.Name })
+  $i = 2
+  while ($taken -contains (T 'Stream {0}' $i)) { $i++ }
+  $def = T 'Stream {0}' $i
+  $name = ConvertTo-VpsStreamName (Read-HostLine (T 'A name for it, e.g. who streams with it (just Enter = "{0}")' $def)) $def
+  # (Two streams with one name couldn't be told apart in the menus.)
+  $base = $name; $i = 2
+  while ($taken -contains $name) {
+    $suf = " ($i)"
+    $name = $base.Substring(0, [Math]::Min($base.Length, 32 - $suf.Length)).TrimEnd() + $suf
+    $i++
+  }
+  $seenTok = New-VpsSeenSet; $seenUser = New-VpsSeenSet
+  foreach ($e in $list) { [void]$seenTok.Add($e.Token); [void]$seenUser.Add($e.PublishUser.ToLowerInvariant()) }
+  $new = [pscustomobject][ordered]@{ Name = $name; Token = ''; PublishUser = ''; PublishPass = ''; SrtPassphrase = '' }
+  $chg = $false
+  Repair-VpsStream $new $def $seenTok $seenUser "$($v.ReadPassphrase)" ([ref]$chg)
+  Set-VpsStreamList $v (@(@(Get-Prop $v 'Streams') | Where-Object { $null -ne $_ }) + $new) ([ref]$chg)
+  Save-VpsConfig
+  Show-VpsBundle $v -Quiet
+  Say (T '  Added "{0}". Two more steps:' $name) 'Green'
+  Say (T '   1) Paste install.sh (vps-setup folder) on the server again: the streams on it keep working, the new one works after that.') 'White'
+  Say (T '   2) Give this code to the PC that streams with it. There: H -> My VPS -> paste the code instead of an address.') 'White'
+  $st = @(Get-VpsStreams $v | Where-Object { $_.Token -eq $new.Token })[0]
+  Show-VpsCode (ConvertTo-VpsConnectCode $v $st)
+  Say (T '  All streams share the server''s upload: e.g. 2 streams with 10 viewers each at 4 Mbps need 80 Mbps.') 'DarkGray'
+}
+
+function Select-VpsCode($v, $list) {
+  $opts = @()
+  foreach ($e in $list) {
+    if ($e.Own) { $opts += (T 'This PC''s own link - for another PC of yours (only one of the two can stream on it at a time)') }
+    else { $opts += $e.Name }
+  }
+  $opts += (T 'The whole server - for another PC of yours that should manage it too (it also gets this PC''s link)')
+  $i = Read-Choice (T 'The code for which stream?') $opts -1 $true
+  if ($i -lt 0) { return }
+  if ($i -ge $list.Count) {
+    Say (T '  The code for the whole server (it holds every stream''s password):') 'White'
+    Show-VpsCode (ConvertTo-VpsConnectCode $v $list[0] $true)
+    return
+  }
+  if ($list[$i].Own) { Say (T '  The code for this PC''s own link:') 'White' }
+  else { Say (T '  The code for "{0}":' $list[$i].Name) 'White' }
+  Show-VpsCode (ConvertTo-VpsConnectCode $v $list[$i])
+}
+
+function Remove-VpsStreamInteractive($v, $list) {
+  $others = @($list | Where-Object { -not $_.Own })
+  if ($others.Count -eq 0) { return }
+  $i = Read-Choice (T 'Remove which stream?') @($others | ForEach-Object { $_.Name }) -1 $true
+  if ($i -lt 0) { return }
+  $gone = $others[$i]
+  if (-not (Test-AnswerYes (Read-HostLine (T 'Remove "{0}"? Its link stops working once install.sh is pasted on the server again. [y/N]' $gone.Name)))) { return }
+  $chg = $false
+  Set-VpsStreamList $v @(@(Get-Prop $v 'Streams') | Where-Object { $null -ne $_ -and "$($_.Token)" -cne $gone.Token }) ([ref]$chg)
+  Save-VpsConfig
+  Show-VpsBundle $v -Quiet
+  Say (T '  Removed. Paste install.sh (vps-setup folder) on the server again: then that link stops working.') 'Green'
+}
+
+# New passwords for every stream (the links stay): every code given out stops working once install.sh is pasted again.
+function Reset-VpsAllPasswords($v) {
+  if (-not (Test-AnswerYes (Read-HostLine (T 'New passwords for every stream? Every code given out stops working once install.sh is pasted on the server again; the links stay the same. [y/N]')))) { return }
+  $chg = $false
+  Set-HostField $v 'PublishPass' (New-HostSecret 24) ([ref]$chg)
+  Set-HostField $v 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
+  Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg)
+  foreach ($e in @(Get-Prop $v 'Streams')) {
+    if ($e -isnot [System.Management.Automation.PSCustomObject]) { continue }
+    Set-HostField $e 'PublishPass' (New-HostSecret 24) ([ref]$chg)
+    Set-HostField $e 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
+  }
+  Save-VpsConfig
+  Show-VpsBundle $v -Quiet
+  Say (T '  Done. Paste install.sh (vps-setup folder) on the server again, then send every other PC its new code ("Show a connection code").') 'Green'
+}
+
+function Invoke-VpsStreamsMenu($v) {
+  if (-not (Test-HostFn 'Read-Choice')) { return }
+  while ($true) {
+    $list = @(Get-VpsStreams $v)
+    $states = @(Get-VpsStreamStates $v $list)
+    Say ''
+    Say (T '  Streams on your VPS (each has its own link; all of them can be on the air at the same time):') 'White'
+    for ($i = 0; $i -lt $list.Count; $i++) { Say ('   - ' + (Format-VpsStreamLine $list[$i] $states[$i])) 'Gray' }
+    $opts = @((T 'Done'), (T 'Add a stream for another PC'), (T 'Show a connection code'), (T 'New passwords for every stream (takes back every code given out)'))
+    if ($list.Count -gt 1) { $opts += (T 'Remove a stream') }
+    $pick = Read-Choice (T 'Anything else for the VPS?') $opts 0 $false
+    if ($pick -eq 1) { Add-VpsStream $v }
+    elseif ($pick -eq 2) { Select-VpsCode $v $list }
+    elseif ($pick -eq 3) { Reset-VpsAllPasswords $v }
+    elseif ($pick -eq 4) { Remove-VpsStreamInteractive $v $list }
+    else { return }
+  }
+}
+
+# vps: the address or a connection code, then (on the PC that manages the server) the setup files and the streams menu.
+# $false = no address yet.
 function Set-VpsInteractive($v) {
   Say ''
   Say (T '  Your own small server on the internet streams to the viewers: they don''t see your home address and') 'Gray'
   Say (T '  don''t use your upload. Free with Oracle Cloud "Always Free", or about 5.49 EUR/month at Hetzner.') 'Gray'
-  Say (T '  Setting it up takes about 20 minutes, once. The steps are in README-VPS.txt (made now).') 'Gray'
-  $cur = "$(Get-Prop $v 'Address')"
-  while ($true) {
-    if ($cur) { $ans = Read-HostLine (T 'The VPS''s address (IP or name; just Enter = keep {0})' $cur) }
-    else { $ans = Read-HostLine (T 'The VPS''s address (IP or name; just Enter = I don''t have one yet)') }
-    if (-not $ans) { break }
-    $n = ConvertTo-HostAddress $ans
-    if ($n) { $v.Address = $n; break }
-    Say (T '   That isn''t an IP address or a name like vps.example.com - try again.') 'Yellow'
+  Say (T '  One server can carry several streams at the same time (one per PC), each with its own link.') 'Gray'
+  if ("$(Get-Prop $v 'Role')" -eq 'guest') {
+    $name = ConvertTo-VpsStreamName (Get-Prop $v 'Name')
+    if ($name) { Say (T '  This PC streams on "{0}" on the VPS {1} (from a connection code); the server is managed on another PC.' $name $v.Address) 'White' }
+    else { Say (T '  This PC streams on the VPS {0} (from a connection code); the server is managed on another PC.' $v.Address) 'White' }
+    Show-VpsDiagnosis $false
+    while ($true) {
+      $ans = Read-HostLine (T 'Paste a new connection code, or type an address to set up a server of your own (just Enter = keep it like this)')
+      if (-not $ans) { return [bool]"$(Get-Prop $v 'Address')" }
+      if (Test-VpsCodeText $ans) {
+        if (Invoke-VpsCodeImport $v $ans) { return $true }
+        continue
+      }
+      $n = ConvertTo-HostAddress $ans
+      if ($n -and $n -eq (ConvertTo-HostAddress "$(Get-Prop $v 'Address')")) { return $true }   # (the same server: nothing changes)
+      if ($n) {
+        Say (T '  That sets up a server of your own at {0}: this PC stops using the connection code. Its settings are kept in config.json as "VpsBefore".' $n) 'Yellow'
+        if (-not (Test-AnswerYes (Read-HostLine (T 'Set up a server of your own? [y/N]')))) { continue }
+        Save-VpsBefore $v
+        # A server of its own: new passwords (the old ones belong to the other server's stream).
+        Reset-VpsOwnSecrets $v
+        $v.Address = $n
+        break
+      }
+      Say (T '   That is neither a connection code nor an address like vps.example.com - try again.') 'Yellow'
+    }
+  } else {
+    Say (T '  Setting it up takes about 20 minutes, once. The steps are in README-VPS.txt (made now).') 'Gray'
+    Say (T '  Got a connection code from the PC that manages a server? Paste it here instead of the address.') 'Gray'
+    $cur = "$(Get-Prop $v 'Address')"
+    while ($true) {
+      if ($cur) { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = keep {0})' $cur) }
+      else { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = I don''t have one yet)') }
+      if (-not $ans) { break }
+      if (Test-VpsCodeText $ans) {
+        if (Invoke-VpsCodeImport $v $ans) { return $true }
+        continue
+      }
+      $n = ConvertTo-HostAddress $ans
+      if ($n) {
+        $v.Address = $n
+        if ($cur -and $n -ne $cur -and @(Get-VpsStreams $v).Count -gt 1) {
+          Say (T '  The address changed: every other PC needs its code again ("Show a connection code" below).') 'Yellow'
+        }
+        break
+      }
+      Say (T '   That isn''t an IP address or a name like vps.example.com - try again.') 'Yellow'
+    }
   }
   Show-VpsBundle $v
   if (-not "$(Get-Prop $v 'Address')") {
     Say (T '  Once the server runs, choose "My VPS" here again and type its address.') 'Cyan'
     return $false
   }
+  Show-VpsDiagnosis $false
+  Invoke-VpsStreamsMenu $v
   return $true
 }
 
@@ -672,6 +1338,10 @@ function Reset-StreamLink {
     Say (T '  Your links were typed in by hand (custom server): change them in the host menu or in config.json.') 'Yellow'
     return $false
   }
+  if ($p.Id -eq 'vps' -and "$(Get-Prop $c.Vps 'Role')" -eq 'guest') {
+    Say (T '  This PC''s VPS link comes from a connection code: ask whoever manages the server for a new code.') 'Yellow'
+    return $false
+  }
   if (-not $script:Interactive) { return $false }
   Say (T '  A new link replaces the old one: the old link stops working (worlds and friends who have it need the new one).') 'Yellow'
   if (-not (Test-AnswerYes (Read-HostLine (T 'Make a new link? [y/N]')))) { Say (T '  The link stays as it is.') 'DarkGray'; return $false }
@@ -683,13 +1353,20 @@ function Reset-StreamLink {
       Set-TopazConfigLinks $c $key ([ref]$chg)
     }
     'pc' { $c.SelfHost.Token = New-LinkToken }
-    'vps' { $c.Vps.Token = New-LinkToken }
+    'vps' {
+      $c.Vps.Token = New-LinkToken
+      # (New passwords too: a code given out for this PC's own link stops working.)
+      $c.Vps.PublishPass = New-HostSecret 24
+      $c.Vps.SrtPassphrase = New-HostSecret 32
+    }
   }
   try { Save-Config $c } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red' }
   $np = Get-HostProfile $p.Id
   Say (T '  Your new link:  {0}' $np.PcUrl) 'Green'
   if ($p.Id -eq 'vps') {
     Say (T '  Your VPS must learn the new link: paste install.sh on the server again (the new files are below).') 'Yellow'
+    Say (T '  (Its password changes too, so a code given out for this PC''s own link stops working.)') 'DarkGray'
+    if (@(Get-VpsStreams $c.Vps).Count -gt 1) { Say (T '  Only this PC''s link changes: the other streams on the server keep theirs.') 'DarkGray' }
     Show-VpsBundle $c.Vps
   }
   return $true
@@ -1004,9 +1681,15 @@ function Get-PcPublishPass($s) {
 
 function New-MediaMtxConfig([string]$mode, $s, [string]$bindHost = '') {
   if ($mode -ne 'pc' -and $mode -ne 'vps') { throw "New-MediaMtxConfig: unknown mode '$mode'" }
-  $token = "$(Get-Prop $s 'Token')"
-  Assert-MtxSecret $token 'Token' 22 128
-  $path = "live/$token"
+  # The stream paths it serves: pc one (the relay's); vps this PC's own stream and the further ones (Get-VpsStreams).
+  if ($mode -eq 'vps') { $streams = @(Get-VpsStreams $s) }
+  else { $streams = @([pscustomobject]@{ Token = "$(Get-Prop $s 'Token')" }) }
+  $seenTok = New-VpsSeenSet
+  foreach ($st in $streams) {
+    Assert-MtxSecret $st.Token 'Token' 22 128
+    if (-not $seenTok.Add($st.Token)) { throw (T 'Two streams in config.json have the same {0}.' 'Token') }
+  }
+  $path = "live/$($streams[0].Token)"
   $rtspPort = Get-MtxPort $s 'RtspPort' 8554
   $rtmpPort = Get-MtxPort $s 'RtmpPort' 1935
   $hlsPort = Get-MtxPort $s 'HlsPort' 8888
@@ -1017,15 +1700,16 @@ function New-MediaMtxConfig([string]$mode, $s, [string]$bindHost = '') {
   if ([int]::TryParse("$(Get-MtxSetting $s 'MaxReaders' $maxReaders)", [ref]$n) -and $n -ge 1) { $maxReaders = $n }
   $srtPort = 0
   if ($mode -eq 'vps') {
-    $user = "$(Get-Prop $s 'PublishUser')"
-    $pass = "$(Get-Prop $s 'PublishPass')"
-    $srtPass = "$(Get-Prop $s 'SrtPassphrase')"
     $readPass = "$(Get-Prop $s 'ReadPassphrase')"
-    Assert-MtxSecret $user 'PublishUser' 1 64
-    Assert-MtxSecret $pass 'PublishPass' 16 128
-    Assert-MtxSecret $srtPass 'SrtPassphrase' 10 79      # SRT allows 10..79 characters
     Assert-MtxSecret $readPass 'ReadPassphrase' 10 79
-    if ($srtPass -eq $readPass) { throw (T 'SrtPassphrase and ReadPassphrase in config.json must be different.') }
+    $seenUser = New-VpsSeenSet
+    foreach ($st in $streams) {
+      Assert-MtxSecret $st.PublishUser 'PublishUser' 1 64
+      Assert-MtxSecret $st.PublishPass 'PublishPass' 12 128
+      Assert-MtxSecret $st.SrtPassphrase 'SrtPassphrase' 10 79      # SRT allows 10..79 characters
+      if ($st.SrtPassphrase -ceq $readPass) { throw (T 'SrtPassphrase and ReadPassphrase in config.json must be different.') }
+      if (-not $seenUser.Add($st.PublishUser.ToLowerInvariant())) { throw (T 'Two streams in config.json have the same {0}.' 'PublishUser') }
+    }
     $srtPort = Get-MtxPort $s 'SrtPort' 8890
   }
   $used = @($rtspPort, $rtmpPort)
@@ -1054,21 +1738,25 @@ function New-MediaMtxConfig([string]$mode, $s, [string]$bindHost = '') {
     $L.Add('      - action: publish')
     $L.Add("        path: $q")
   } else {
-    $L.Add('  # Only the named user may publish (from any IP: the home IP changes), and only to the stream path.')
-    $L.Add('  - user: ' + (ConvertTo-MtxYamlString $user))
-    $L.Add('    pass: ' + (ConvertTo-MtxYamlString $pass))
-    $L.Add('    ips: []')
-    $L.Add('    permissions:')
-    $L.Add('      - action: publish')
-    $L.Add("        path: $q")
+    $L.Add('  # Each stream: only its own user may publish (from any IP: home IPs change), and only to its own path.')
+    foreach ($st in $streams) {
+      $L.Add('  - user: ' + (ConvertTo-MtxYamlString $st.PublishUser))
+      $L.Add('    pass: ' + (ConvertTo-MtxYamlString $st.PublishPass))
+      $L.Add('    ips: []')
+      $L.Add('    permissions:')
+      $L.Add('      - action: publish')
+      $L.Add('        path: ' + (ConvertTo-MtxYamlString "live/$($st.Token)"))
+    }
   }
-  $L.Add('  # Viewers (anyone with the link) may only read the stream path. No playback, api, metrics or pprof for anyone.')
+  $L.Add('  # Viewers (anyone with a link) may only read the stream path(s). No playback, api, metrics or pprof for anyone.')
   $L.Add('  - user: any')
   $L.Add("    pass: ''")
   $L.Add('    ips: []')
   $L.Add('    permissions:')
-  $L.Add('      - action: read')
-  $L.Add("        path: $q")
+  foreach ($st in $streams) {
+    $L.Add('      - action: read')
+    $L.Add('        path: ' + (ConvertTo-MtxYamlString "live/$($st.Token)"))
+  }
   $L.Add('api: false')
   $L.Add('metrics: false')
   $L.Add('pprof: false')
@@ -1117,13 +1805,16 @@ function New-MediaMtxConfig([string]$mode, $s, [string]$bindHost = '') {
   $L.Add('  overridePublisher: true')
   $L.Add('  record: false')
   if ($mode -eq 'vps') {
-    $L.Add('  srtPublishPassphrase: ' + (ConvertTo-MtxYamlString $srtPass))
     $L.Add('  # Nobody is given this one: reading over SRT is effectively off.')
     $L.Add('  srtReadPassphrase: ' + (ConvertTo-MtxYamlString $readPass))
   }
-  $L.Add('# The only path. Anything else is "not configured" and refused (besides the permissions above).')
+  $L.Add('# The only paths. Anything else is "not configured" and refused (besides the permissions above).')
   $L.Add('paths:')
-  $L.Add("  ${q}:")
+  foreach ($st in $streams) {
+    $L.Add('  ' + (ConvertTo-MtxYamlString "live/$($st.Token)") + ':')
+    # (Each stream sends with its own SRT passphrase.)
+    if ($mode -eq 'vps') { $L.Add('    srtPublishPassphrase: ' + (ConvertTo-MtxYamlString $st.SrtPassphrase)) }
+  }
   return (($L -join "`n") + "`n")
 }
 
@@ -1495,13 +2186,19 @@ function Test-MediaMtxSecurity([string]$exe, [string]$lanIp = '', [bool]$vps = $
   if (-not $vps) { return $rows.ToArray() }
   if (-not (Test-FfmpegHasSrt)) { & $add 'vps: ffmpeg has SRT' $false 'this ffmpeg has no SRT - VPS SRT tests skipped (the tool would push over RTMP)'; return $rows.ToArray() }
   $tok = New-MtxSecret 16
+  # A second stream on the same server (another PC's): its own token, user, password and passphrase.
+  $b2 = [pscustomobject]@{ Name = 'B'; Token = (New-MtxSecret 16); PublishUser = 'vrclm2'; PublishPass = (New-MtxSecret 18); SrtPassphrase = (New-MtxSecret 24) }
   $v = [pscustomobject]@{ Token = $tok; PublishUser = 'vrclm'; PublishPass = (New-MtxSecret 18); SrtPassphrase = (New-MtxSecret 24); ReadPassphrase = (New-MtxSecret 24)
-    SrtPort = (Get-MtxFreePort $taken); RtspPort = (Get-MtxFreePort $taken); RtmpPort = (Get-MtxFreePort $taken); Hls = $false; MaxReaders = 5 }
+    SrtPort = (Get-MtxFreePort $taken); RtspPort = (Get-MtxFreePort $taken); RtmpPort = (Get-MtxFreePort $taken); Hls = $false; MaxReaders = 5
+    Role = 'owner'; Streams = @($b2) }
   $rtsp = "rtsp://${lo}:$($v.RtspPort)/live/$tok"
   $rtmpBase = "rtmp://${lo}:$($v.RtmpPort)/live/$tok"
   $srtBase = "srt://${lo}:$($v.SrtPort)"
   $srtOk = "${srtBase}?streamid=publish:live/${tok}:$($v.PublishUser):$($v.PublishPass)&pkt_size=1316&passphrase=$($v.SrtPassphrase)&pbkeylen=32"
-  $hide = { param($u) (($u -replace [regex]::Escape($tok), '<token>') -replace [regex]::Escape($v.PublishPass), '<pass>') -replace '(passphrase=)[^&]+', '$1<secret>' }
+  $tok2 = $b2.Token
+  $rtsp2 = "rtsp://${lo}:$($v.RtspPort)/live/$tok2"
+  $srt2 = { param($t, $u, $pw, $pp) "${srtBase}?streamid=publish:live/${t}:${u}:${pw}&pkt_size=1316&passphrase=${pp}&pbkeylen=32" }
+  $hide = { param($u) (((($u -replace [regex]::Escape($tok), '<token>') -replace [regex]::Escape($tok2), '<token2>') -replace [regex]::Escape($v.PublishPass), '<pass>') -replace [regex]::Escape($b2.PublishPass), '<pass2>') -replace '(passphrase=)[^&]+', '$1<secret>' }
   try {
     try { $h = Start-MtxProcess $exe (New-MediaMtxConfig 'vps' $v $lo) 'mediamtx-test-vps'; & $add 'vps: MediaMTX accepts the config and starts' $true ("pid $($h.Proc.Id)") }
     catch { & $add 'vps: MediaMTX accepts the config and starts' $false $_.Exception.Message; return $rows.ToArray() }
@@ -1546,6 +2243,42 @@ function Test-MediaMtxSecurity([string]$exe, [string]$lanIp = '', [bool]$vps = $
     & $add 'vps: read over RTMP works' $r.Ok $r.Detail
     $r = Test-MtxRead ($rtmpBase + '?next') @('-rw_timeout', '5000000')
     & $add 'vps: read over RTMP with ?next works' $r.Ok $r.Detail
+    # Several streams: each PC on its own path, at the same time, and none can send on another's.
+    $cases2 = @(
+      @("vps: stream 1's user can't publish to stream 2's path (SRT)", (& $srt2 $tok2 $v.PublishUser $v.PublishPass $b2.SrtPassphrase)),
+      @("vps: stream 1's user can't publish to stream 2's path (SRT, stream 1's passphrase)", (& $srt2 $tok2 $v.PublishUser $v.PublishPass $v.SrtPassphrase)),
+      @("vps: stream 2's user can't publish to stream 1's path (SRT)", (& $srt2 $tok $b2.PublishUser $b2.PublishPass $v.SrtPassphrase)),
+      @("vps: stream 2's user can't publish to stream 1's path (RTMP)", "${rtmpBase}?user=$($b2.PublishUser)&pass=$($b2.PublishPass)"),
+      @("vps: stream 2 with stream 1's passphrase is refused", (& $srt2 $tok2 $b2.PublishUser $b2.PublishPass $v.SrtPassphrase))
+    )
+    foreach ($c in $cases2) {
+      $r = Test-MtxPublish $c[1]
+      & $add $c[0] (-not $r.Ok) ($r.Detail + '  [' + (& $hide $c[1]) + ']')
+    }
+    $r = Test-MtxRead $rtsp $tcpOpt
+    & $add 'vps: stream 1 still plays after those refused attempts (nobody took it over)' $r.Ok $r.Detail
+    $pub2 = Start-MtxBackground $script:FFmpeg ((Get-MtxTestSource 600) + (Get-MtxOutArgs (& $srt2 $tok2 $b2.PublishUser $b2.PublishPass $b2.SrtPassphrase)))
+    [void]$bg.Add($pub2)
+    $r = Wait-MtxReadable $rtsp2 15
+    & $add 'vps: stream 2 (its own user, password and passphrase) is on the air at the same time' $r.Ok $r.Detail
+    $r = Test-MtxRead $rtsp $tcpOpt
+    & $add 'vps: stream 1 still plays while stream 2 is on' $r.Ok $r.Detail
+    $r = Test-MtxRead "rtmp://${lo}:$($v.RtmpPort)/live/$tok2" @('-rw_timeout', '5000000')
+    & $add 'vps: stream 2 plays over RTMP (Quest link) too' $r.Ok $r.Detail
+    $d = Test-VpsStream $lo $v.RtspPort $tok2 $b2.PublishUser $b2.PublishPass 4000
+    & $add 'vps check: a live stream answers 200 and its own password is taken (ANNOUNCE)' ($d.State -eq 'live' -and $d.PassOk -eq $true) "$($d.State) $($d.Code) pass=$($d.PassOk)"
+    $d = Test-VpsStream $lo $v.RtspPort $tok2 $v.PublishUser $v.PublishPass 4000
+    & $add "vps check: stream 1's password on stream 2's link is refused (401)" ($d.PassOk -eq $false) "$($d.State) $($d.Code) pass=$($d.PassOk)"
+    $r = Test-MtxRead $rtsp2 $tcpOpt
+    & $add 'vps check: the ANNOUNCE checks did not take stream 2 over' $r.Ok $r.Detail
+    $d = Test-VpsStream $lo $v.RtspPort (New-MtxSecret 16) '' '' 4000
+    & $add 'vps check: an unknown link answers 400 (unknown)' ($d.State -eq 'unknown') "$($d.State) $($d.Code)"
+    Stop-MtxBackground $pub2
+    $deadline = (Get-Date).AddSeconds(15)
+    do { Start-Sleep -Milliseconds 700; $d = Test-VpsStream $lo $v.RtspPort $tok2 '' '' 4000 } while ($d.State -ne 'idle' -and (Get-Date) -lt $deadline)
+    & $add 'vps check: a known link with nobody on it answers 404 (idle)' ($d.State -eq 'idle') "$($d.State) $($d.Code)"
+    $d = Test-VpsStream $lo (Get-MtxFreePort $taken) $tok '' '' 3000
+    & $add 'vps check: no server on the port = down' ($d.State -eq 'down') "$($d.State) $($d.Detail)"
     $r = Test-MtxRead "${srtBase}?streamid=read:live/$tok" @() 12000
     & $add 'vps: SRT read without a passphrase is refused' (-not $r.Ok) $r.Detail
     $r = Test-MtxRead "${srtBase}?streamid=read:live/$tok&passphrase=$($v.SrtPassphrase)&pbkeylen=32" @() 12000
@@ -1608,6 +2341,9 @@ function New-VpsSetupBundle($s) {
     (T '4) In VRChat Link Maker choose "My VPS" with the address {0}. Try the VLC link first.' $addr),
     '',
     (T 'After "New link" in the tool this folder is made again: paste the new install.sh again (the old link then stops working).'),
+    '',
+    (T 'More streams at the same time (one per PC, each with its own link): in VRChat Link Maker choose "My VPS" -> "Add a stream for another PC", paste the new install.sh here again, and give the other PC the connection code the tool shows. That PC pastes the code under "My VPS" instead of an address - it must not run an install.sh of its own (that would replace this setup).'),
+    (T 'All streams share the server''s upload: e.g. 2 streams with 10 viewers each at 4 Mbps need 80 Mbps.'),
     (T 'Paid alternative: Hetzner Cloud CX23 (about 5.49 EUR a month plus a public IPv4 address). Create an Ubuntu 24.04 server in an EU location, then do step 3 as root (ssh root@<address>, no sudo needed). If you turned on Hetzner''s cloud firewall, open the same ports there.'),
     '',
     (T 'Security: only this tool can send the stream (user + password, and on SRT an encryption passphrase). Viewers can only watch live/<token>; every other path is refused. Like any stream link, anyone who has the link can watch.'),

@@ -260,10 +260,31 @@ My VPS (your own rented server - the safer choice)
      region when you sign up; take an Ampere A1 machine, 2 OCPU / 12 GB).
      Or Hetzner CX23 (about 5.49 EUR a month plus an IPv4 address).
   3. Log in to the server as root and paste install.sh in one go.
-  4. Put the server's address into the tool (Vps > Address in config.json;
-     README-VPS.txt says how).
+  4. Type H, choose "My VPS" again and type the server's address. Before
+     every start the tool checks the server and says what's wrong, if
+     anything (it doesn't answer, doesn't know your link, wrong password).
   5. Press T for a speed test to your server and save the bitrate it suggests.
   6. Start streaming as usual. Viewers turn on "Allow Untrusted URLs".
+- Several streams at the same time (one per PC, each with its own link):
+  - On the PC that set the server up: H -> "My VPS" -> "Add a stream for
+    another PC". Paste the new install.sh on the server again (the streams
+    already on it keep working) and send the connection code it shows to the
+    other person. The code works like a password: send it privately.
+  - On the other PC (a fresh copy from GitHub is fine): paste the code on
+    the start screen, or H -> "My VPS" -> paste it instead of an address.
+    That PC never runs an install.sh of its own: it would replace the
+    server's setup.
+  - "Show a connection code" also gives codes for another PC of yours: your
+    own link (only one of the two can stream on it at a time) or the whole
+    server (that PC can then manage it too, e.g. after reinstalling Windows;
+    it gets your link as well). Change the streams on one PC only: the
+    server gets the streams of the PC that pasted install.sh last.
+  - A code went to the wrong person? "Remove a stream" takes one stream's
+    code back, N takes back the code for your own link, and "New passwords
+    for every stream" takes back every code (paste install.sh again after
+    each of them, then send new codes).
+  - All streams share the server's upload (2 streams x 10 viewers x 4 Mbps =
+    80 Mbps).
 
 Custom
 - Your own server addresses and links in config.json. For example Twitch:
@@ -274,7 +295,10 @@ More keys on the start screen:
 - T  upload speed test for the host you picked (Topaz: a 30-second test stream
      with a throwaway key; VPS: to your server; this PC: your upload). It
      suggests a bitrate and can save it.
-- N  new link (new secret key). The old link stops working.
+- N  new link (new secret key). The old link stops working. My VPS: its
+     password changes too; paste install.sh on the server again. A PC that
+     streams with a connection code asks whoever manages the server for a
+     new code instead.
 - V  picture size: Auto (the sharpest the host carries well: 720p on Topaz,
      900p from this PC, 1080p from a VPS) or 360p to 1080p. Also works typed
      on the waiting screen. Changing it makes the players reconnect once.
@@ -389,7 +413,9 @@ All of these are optional.
   SelfHost    settings for "This PC": HostName, DuckDnsToken, RtspPort (8554),
               RtmpPort (1935), MaxReaders (10), Upnp, Firewall, Ipv6,
               VideoKbps (3000) and more.
-  Vps         settings for "My VPS": Address, VideoKbps (4000) and more.
+  Vps         settings for "My VPS": Address, VideoKbps (4000), Role
+              ("owner" = this PC set the server up, "guest" = it streams with
+              a connection code), Streams (the other PCs' streams) and more.
   Language    "auto" (Windows' language if there is a translation for it,
               else English), "en" or "ru". See LANGUAGE above.
   Player      "ask" (the default: asks once per session), "auto" (always the
@@ -417,6 +443,12 @@ IF SOMETHING DOESN'T WORK
   the instance can't be Public / Group Public. For "This PC", check that ports
   8554 and 1935 reach your PC, and whether it said you're behind CGNAT - if
   so, use a VPS or the IPv6 link. Try both the name link and the bare-IP link.
+- "My VPS" doesn't take the stream: the tool checks the server before every
+  start and says why (it doesn't answer, doesn't know your link, wrong
+  password, someone else is on your link). A PC that streams with a
+  connection code needs a new code from whoever manages the server. On the
+  PC that manages the server, paste install.sh on the server again after
+  adding or removing streams.
 - Someone is behind the others: press R R (or put the plain link in again).
   Turn on "Clock on the stream" in the control window to compare who is where.
 - A web link fails to download: update yt-dlp (open PowerShell and run

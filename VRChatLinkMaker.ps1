@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.2'
+$script:Version = '1.3'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -1391,6 +1391,10 @@ function Resolve-Entries([string[]]$entries) {
 }
 
 function Add-Entries([string[]]$entries, [bool]$announce, [int]$insertAt = -1) {
+  # (A VPS connection code is a password: it is never searched for or printed.)
+  if (Test-HostModule) {
+    $entries = @($entries | Where-Object { -not (Test-VpsCodeText "$_") -and -not ("$_" -match '^[A-Za-z0-9_-]{40,}$' -and -not [System.IO.File]::Exists("$_")) })
+  }
   $items = @(Resolve-Entries $entries)
   $n = 0
   foreach ($it in $items) {
@@ -1454,6 +1458,12 @@ function Read-Entries {
   Say (T '  - V = picture size (resolution)') 'DarkGray'
   $line = Read-Host '>'
   if (-not $line -or -not $line.Trim()) { return @(Show-FilePicker) }
+  # A VPS connection code (it is a password: never search for it or print it): set up "My VPS" with it.
+  if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
+    $line += Read-PastedRest
+    if ($hostKeys) { Use-VpsCode $line } else { Say (T '  That is a VPS connection code: paste it in the window that streams (H -> My VPS).') 'Yellow' }
+    return @(Read-Entries)
+  }
   # V = picture size (on a Russian keyboard layout the V key types U+043C)
   if ($line -match '^\s*(?:v|res|resolution|\u043c)\s*$') { Invoke-ResolutionMenu; return @(Read-Entries) }
   # H / T / N (on a Russian keyboard layout those keys type U+0440, U+0435, U+0442)
@@ -1474,7 +1484,25 @@ function Read-Entries {
 }
 
 # A line typed / pasted / dropped into the window while it streams.
+# The rest of a paste that came in as several lines (a chat window may have wrapped a long code).
+function Read-PastedRest {
+  $rest = ''
+  try {
+    Start-Sleep -Milliseconds 150
+    while ($script:HasConsole -and [Console]::KeyAvailable) { $rest += "$(Read-Host)"; Start-Sleep -Milliseconds 100 }
+  } catch {}
+  return $rest
+}
+
+# While it streams, lines arrive one by one: what comes right after a code is the rest of it (dropped as well).
+$script:CodePasteUntil = $null
 function Add-TypedLine([string]$line, [string]$kind = '') {
+  if ($script:CodePasteUntil -and (Get-Date) -lt $script:CodePasteUntil) { return }
+  if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
+    $script:CodePasteUntil = (Get-Date).AddSeconds(2)
+    Say (T '  That is a VPS connection code: when nothing plays, type H, choose "My VPS" and paste it there.') 'Yellow'
+    return
+  }
   if ($kind -eq 'waiting' -and (Test-HostModule) -and $script:HostP -and $line -match '^\s*(?:h|host|\u0440)\s*$') { Add-Cmd (New-Cmd 'host'); return }
   if ($kind -eq 'waiting' -and (Test-HostModule) -and $script:HostP -and $line -match '^\s*(?:n|new|\u0442)\s*$') { Add-Cmd (New-Cmd 'newlink'); return }
   if ($line -match '^\s*(?:v|res|resolution|\u043c)\s*$') {
@@ -2467,6 +2495,8 @@ function Start-Relay {
   $script:RelayErr = $script:Relay.StandardError.ReadToEndAsync()
   $script:RelayIn = $script:Relay.StandardInput.BaseStream
   $script:RelayStartedAt = Get-Date
+  $script:RelayKilled = $false
+  $script:RelayHadSent = $false
   $script:LastEnd = -1.0
   # Nobody can be watching a connection that just opened: the next video waits for the players (Test-HoldReady).
   $script:RelayFresh = $true
@@ -2543,13 +2573,23 @@ function Get-RelayError {
   if ($e -match '-10060|-138\b|-110\b|timed out') { return (T 'the connection timed out') }
   if ($e -match '-10061|-111\b|refused') { return (T 'the server refused the connection') }
   if ($e -match '-11001|-10065|resolve|getaddrinfo') { return (T 'the server''s address couldn''t be found (is the internet on?)') }
+  if ($e -match 'Operation not permitted') { return (T 'the server refused the stream (wrong key or password?)') }
   if ($env:VRCLM_DEBUG) { return (Hide-UrlSecrets $e) }
   return ''
 }
 
+# $script:RelayKilled: this tool ended the relay while it was still connected (a stall, a resync...), as opposed to
+# the server or the network ending it. (The server then still lists that connection for a few seconds.)
+# $script:RelayHadSent: the relay had sent something before it was stopped (its progress file is gone after that).
+$script:RelayKilled = $false
+$script:RelayHadSent = $false
 function Stop-Relay {
   if ($script:Src) { [void](Stop-Source $script:Src -Now) }
-  if ($script:Relay) { Remove-Relay $script:Relay (Get-RelayProgPath) }
+  if ($script:Relay) {
+    try { if (-not $script:Relay.HasExited) { $script:RelayKilled = $true } } catch {}
+    try { if ((Read-RelaySize) -gt 0) { $script:RelayHadSent = $true } } catch {}
+    Remove-Relay $script:Relay (Get-RelayProgPath)
+  }
   $script:Relay = $null
   $script:RelayIn = $null
 }
@@ -2573,7 +2613,18 @@ function Close-Relay {
 # Waits a little and says so, after the connection to the server broke. $video: a video waits for it (else a screen).
 function Wait-RelayRetry([bool]$video = $true) {
   $why = Get-RelayError
+  $sent = $false
+  try { $sent = ((Read-RelaySize) -gt 0) } catch {}
   Stop-Relay
+  $sent = $sent -or $script:RelayHadSent
+  $endedItself = -not $script:RelayKilled
+  if ($script:HostP -and $script:HostP.Id -eq 'vps' -and (Get-Command Get-VpsRelayVerdict -CommandType Function -ErrorAction SilentlyContinue)) {
+    # My VPS: the server says why (a link it doesn't know, a wrong password, another PC on the same link...).
+    $verdict = $null
+    try { $verdict = Get-VpsRelayVerdict $sent $endedItself } catch { if ($script:CtrlCQuit) { throw } }
+    if ($verdict -and $verdict.Stop) { Say $verdict.Message 'Red'; return $false }
+    if ($verdict -and $verdict.Why) { $why = $verdict.Why }
+  }
   $script:RelayFails++
   if ($script:RelayFails -gt 7) {
     Say (T 'Can''t keep a connection to the stream server. Check your internet connection and try again later.') 'Red'
@@ -4350,6 +4401,10 @@ function Use-Ipv6Links($p) {
 
 function Start-HostServer {
   $p = $script:HostP
+  # My VPS: ask the server first (does it answer, know this PC's link and take its password; is anyone else on it?).
+  if ($p -and $p.Id -eq 'vps' -and (Get-Command Test-VpsReady -CommandType Function -ErrorAction SilentlyContinue)) {
+    try { return (Test-VpsReady $p) } catch { if ($script:CtrlCQuit) { throw }; return $true }
+  }
   if (-not $p -or -not $p.UsesMediaMtx) { return $true }
   $s = Get-Prop $script:Cfg 'SelfHost'
   $exe = $null
@@ -4465,6 +4520,35 @@ function Invoke-HostMenu {
       Show-Links
       Start-Standby
     }
+  } finally { $script:PromptOk = $was }
+}
+
+# A connection code pasted on the start screen: "My VPS" with it, like H -> My VPS -> paste (another host = another link).
+function Use-VpsCode([string]$line) {
+  $was = $script:PromptOk
+  $script:PromptOk = $true
+  try {
+    [void](Initialize-HostConfig)
+    $before = $script:HostP
+    if (-not (Invoke-VpsCodeImport $script:Cfg.Vps $line)) { return }
+    $chg = $false
+    if ("$(Get-Prop $script:Cfg 'Host')" -eq 'custom') {
+      # (The typed-in custom links are kept, as when the host menu leaves "custom".)
+      $keep = [pscustomobject][ordered]@{ IngestUrl = "$(Get-Prop $script:Cfg 'IngestUrl')"; PcUrl = "$(Get-Prop $script:Cfg 'PcUrl')"; QuestUrl = "$(Get-Prop $script:Cfg 'QuestUrl')"; VlcUrl = "$(Get-Prop $script:Cfg 'VlcUrl')" }
+      Set-HostField $script:Cfg 'CustomLinks' $keep ([ref]$chg)
+    }
+    $script:Cfg.Host = 'vps'
+    Sync-HostServerName $script:Cfg 'vps' ([ref]$chg)
+    [void](Initialize-HostConfig)
+    try { Save-Config $script:Cfg } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red' }
+    $after = Get-HostProfile 'vps'
+    if ($before -and $before.Id -eq 'vps' -and $before.IngestUrl -eq $after.IngestUrl -and $before.PcUrl -eq $after.PcUrl) { return }   # (nothing changed)
+    Stop-Relay
+    Stop-HostServer
+    Set-ActiveHost
+    Reset-VrcPlayer
+    Show-Links
+    Start-Standby
   } finally { $script:PromptOk = $was }
 }
 

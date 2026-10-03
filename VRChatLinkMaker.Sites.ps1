@@ -4666,6 +4666,8 @@ function Test-SearchQuery([string]$text) {
   $t = ([string]$text).Trim()
   if ($t.Length -lt 2) { return $false }
   if ($t -notmatch '\p{L}') { return $false }
+  if ($t -match '(?i)vrclm-vps\d*:') { return $false }   # a VPS connection code (a password): never searched for
+  if ($t -match '^[A-Za-z0-9_-]{40,}$') { return $false }   # (nor a piece of one: no title is one 40-letter word)
   if ($t -match '^(?i)[a-z][a-z0-9+.-]*://' -or $t -match '^(?i)www\.') { return $false }
   if ($t -match '^(?i)[a-z0-9-]+(\.[a-z0-9-]+)+/' ) { return $false }   # animego.me/anime/... without https://
   if ($t -match '^[a-zA-Z]:' -or $t.StartsWith('\\') -or $t -match '^\.{1,2}[\\/]' -or $t.Contains('\')) { return $false }
