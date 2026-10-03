@@ -1,4 +1,6 @@
 {
+  "Messages": "Сообщения",
+  "Copy all": "Копировать всё",
   "_language": "Русский",
   "Couldn't save the language in config.json: {0}": "Не удалось сохранить язык в config.json: {0}",
   "No translations found (the \"lang\" folder next to this tool is missing or empty).": "Переводы не найдены (папки \"lang\" рядом с программой нет или она пуста).",

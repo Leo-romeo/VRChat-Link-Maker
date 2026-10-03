@@ -154,6 +154,21 @@ function Say([string]$text, [string]$color = '') {
   Clear-StatusLine
   if ($color) { Write-Host $text -ForegroundColor $color } else { Write-Host $text }
   Write-LogLine $text
+  Add-UiLogLine $text $color
+}
+
+# The control window's message pane gets every Say line: the window drains the queue, and the ring refills a reopened window.
+$script:UiLog = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+$script:UiLogRing = New-Object 'System.Collections.Generic.List[object]'
+function Add-UiLogLine([string]$text, [string]$color) {
+  try {
+    $e = @($text, $color)
+    $script:UiLogRing.Add($e)
+    if ($script:UiLogRing.Count -gt 600) { $script:UiLogRing.RemoveRange(0, 100) }
+    $script:UiLog.Enqueue($e)
+    $drop = $null
+    while ($script:UiLog.Count -gt 2000) { [void]$script:UiLog.TryDequeue([ref]$drop) }
+  } catch {}
 }
 
 # Everything the window says also goes into log.txt next to the tool (the previous run's is log-previous.txt).

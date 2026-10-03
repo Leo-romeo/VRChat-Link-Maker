@@ -197,7 +197,7 @@ function New-ControlPanel {
   $f.StartPosition = [System.Windows.Forms.FormStartPosition]::WindowsDefaultLocation
   $f.MinimumSize = New-Object System.Drawing.Size([int](540 * $k), [int](560 * $k))
   $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-  $f.Size = New-Object System.Drawing.Size([int](620 * $k), [int]([Math]::Min(760 * $k, [Math]::Max(560 * $k, $wa.Height - 60))))
+  $f.Size = New-Object System.Drawing.Size([int](620 * $k), [int]([Math]::Min(900 * $k, [Math]::Max(560 * $k, $wa.Height - 60))))
   $f.SuspendLayout()
 
   $root = New-Object "$WF.TableLayoutPanel"
@@ -205,7 +205,7 @@ function New-ControlPanel {
   $root.ColumnCount = 1
   $root.Padding = New-Object System.Windows.Forms.Padding([int](8 * $k))
   [void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-  $rowSizes = @('Auto', 'P62', 'Auto', 'Auto', 'Auto', 'Auto', 'Auto', 'P38', 'Auto', 'Auto')
+  $rowSizes = @('Auto', 'P62', 'Auto', 'Auto', 'Auto', 'Auto', 'Auto', 'P38', 'Auto', 'P34', 'Auto', 'Auto')
   $root.RowCount = $rowSizes.Count
   foreach ($r in $rowSizes) {
     if ($r -eq 'Auto') { [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
@@ -378,7 +378,53 @@ function New-ControlPanel {
   $p.List = $lb
   $root.Controls.Add($lb, 0, 7)
 
-  # Row 8: add, viewer preview, copy link, resync
+  # Rows 8-9: messages (everything the console window shows; right-click copies)
+  $root.Controls.Add((New-PanelLabel (T 'Messages') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 8)
+  $lg = New-Object "$WF.ListBox"
+  $lg.Dock = [System.Windows.Forms.DockStyle]::Fill
+  $lg.IntegralHeight = $false
+  $lg.HorizontalScrollbar = $true
+  $lg.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+  $lg.BackColor = $c.Box
+  $lg.ForeColor = $c.Text
+  $lg.Font = New-Object System.Drawing.Font('Consolas', [single]8.25)
+  $lg.Margin = New-Object System.Windows.Forms.Padding(2, 0, 2, [int](4 * $k))
+  $lg.MinimumSize = New-Object System.Drawing.Size(0, [int]($fh * 3))
+  $lg.DrawMode = [System.Windows.Forms.DrawMode]::OwnerDrawFixed
+  $lg.ItemHeight = $lg.Font.Height + 1
+  $p.LogColors = New-Object 'System.Collections.Generic.List[string]'
+  $p.LogPal = @{
+    Red = (New-PanelColor 240 110 110); DarkRed = (New-PanelColor 240 110 110); Yellow = (New-PanelColor 232 200 90); DarkYellow = (New-PanelColor 232 200 90)
+    Green = (New-PanelColor 110 205 125); DarkGreen = (New-PanelColor 110 205 125); Cyan = (New-PanelColor 100 190 235); DarkCyan = (New-PanelColor 100 190 235)
+    Gray = $c.Dim; DarkGray = $c.Dim; Magenta = (New-PanelColor 210 140 230)
+  }
+  $lg.Add_DrawItem({
+    param($sender, $e)
+    try {
+      if ($e.Index -lt 0) { return }
+      $q = $script:Panel
+      $e.DrawBackground()
+      $col = $q.Colors.Text
+      if ($e.Index -lt $q.LogColors.Count) { $n = $q.LogColors[$e.Index]; if ($n -and $q.LogPal.ContainsKey($n)) { $col = $q.LogPal[$n] } }
+      if (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0) { $col = [System.Drawing.SystemColors]::HighlightText }
+      [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, [string]$sender.Items[$e.Index], $e.Font, $e.Bounds, $col, [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::SingleLine -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter)
+    } catch {}
+  })
+  $lcm = New-Object "$WF.ContextMenuStrip"
+  $lmi = New-Object "$WF.ToolStripMenuItem"
+  $lmi.Text = T 'Copy all'
+  $lmi.Add_Click({
+    try {
+      $t = (@($script:Panel.Log.Items) | ForEach-Object { [string]$_ }) -join "`r`n"
+      if ($t) { [System.Windows.Forms.Clipboard]::SetDataObject($t, $true, 5, 100) }
+    } catch {}
+  })
+  [void]$lcm.Items.Add($lmi)
+  $lg.ContextMenuStrip = $lcm
+  $p.Log = $lg
+  $root.Controls.Add($lg, 0, 9)
+
+  # Row 10: add, viewer preview, copy link, resync
   $bot = New-PanelGrid 4 ([int]($fh * 2.7))
   $p.Add = New-PanelButton (T 'Add / search...') (T 'Add a video or a link, or search for one.') 'add' $null $null
   $p.Viewer = New-PanelButton (T 'Watch as viewers see it') (T 'Opens the real stream in a small player window, the way viewers get it (with their delay). Close it any time.') 'viewer' $null $null
@@ -413,9 +459,9 @@ function New-ControlPanel {
   foreach ($b in $bb) { $b.AutoEllipsis = $false }   # long translations wrap onto a second line
   $i = 0
   foreach ($b in $bb) { $bot.Controls.Add($b, $i, 0); $i++ }
-  $root.Controls.Add($bot, 0, 8)
+  $root.Controls.Add($bot, 0, 10)
 
-  # Row 9: checkboxes
+  # Row 11: checkboxes
   $flow = New-Object "$WF.FlowLayoutPanel"
   $flow.Dock = [System.Windows.Forms.DockStyle]::Fill
   $flow.Height = $fh + [int](12 * $k)
@@ -433,7 +479,7 @@ function New-ControlPanel {
   $p.OnTop.Add_CheckedChanged({ try { $script:Panel.Form.TopMost = $script:Panel.OnTop.Checked } catch {} })
   $flow.Controls.Add($p.Clock)
   $flow.Controls.Add($p.OnTop)
-  $root.Controls.Add($flow, 0, 9)
+  $root.Controls.Add($flow, 0, 11)
 
   $f.Controls.Add($root)
   $f.Add_KeyDown({
@@ -638,9 +684,17 @@ function Open-ControlPanel {
       $rs.Open()
       $script:PanelRs = $rs
     }
+    # The message pane: the queue outlives the window; a new window starts from the ring of recent lines.
+    $backlog = $null
+    try {
+      if ($null -ne $script:UiLogRing) { $backlog = $script:UiLogRing.ToArray() }
+      $drop = $null
+      if ($null -ne $script:UiLog) { while ($script:UiLog.TryDequeue([ref]$drop)) {} }
+    } catch {}
     $sync = [hashtable]::Synchronized(@{
       State = $null; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]')
       Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false
+      Log = $script:UiLog; Backlog = $backlog
     })
     $self = $script:PanelSelf
     if (-not $self) { $self = $script:PanelFile }
@@ -727,6 +781,38 @@ function Invoke-PanelTick {
     return
   }
   Update-PanelView $sync.State
+  try { Update-PanelLog $sync } catch {}
+}
+
+# New message lines for the pane (at most 300 per tick); it keeps the last 1500 and follows the end unless scrolled up.
+function Update-PanelLog($sync) {
+  $q = $script:Panel
+  $lg = $q.Log
+  if ($null -eq $lg) { return }
+  $new = New-Object 'System.Collections.Generic.List[object]'
+  $bl = $sync.Backlog
+  if ($bl) { $sync.Backlog = $null; foreach ($e in $bl) { $new.Add($e) } }
+  $src = $sync.Log
+  if ($null -ne $src) {
+    $e = $null
+    $n = 0
+    while ($n -lt 300 -and $src.TryDequeue([ref]$e)) { $new.Add($e); $n++ }
+  }
+  if ($new.Count -eq 0) { return }
+  $rows = [Math]::Max(1, [int][Math]::Floor($lg.ClientSize.Height / [Math]::Max(1, $lg.ItemHeight)))
+  $atEnd = ($lg.Items.Count -eq 0) -or (($lg.TopIndex + $rows) -ge ($lg.Items.Count - 1))
+  $lg.BeginUpdate()
+  try {
+    foreach ($e in $new) {
+      foreach ($ln in (([string]$e[0]) -split "`r?`n")) { [void]$lg.Items.Add($ln); $q.LogColors.Add([string]$e[1]) }
+    }
+    $over = $lg.Items.Count - 1500
+    if ($over -gt 0) {
+      for ($i = 0; $i -lt $over; $i++) { $lg.Items.RemoveAt(0) }
+      $q.LogColors.RemoveRange(0, $over)
+    }
+    if ($atEnd) { $lg.TopIndex = [Math]::Max(0, $lg.Items.Count - $rows) }
+  } finally { $lg.EndUpdate() }
 }
 
 function Show-PanelWindow {
