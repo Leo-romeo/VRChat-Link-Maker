@@ -1326,9 +1326,21 @@ function Set-CustomInteractive($c) {
   return $true
 }
 
+# What each host is, in $script:HostIds order (the host menu's choices; the control window shows them as tips).
+function Get-HostChoiceTexts {
+  return @(
+    (T 'Topaz Chat - free, trusted by VRChat, plays everywhere (Public too). Up to about 1.4 Mbps.'),
+    (T 'This PC - free, sharper picture; viewers see your home IP; not for Public instances; uses your upload.'),
+    (T 'My VPS - your own server (Oracle free, or ~5.49 EUR/month; viewers in Russia need another host, see README); hides your IP; not for Public instances.'),
+    (T 'Custom server - type the links yourself (e.g. Twitch: trusted, but the stream is public).')
+  )
+}
+
 # The host menu. Saves config.json (only when something changed). Returns $true when the host or its links changed (the
 # stream must restart). The main script runs it as a flow (Invoke-HostChoice): Esc at the first question leaves it.
-function Select-Host {
+# -Pick: the host id already chosen (the control window's menu): "Where should the stream go?" isn't asked, the
+# host's own questions are.
+function Select-Host([string]$Pick = '') {
   if (-not $script:Interactive) { return $false }
   $c = $script:Cfg
   $was = $c | ConvertTo-Json -Depth 8 -Compress
@@ -1339,16 +1351,15 @@ function Select-Host {
   # The configured host couldn't start (Topaz streams instead): Topaz is "now", and picking the other one again retries it.
   if ($script:HostP -and $script:HostP.Id -ne $cfgId) { $before = Get-HostProfile $script:HostP.Id }
   $curId = $before.Id
-  $opts = @(
-    (T 'Topaz Chat - free, trusted by VRChat, plays everywhere (Public too). Up to about 1.4 Mbps.'),
-    (T 'This PC - free, sharper picture; viewers see your home IP; not for Public instances; uses your upload.'),
-    (T 'My VPS - your own server (Oracle free, or ~5.49 EUR/month; viewers in Russia need another host, see README); hides your IP; not for Public instances.'),
-    (T 'Custom server - type the links yourself (e.g. Twitch: trusted, but the stream is public).')
-  )
-  $ci = [array]::IndexOf($script:HostIds, $curId)
-  $opts[$ci] = T '{0}  <- now' $opts[$ci]
-  Say ''
-  $i = Read-Choice (T 'Where should the stream go?') $opts $ci $false
+  $i = -1
+  if ($Pick) { $i = [array]::IndexOf($script:HostIds, $Pick) }
+  if ($i -lt 0) {
+    $opts = @(Get-HostChoiceTexts)
+    $ci = [array]::IndexOf($script:HostIds, $curId)
+    $opts[$ci] = T '{0}  <- now' $opts[$ci]
+    Say ''
+    $i = Read-Choice (T 'Where should the stream go?') $opts $ci $false
+  }
   $id = $script:HostIds[$i]
 
   $ok = $true

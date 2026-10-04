@@ -346,15 +346,22 @@ function Save-LanguageSetting([string]$code) {
 }
 
 # Asks which language the window should use (Enter keeps the current one) and remembers it in config.json.
-function Select-Language {
+# -Pick: the language code already chosen (the control window's menu): no question.
+function Select-Language([string]$Pick = '') {
   $langs = @(Get-Languages)
   if ($langs.Count -lt 2) { Say (T 'No translations found (the "lang" folder next to this tool is missing or empty).') 'Yellow'; return }
   $cur = 0
-  for ($i = 0; $i -lt $langs.Count; $i++) { if ($langs[$i].Code -eq $script:Lang) { $cur = $i } }
-  Say ''
-  # Asked in every language at once (the current one first), so it can be read whatever the window speaks now.
-  $asks = @(@($langs[$cur].Ask) + @($langs | ForEach-Object { $_.Ask }) | Select-Object -Unique)
-  $pos = Read-Choice ($asks -join ' / ') @($langs | ForEach-Object { $_.Name }) $cur $false -Key 'lang' -Values @($langs | ForEach-Object { $_.Code }) -Esc $cur
+  $pos = -1
+  for ($i = 0; $i -lt $langs.Count; $i++) {
+    if ($langs[$i].Code -eq $script:Lang) { $cur = $i }
+    if ($Pick -and $langs[$i].Code -eq $Pick) { $pos = $i }
+  }
+  if ($pos -lt 0) {
+    Say ''
+    # Asked in every language at once (the current one first), so it can be read whatever the window speaks now.
+    $asks = @(@($langs[$cur].Ask) + @($langs | ForEach-Object { $_.Ask }) | Select-Object -Unique)
+    $pos = Read-Choice ($asks -join ' / ') @($langs | ForEach-Object { $_.Name }) $cur $false -Key 'lang' -Values @($langs | ForEach-Object { $_.Code }) -Esc $cur
+  }
   $code = $langs[$pos].Code
   Lock-NavStep
   Initialize-Language $code
@@ -468,6 +475,10 @@ namespace VRCLinkMaker {
       } catch { }
     }
     public string Text { get { lock (gate) { return text; } } }
+  }
+  // (The control window: the grey hint text in its input box, EM_SETCUEBANNER.)
+  public static class Win {
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
   }
 }
 '@
@@ -1471,12 +1482,15 @@ function Select-SessionFps($item) {
 }
 
 # ------------------------------------------------------------------ queue items
+# Id: a number of its own for each item (the control window's Up next menu names items by it, see Invoke-QueueCommand).
+$script:ItemSeq = 0
 function New-QueueItem([string]$kind, [string]$src) {
   $name = $src
   $path = $null
   if ($kind -eq 'file') { $name = [System.IO.Path]::GetFileName($src); $path = $src } else { $name = Get-ShortText $src 70 }
+  $script:ItemSeq++
   return [pscustomobject]@{
-    Kind = $kind; Source = $src; Path = $path; Name = $name; State = 'new'; Error = $null
+    Id = $script:ItemSeq; Kind = $kind; Source = $src; Path = $path; Name = $name; State = 'new'; Error = $null
     JobDir = $null; Info = $null; AudioTrack = $null; SubTrack = $null; SubFile = $null; SubIsSrt = $false; SubWarn = $null
     ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false; IsLive = $false
     FpsFilter = $null; OutFps = 24.0; FpsNote = $null; ResumeAt = 0.0; Attempts = 0; Announced = $false
@@ -1652,25 +1666,32 @@ function Test-MenuItemOn($it) {
 }
 
 # Runs a menu item (on '>', or on the waiting screen through Invoke-Queue: the waiting screen stays on meanwhile).
-function Invoke-MenuAction([string]$id) {
+# $pick: the choice already made in the control window's Settings menu (host id, picture height, language code), so
+# that question isn't asked again ($null = ask). Follow-up questions (a VPS code, a DuckDNS name...) still come here.
+function Invoke-MenuAction([string]$id, $pick = $null) {
   switch ($id) {
-    'host' { Invoke-HostMenu }
-    'res' { Invoke-ResolutionMenu }
+    'host' { if ($null -ne $pick) { Invoke-HostMenu $pick } else { Invoke-HostMenu } }
+    'res' { if ($null -ne $pick) { Invoke-ResolutionMenu $pick } else { Invoke-ResolutionMenu } }
     'speedtest' { Invoke-SpeedTestMenu }
     'newlink' { Invoke-NewLinkMenu }
-    'lang' { Invoke-LanguageMenu }
+    'lang' { if ($null -ne $pick) { Invoke-LanguageMenu $pick } else { Invoke-LanguageMenu } }
     'forget' { Clear-AskedPrefs }
     'menu' { Invoke-SettingsMenu }
   }
 }
 
-function Invoke-LanguageMenu {
+function Invoke-LanguageMenu($Pick = $null) {
   $was = $script:PromptOk
   $script:PromptOk = $true
+  $before = $script:Lang
   try {
-    Select-Language
+    if ($null -ne $Pick) { Select-Language -Pick ([string]$Pick) } else { Select-Language }
     if ($script:Cfg) { Show-Links }
   } finally { $script:PromptOk = $was }
+  # The control window takes its texts when it opens: open it again in the new language (same place and size).
+  if ($script:Lang -ne $before -and $script:PanelShown -and (Test-ControlPanelOpen)) {
+    try { Close-ControlPanel; $script:PanelShown = [bool](Open-ControlPanel) } catch { $script:PanelShown = $false }
+  }
 }
 
 # "Ask again": this session's answers to which player, which audio / subtitles and which voice-over are forgotten.
@@ -4236,11 +4257,102 @@ function Receive-Commands([string]$kind) {
         'add' { Open-AddWindow '' }
         'viewer' { Open-ViewerPreview }
         'clock' { Switch-Clock }
+        # The window's input box: each line as if typed here and Enter pressed; files / a folder as if dropped here.
+        'line' { foreach ($ln in @(([string]$p.Arg) -split "`r?`n")) { if ($ln.Trim()) { Add-TypedLine $ln.Trim() $kind } } }
+        'files' {
+          $fs = @(@($p.Arg) | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() })
+          if ($fs.Count -gt 0) { Invoke-AddEntries $fs $kind }
+        }
+        { $_ -in @('qplay', 'qup', 'qdown', 'qremove', 'qclear') } { Invoke-QueueCommand $p.Cmd $p.Arg $kind }
         default { Add-Cmd (New-Cmd $p.Cmd $p.Arg 'panel') }
       }
     }
   }
   Receive-WorldCommands $kind
+}
+
+# The position of the queue item with this Id, or -1.
+function Find-QueueIndex($id) {
+  $n = 0
+  if (-not [int]::TryParse("$id", [ref]$n) -or $n -le 0) { return -1 }
+  for ($i = 0; $i -lt $script:Queue.Count; $i++) { if ([int](Get-Prop $script:Queue[$i] 'Id') -eq $n) { return $i } }
+  return -1
+}
+
+# Takes an item out of the queue: its download / helper programs are stopped (taskkill runs on its own, so the loop
+# never waits for it) and its folder is deleted (or later, once the programs let go of it: Remove-PendingDirs).
+function Remove-QueueItemAt([int]$i) {
+  $it = $script:Queue[$i]
+  $script:Queue.RemoveAt($i)
+  $procs = @()
+  if ($it.Dl -and $it.Dl.Proc) { $procs += $it.Dl.Proc }
+  foreach ($bg in @($it.Prep)) { if ($bg -and $bg.Proc) { $procs += $bg.Proc } }
+  $pb = Get-Prop $it 'ProbeBg'
+  if ($pb -and $pb.Bg -and $pb.Bg.Proc) { $procs += $pb.Bg.Proc }
+  $pk = Get-Prop $it 'PickBg'
+  if ($pk -and $pk.Ps) { try { [void]$pk.Ps.BeginStop($null, $null) } catch {} }
+  foreach ($p in $procs) {
+    $alive = $false
+    try { $alive = -not $p.HasExited } catch {}
+    if (-not $alive) { continue }
+    # (The whole tree: yt-dlp's own ffmpeg would keep the files open.)
+    try { [void](Start-Background 'taskkill.exe' @('/T', '/F', '/PID', [string]$p.Id)) } catch { Stop-Proc $p }
+  }
+  $dir = $it.JobDir
+  if ($dir) {
+    if ($script:JobLocks.ContainsKey($dir)) {
+      try { $script:JobLocks[$dir].Dispose() } catch {}
+      $script:JobLocks.Remove($dir)
+    }
+    try { [System.IO.Directory]::Delete($dir, $true) } catch {}
+    if ([System.IO.Directory]::Exists($dir)) { [void]$script:PendingDirs.Add($dir) }
+    $it.JobDir = $null
+  }
+  return $it
+}
+
+# The control window's Up next menu (Arg = @{ Id }). Only items after the one that plays can change; while nothing
+# plays, the one being got ready can too. Runs on this thread from Receive-Commands only (never inside a question).
+#   qplay: while a video plays (or is paused / waits for the players) it moves right behind it and the video switches
+#          to it (as "Now" from a second window); while nothing plays it becomes the next one.
+#   qup / qdown: one place earlier / later.  qremove: out of the queue (its download stops).  qclear: all of them.
+function Invoke-QueueCommand([string]$cmd, $arg, [string]$kind) {
+  $first = $script:Idx
+  if ($kind -ne 'waiting') { $first = $script:Idx + 1 }
+  if ($cmd -eq 'qclear') {
+    $n = 0
+    for ($i = $script:Queue.Count - 1; $i -ge $first; $i--) { [void](Remove-QueueItemAt $i); $n++ }
+    if ($n -gt 0) { Say (T '  Cleared the queue ({0} removed).' $n) 'Gray' }
+    return
+  }
+  $id = $null
+  if ($arg -is [System.Collections.IDictionary]) { $id = $arg['Id'] } else { $id = Get-Prop $arg 'Id' }
+  $i = Find-QueueIndex $id
+  if ($i -lt 0) { Say (T '  That video isn''t in the queue any more.') 'DarkGray'; return }
+  $it = $script:Queue[$i]
+  if ($i -lt $first) {
+    if ($cmd -eq 'qremove' -and $i -eq $script:Idx) { Say (T '  {0} is playing now: to leave it, use Next or Stop.' $it.Name) 'Yellow' }
+    return
+  }
+  switch ($cmd) {
+    'qplay' {
+      $to = $script:Idx
+      if ($kind -ne 'waiting') { $to = $script:Idx + 1 }
+      if ($i -ne $to) { $script:Queue.RemoveAt($i); $script:Queue.Insert($to, $it) }
+      if ($kind -ne 'waiting') { Add-Cmd (New-Cmd 'playnow' $null 'panel') }
+      else { Say (T '  Next up: {0}' $it.Name) 'Gray' }
+    }
+    'qup' {
+      if ($i - 1 -ge $first) { $script:Queue.RemoveAt($i); $script:Queue.Insert($i - 1, $it) }
+    }
+    'qdown' {
+      if ($i + 1 -lt $script:Queue.Count) { $script:Queue.RemoveAt($i); $script:Queue.Insert($i + 1, $it) }
+    }
+    'qremove' {
+      [void](Remove-QueueItemAt $i)
+      Say (T '  Removed from the queue: {0}' $it.Name) 'Gray'
+    }
+  }
 }
 
 function Switch-Clock {
@@ -4531,19 +4643,17 @@ function Get-QualityLine {
   $fps = [Math]::Round($script:StreamFpsNum, 2)
   $bpp = 0.0
   if ($script:OutW -gt 0 -and $script:OutH -gt 0 -and $script:StreamFpsNum -gt 0) { $bpp = $script:VideoKbps * 1000.0 / ($script:OutW * $script:OutH * $script:StreamFpsNum) }
-  $txt = T '{0}p - {1} fps - {2} kbps' $script:OutH (Format-Num $fps) $script:VideoKbps
-  if ($script:HostP) { $txt += ' - ' + $script:HostP.Name }
+  # (The chip in the window's link bar: "<host> - <picture> <fps> fps <kbps> kbps".)
+  if ($script:HostP) { $txt = T '{0} - {1}p {2} fps {3} kbps' $script:HostP.Name $script:OutH (Format-Num $fps) $script:VideoKbps }
+  else { $txt = T '{0}p {1} fps {2} kbps' $script:OutH (Format-Num $fps) $script:VideoKbps }
   return [pscustomobject]@{ Text = $txt; Low = ($bpp -gt 0 -and $bpp -lt 0.04) }
 }
 
-# The resolution menu. $true = the setting changed (saved in config.json).
-function Select-Resolution {
-  if (-not $script:Interactive) { return $false }
+# The picture sizes to choose from: Value = the height (0 = auto), Label (the resolution menu and the control window's).
+function Get-ResolutionChoices {
   $ceil = Get-KbpsCeiling
   $autoH = Get-AutoHeight $ceil
-  $cur = Get-HeightSetting
-  $hs = @(0) + @($script:Resolutions | ForEach-Object { [int]$_.H })
-  $opts = @()
+  $list = @()
   foreach ($r in @(@{ H = 0; Min = 0 }) + $script:Resolutions) {
     $h = [int]$r.H
     if ($h -le 0) {
@@ -4552,15 +4662,35 @@ function Select-Resolution {
       $o = T '{0}p - {1} kbps' $h (Get-QualityKbps $h)
       if ($ceil -lt $r.Min * (Get-FpsFactor)) { $o += ' ' + (T '(too big for {0} kbps: blurry when things move)' $ceil) }
     }
-    if ($h -eq $cur) { $o = T '{0}  <- now' $o }
-    $opts += $o
+    $list += [pscustomobject]@{ Value = $h; Label = $o }
   }
-  $ci = [array]::IndexOf($hs, $cur)
-  if ($ci -lt 0) { $ci = 0; Say (T 'Now: {0}p (set in config.json).' $cur) 'Gray' }
-  Say ''
-  # (Esc = keep the size as it is: not offered when config.json's size isn't in the list, so Esc can't pick Auto.)
-  if ([array]::IndexOf($hs, $cur) -ge 0) { $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false -Key 'res' -Values $hs -Esc $ci }
-  else { $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false -Key 'res' -Values $hs }
+  return $list
+}
+
+# The resolution menu. $true = the setting changed (saved in config.json). $Pick: the height already chosen (the
+# control window's menu; 0 = auto): no question.
+function Select-Resolution($Pick = $null) {
+  if (-not $script:Interactive) { return $false }
+  $cur = Get-HeightSetting
+  $choices = @(Get-ResolutionChoices)
+  $hs = @($choices | ForEach-Object { [int]$_.Value })
+  $i = -1
+  $pv = 0
+  if ($null -ne $Pick -and [int]::TryParse("$Pick", [ref]$pv)) { $i = [array]::IndexOf($hs, $pv) }
+  if ($i -lt 0) {
+    $opts = @()
+    foreach ($c in $choices) {
+      $o = $c.Label
+      if ([int]$c.Value -eq $cur) { $o = T '{0}  <- now' $o }
+      $opts += $o
+    }
+    $ci = [array]::IndexOf($hs, $cur)
+    if ($ci -lt 0) { $ci = 0; Say (T 'Now: {0}p (set in config.json).' $cur) 'Gray' }
+    Say ''
+    # (Esc = keep the size as it is: not offered when config.json's size isn't in the list, so Esc can't pick Auto.)
+    if ([array]::IndexOf($hs, $cur) -ge 0) { $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false -Key 'res' -Values $hs -Esc $ci }
+    else { $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false -Key 'res' -Values $hs }
+  }
   $h = $hs[$i]
   if ($h -eq $cur) { return $false }
   Lock-NavStep
@@ -5023,8 +5153,13 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     if ($media) { $title = $media.Name }
     $dur = 0.0
     if ($media -and $media.Info -and $media.Info.Duration -gt 0) { $dur = $media.Info.Duration }
+    # Up next: what comes after the video that plays; while nothing plays, from the one being got ready. The Ids go along
+    # (the window's right-click menu names an item by its Id: Invoke-QueueCommand).
     $up = @()
-    for ($i = $script:Idx + 1; $i -lt [Math]::Min($script:Queue.Count, $script:Idx + 21); $i++) { $up += $script:Queue[$i].Name }
+    $upIds = @()
+    $from = $script:Idx + 1
+    if ($kind -eq 'waiting') { $from = $script:Idx }
+    for ($i = $from; $i -lt [Math]::Min($script:Queue.Count, $from + 20); $i++) { $up += $script:Queue[$i].Name; $upIds += [int](Get-Prop $script:Queue[$i] 'Id') }
     $mode = $kind
     if ($kind -eq 'waiting' -and -not (Test-RelayAlive)) { $mode = 'off' }
     $pl = ''
@@ -5040,11 +5175,55 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $ql = Get-QualityLine
     $qtip = T 'What the stream carries: picture size, frames per second, video bitrate, server.'
     if ($ql.Low) { $qtip += ' ' + (T 'Orange: too few bits for this picture size, so it looks blocky. A smaller picture size (Settings > Picture size) looks sharper.') }
-    $script:PanelState = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up
-      Link = $script:ShownLink; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
+    $quest = ''
+    if ($script:HostP) { $quest = [string]$script:HostP.QuestUrl } elseif ($script:Cfg) { $quest = [string](Get-Prop $script:Cfg 'QuestUrl') }
+    $s = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up; UpcomingIds = [int[]]$upIds
+      Link = $script:ShownLink; QuestLink = $quest; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
       Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip }
+    $m = $null
+    try { $m = Get-PanelMenuState } catch {}
+    if ($m) { foreach ($k in $m.Keys) { $s[$k] = $m[$k] } }
+    $script:PanelState = $s
     Update-ControlPanel $script:PanelState
   } catch { $script:PanelShown = $false }
+}
+
+# The Settings menu's items for the control window: the same list as M here (Get-MenuItems), with the choices of
+# host, picture size and language (a pick there comes back with its choice, see Invoke-MenuAction). Made again only
+# when something it shows changed (the languages are read from the lang folder once).
+$script:PanelMenuCache = $null
+$script:PanelLangs = $null
+function Get-PanelMenuState {
+  $hid = ''
+  if ($script:HostP) { $hid = [string]$script:HostP.Id }
+  $key = '{0}|{1}|{2}|{3}|{4}|{5}' -f $script:Lang, $hid, (Get-HeightSetting), (Get-KbpsCeiling), $script:StreamFpsNum, [bool](Test-HostModule)
+  $c = $script:PanelMenuCache
+  if ($c -and $c.Key -ceq $key) { return $c.Value }
+  # (Made again e.g. when the first video sets the frame rate: no file reads then, the languages are kept from the first time.)
+  if ($null -eq $script:PanelLangs) { $script:PanelLangs = @(); try { $script:PanelLangs = @(Get-Languages) } catch {} }
+  $items = @()
+  foreach ($it in @(Get-MenuItems)) {
+    $on = $false
+    if ($it.Need -eq 'lang') { $on = (@($script:PanelLangs).Count -gt 1) } else { $on = [bool](Test-MenuItemOn $it) }
+    $items += @{ Id = [string]$it.Id; Label = [string]$it.Label; On = $on }
+  }
+  $hosts = @()
+  if ((Test-HostModule) -and $script:HostIds) {
+    $tips = @(Get-HostChoiceTexts)
+    for ($i = 0; $i -lt $script:HostIds.Count; $i++) {
+      $tip = ''
+      if ($i -lt $tips.Count) { $tip = [string]$tips[$i] }
+      $hosts += @{ Value = [string]$script:HostIds[$i]; Label = [string](Get-HostDisplayName $script:HostIds[$i]); Tip = $tip }
+    }
+  }
+  $res = @()
+  foreach ($r in @(Get-ResolutionChoices)) { $res += @{ Value = [string]$r.Value; Label = [string]$r.Label; Tip = '' } }
+  $langs = @()
+  foreach ($l in $script:PanelLangs) { $langs += @{ Value = [string]$l.Code; Label = [string]$l.Name; Tip = '' } }
+  $v = @{ Menu = $items; Choices = @{ host = $hosts; res = $res; lang = $langs }
+    Chosen = @{ host = $hid; res = [string](Get-HeightSetting); lang = [string]$script:Lang } }
+  $script:PanelMenuCache = @{ Key = $key; Value = $v }
+  return $v
 }
 
 # ------------------------------------------------------------------ running one source
@@ -5531,7 +5710,10 @@ function Invoke-Queue {
       if (@(Get-MenuItems -WithMenu | ForEach-Object { $_.Id }) -contains $r.Outcome) {
         $alive = Test-RelayAlive
         if ($alive) { Start-Standby }
-        Invoke-MenuAction $r.Outcome
+        # (A pick in the control window's Settings menu comes with its choice: that question isn't asked again.)
+        $pick = $null
+        if ($r.Cmd -and $r.Cmd.From -eq 'panel') { $pick = $r.Cmd.Arg }
+        Invoke-MenuAction $r.Outcome $pick
         # (The connection broke while the menu waited: reconnect as below, instead of ending the stream.)
         $lost = $alive -and -not (Test-RelayAlive)
         if (-not $lost) { continue }
@@ -5975,19 +6157,20 @@ function Reset-VrcPlayer {
 
 # The host menu as a flow: Back inside its questions; Esc (or 0) at "Where should the stream go?" leaves it with
 # nothing saved and nothing restarted (the config goes back to how it was). $true = the host or its links changed.
-function Invoke-HostChoice {
-  $r = Invoke-NavFlow -Name 'host' -Origin 'menu' -Cfg -Body { Select-Host }
+# $Pick: the host already chosen in the control window (its follow-up questions are still asked here).
+function Invoke-HostChoice([string]$Pick = '') {
+  $r = Invoke-NavFlow -Name 'host' -Origin 'menu' -Cfg -Body { if ($Pick) { Select-Host -Pick $Pick } else { Select-Host } }
   if ($r.Nav) { return $false }
   return [bool](@($r.Value) | Select-Object -Last 1)
 }
 
 # The host menu (H): another host means another link; viewers get the new one.
-function Invoke-HostMenu {
+function Invoke-HostMenu([string]$Pick = '') {
   if (-not (Test-HostModule) -or -not $script:HostP) { return }
   $was = $script:PromptOk
   $script:PromptOk = $true
   try {
-    $changed = Invoke-HostChoice
+    $changed = Invoke-HostChoice $Pick
     if ($changed) {
       # (A restart can't be undone: no Back crosses it, so the server's questions below are one-off ones with their Esc
       # answers, also when the same host was picked again after a fallback to Topaz and nothing was saved.)
@@ -6065,11 +6248,12 @@ function Invoke-SpeedTestMenu {
 }
 
 # The resolution menu (V). Another picture size means a new stream, so it reconnects (players follow, as after a resync).
-function Invoke-ResolutionMenu {
+function Invoke-ResolutionMenu($Pick = $null) {
   $was = $script:PromptOk
   $script:PromptOk = $true
   try {
-    if (-not (Select-Resolution)) { return }
+    if ($null -ne $Pick) { $chg = Select-Resolution $Pick } else { $chg = Select-Resolution }
+    if (-not $chg) { return }
     $oldW = $script:OutW; $oldH = $script:OutH; $oldCap = $script:RateCapKbps
     Update-StreamQuality
     Show-StreamQuality

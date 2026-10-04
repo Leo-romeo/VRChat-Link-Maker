@@ -16,6 +16,10 @@
 # synchronized hashtable: State (what to show), Cmds (the clicks), Ready, Closed, ShowReq, CloseReq, Error.
 # Nothing on the window's side may throw: every handler is wrapped, and an internal error only closes the
 # window (the reason goes to $script:PanelError and log.txt).
+# What the window posts (Cmds, {Cmd; Arg}): the stream's commands (toggle, seek, seekto, skip, stop, resync, quit),
+# add / viewer / clock, the Settings menu's item Ids (host / res / lang with the choice as Arg), 'line' (the input
+# box's text), 'files' (paths: picked, dropped or pasted), and qplay / qup / qdown / qremove / qclear (Arg = @{ Id },
+# the Up next menu). The main thread carries them out in Receive-Commands only, never inside a question.
 # (This file stays plain ASCII: symbols are built from [char] codes.)
 
 $script:Panel = $null         # (window thread) the window and its controls
@@ -28,6 +32,7 @@ $script:PanelLast = @{}
 $script:PanelError = $null
 $script:PanelStyled = $false
 $script:ViewerProc = $null
+$script:PanelBounds = $null   # (main thread) where the last window was: @{ X; Y; W; H; Top }
 
 # ------------------------------------------------------------------ commands (clicks and keys)
 function Add-PanelCommand([string]$cmd, $arg = $null) {
@@ -191,10 +196,11 @@ function Set-PanelGridWidths($grid, $buttons, [int]$extra) {
 function New-ControlPanel {
   $WF = 'System.Windows.Forms'
   $p = @{
-    Closed = $false; Link = ''; Mode = ''; Warned = 0; LogWidest = 0; RealPos = 0.0; PosText = ''; SeekDur = 0.0; SeekShown = 0.0; SeekOn = $false; SeekPx = -1
+    Closed = $false; Link = ''; QuestLink = ''; Mode = ''; Warned = 0; LogWidest = 0; RealPos = 0.0; PosText = ''; SeekDur = 0.0; SeekShown = 0.0; SeekOn = $false; SeekPx = -1
     Drag = $false; DragPos = 0.0; HoldPos = 0.0; HoldUntil = [DateTime]::MinValue
-    StopArmedUntil = [DateTime]::MinValue; CopiedUntil = [DateTime]::MinValue
+    StopArmedUntil = [DateTime]::MinValue; CopiedUntil = [DateTime]::MinValue; CopiedBtn = $null
     PrevCheck = [DateTime]::MinValue; PrevTime = [DateTime]::MinValue; PrevMissing = [DateTime]::MinValue
+    InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; CueSet = $false; CueTries = 0; InRows = $false; Timer = $null
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -215,8 +221,10 @@ function New-ControlPanel {
   $p.Small = New-Object System.Drawing.Font('Segoe UI', [single]8.25, [System.Drawing.FontStyle]::Bold)
   $p.Sym = New-Object System.Drawing.Font('Segoe UI Symbol', [single]9.75)
   $p.BigFont = New-Object System.Drawing.Font('Segoe UI Symbol', [single]11, [System.Drawing.FontStyle]::Bold)
+  $p.Mono = New-Object System.Drawing.Font('Consolas', [single]9)
   $fh = $p.Font.Height
   $k = $fh / 15.0
+  $p.K = $k
   $p.Tips = New-Object "$WF.ToolTip"
   $p.Tips.AutoPopDelay = 15000
   $p.Tips.InitialDelay = 400
@@ -229,10 +237,22 @@ function New-ControlPanel {
   $f.ForeColor = $c.Text
   $f.KeyPreview = $true
   $f.ShowInTaskbar = $true
+  $f.AllowDrop = $true
   $f.StartPosition = [System.Windows.Forms.FormStartPosition]::WindowsDefaultLocation
-  $f.MinimumSize = New-Object System.Drawing.Size([int](540 * $k), [int](560 * $k))
+  $f.MinimumSize = New-Object System.Drawing.Size([int](560 * $k), [int](620 * $k))
   $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-  $f.Size = New-Object System.Drawing.Size([int](620 * $k), [int]([Math]::Min(900 * $k, [Math]::Max(560 * $k, $wa.Height - 60))))
+  $f.Size = New-Object System.Drawing.Size([int]([Math]::Min(720 * $k, [Math]::Max(560 * $k, $wa.Width - 40))), [int]([Math]::Min(960 * $k, [Math]::Max(620 * $k, $wa.Height - 60))))
+  # The same place and size as the window before it (opened again, e.g. after a language change), if still on a screen.
+  $sb = $null
+  try { $sb = $script:PanelSync.StartBounds } catch {}
+  if ($sb) {
+    try {
+      $r = New-Object System.Drawing.Rectangle([int]$sb.X, [int]$sb.Y, [int]$sb.W, [int]$sb.H)
+      $seen = $false
+      foreach ($scr in [System.Windows.Forms.Screen]::AllScreens) { if ($scr.WorkingArea.IntersectsWith($r)) { $seen = $true } }
+      if ($seen -and $r.Width -gt 0 -and $r.Height -gt 0) { $f.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual; $f.Bounds = $r }
+    } catch {}
+  }
   $f.SuspendLayout()
 
   $root = New-Object "$WF.TableLayoutPanel"
@@ -240,12 +260,20 @@ function New-ControlPanel {
   $root.ColumnCount = 1
   $root.Padding = New-Object System.Windows.Forms.Padding([int](8 * $k))
   [void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-  $rowSizes = @('Auto', 'P62', 'Auto', 'Auto', 'Auto', 'Auto', 'Auto', 'P38', 'Auto', 'P34', 'Auto', 'Auto')
+  # Rows: 0 title, 1 link bar, 2 warnings banner, 3 input box, 4 preview, 5 seek bar, 6 transport, 7 status, 8 player,
+  # 9-10 up next, 11-12 messages, 13 buttons, 14 checkboxes. The preview takes what is left (it shrinks first on a small
+  # screen); up next and messages get a share of it, at least a few lines each (Update-PanelRows).
+  $p.ListMin = [int]($fh * 2.5) + [int](4 * $k)
+  $p.LogMin = [int]($fh * 3) + [int](4 * $k)
+  $rowSizes = @('Auto', 'Auto', 'Auto', 'Auto', 'P100', 'Auto', 'Auto', 'Auto', 'Auto', 'Auto', ('A' + [int]($fh * 5)), 'Auto', ('A' + [int]($fh * 6)), 'Auto', 'Auto')
+  $p.RowPreview = 4; $p.RowList = 10; $p.RowLog = 12
   $root.RowCount = $rowSizes.Count
   foreach ($r in $rowSizes) {
     if ($r -eq 'Auto') { [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
+    elseif ($r.StartsWith('A')) { [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, [single]$r.Substring(1)))) }
     else { [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, [single]$r.Substring(1)))) }
   }
+  $p.Root = $root
 
   # Row 0: what the stream is doing + the title
   $top = New-PanelGrid 2 ($p.Bold.Height + 8)
@@ -262,7 +290,97 @@ function New-ControlPanel {
   $top.Controls.Add($p.Title, 1, 0)
   $root.Controls.Add($top, 0, 0)
 
-  # Row 1: the preview picture (what ffmpeg sends, refreshed about twice a second)
+  # Row 1: the link for the world's player, [Copy], [Quest link] (when the host has one), and what the stream carries
+  # (a dim chip: host - picture fps kbps; orange when it is too few bits for the picture size).
+  $lk = New-PanelGrid 5 ([int]($fh * 2.1))
+  $p.LinkLabel = New-Object "$WF.Label"
+  $p.LinkLabel.Text = T 'Link for VRChat:'
+  $p.LinkLabel.AutoSize = $true
+  $p.LinkLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Left
+  $p.LinkLabel.ForeColor = $c.Dim
+  $p.LinkLabel.Margin = New-Object System.Windows.Forms.Padding(2, 1, [int](4 * $k), 1)
+  $lb0 = New-Object "$WF.TextBox"
+  $lb0.ReadOnly = $true
+  $lb0.Font = $p.Mono
+  $lb0.BackColor = $c.Box
+  $lb0.ForeColor = $c.Text
+  $lb0.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+  $lb0.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+  $lb0.Margin = New-Object System.Windows.Forms.Padding(2, 1, 2, 1)
+  $lb0.Add_Click({ try { $this.SelectAll() } catch {} })
+  $p.LinkBox = $lb0
+  $p.Copy = New-PanelButton (T 'Copy') '' '' $null $null
+  $p.Copy.Add_Click({ try { $q = $script:Panel; if ($q.Link) { Set-PanelClipboard $q.Copy ([string]$q.Link) } } catch {} })
+  $p.CopyText = $p.Copy.Text
+  $p.Quest = New-PanelButton (T 'Quest link') '' '' $null $null
+  $p.Quest.Add_Click({ try { $q = $script:Panel; if ($q.QuestLink) { Set-PanelClipboard $q.Quest ([string]$q.QuestLink) } } catch {} })
+  $p.QuestText = $p.Quest.Text
+  # (One line, cut with "..." when narrow: the whole text is its tooltip.)
+  $p.Quality = New-PanelLabel '' ($fh + 4) $null $c.Dim
+  $p.Quality.Dock = [System.Windows.Forms.DockStyle]::None
+  $p.Quality.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+  $p.Quality.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+  $p.Quality.Margin = New-Object System.Windows.Forms.Padding([int](6 * $k), 1, 2, 1)
+  $bw = [Math]::Max([System.Windows.Forms.TextRenderer]::MeasureText($p.CopyText, $p.Font).Width, [System.Windows.Forms.TextRenderer]::MeasureText((T 'Copied!'), $p.Font).Width) + [int](22 * $k)
+  $p.QuestW = [Math]::Max([System.Windows.Forms.TextRenderer]::MeasureText($p.QuestText, $p.Font).Width, [System.Windows.Forms.TextRenderer]::MeasureText((T 'Copied!'), $p.Font).Width) + [int](22 * $k)
+  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 62)))
+  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, [single]$bw)))
+  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 0)))
+  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 38)))
+  $p.Quest.Visible = $false
+  $lk.Controls.Add($p.LinkLabel, 0, 0)
+  $lk.Controls.Add($lb0, 1, 0)
+  $lk.Controls.Add($p.Copy, 2, 0)
+  $lk.Controls.Add($p.Quest, 3, 0)
+  $lk.Controls.Add($p.Quality, 4, 0)
+  $p.LinkBar = $lk
+  $root.Controls.Add($lk, 0, 1)
+
+  # Row 2: the latest warning (a yellow or red line of the messages) for about 15 s; a click hides it.
+  $bn = New-PanelLabel '' ($fh + [int](10 * $k)) $null $null
+  $bn.Padding = New-Object System.Windows.Forms.Padding([int](6 * $k), 0, [int](6 * $k), 0)
+  $bn.Margin = New-Object System.Windows.Forms.Padding(2, [int](3 * $k), 2, [int](2 * $k))
+  $bn.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $bn.Visible = $false
+  $bn.Add_Click({ try { Hide-PanelBanner } catch {} })
+  $p.Banner = $bn
+  $root.Controls.Add($bn, 0, 2)
+
+  # Row 3: the input box (a title, a link, a file path; Enter = Add), [Files...], [Folder...]. Files and folders can be
+  # dropped anywhere on the window, links and text too.
+  $in = New-PanelGrid 4 ([int]($fh * 2.3))
+  $ib = New-Object "$WF.TextBox"
+  $ib.BackColor = $c.Box
+  $ib.ForeColor = $c.Text
+  $ib.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+  $ib.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+  $ib.Margin = New-Object System.Windows.Forms.Padding(2, 1, 2, 1)
+  $ib.Add_KeyDown({
+    param($sender, $e)
+    try { if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $e.Handled = $true; $e.SuppressKeyPress = $true; Submit-PanelInput } } catch {}
+  })
+  $ib.Add_HandleCreated({ try { Set-PanelCue } catch {} })
+  $p.Input = $ib
+  $p.AddLine = New-PanelButton (T 'Add') (T 'Add what you typed (Enter): a link or a file is queued, a title is searched for.') '' $null $null
+  $p.AddLine.Add_Click({ try { Submit-PanelInput } catch {} })
+  $p.Files = New-PanelButton (T 'Files...') (T 'Pick video files to add.') '' $null $null
+  $p.Files.Add_Click({ try { Show-PanelFileDialog } catch { Write-PanelWarning $_ } })
+  $p.Folder = New-PanelButton (T 'Folder...') (T 'Add every video in a folder.') '' $null $null
+  $p.Folder.Add_Click({ try { Show-PanelFolderDialog } catch { Write-PanelWarning $_ } })
+  [void]$in.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+  foreach ($b in @($p.AddLine, $p.Files, $p.Folder)) {
+    $w = [System.Windows.Forms.TextRenderer]::MeasureText([string]$b.Text, $b.Font).Width + [int](22 * $k)
+    [void]$in.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, [single]$w)))
+  }
+  $in.Controls.Add($ib, 0, 0)
+  $in.Controls.Add($p.AddLine, 1, 0)
+  $in.Controls.Add($p.Files, 2, 0)
+  $in.Controls.Add($p.Folder, 3, 0)
+  $p.InputRow = $in
+  $root.Controls.Add($in, 0, 3)
+
+  # Row 4: the preview picture (what ffmpeg sends, refreshed about twice a second)
   $pv = New-Object "$WF.PictureBox"
   $pv.Dock = [System.Windows.Forms.DockStyle]::Fill
   $pv.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
@@ -283,9 +401,9 @@ function New-ControlPanel {
     } catch {}
   })
   $p.Preview = $pv
-  $root.Controls.Add($pv, 0, 1)
+  $root.Controls.Add($pv, 0, 4)
 
-  # Row 2: position, seek bar, duration
+  # Row 5: position, seek bar, duration
   $tw = [System.Windows.Forms.TextRenderer]::MeasureText('00:00:00', $p.Font).Width + [int](6 * $k)
   $time = New-PanelGrid 3 ([int]($fh * 1.7))
   [void]$time.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, [single]$tw)))
@@ -337,9 +455,9 @@ function New-ControlPanel {
   $time.Controls.Add($p.Pos, 0, 0)
   $time.Controls.Add($bar, 1, 0)
   $time.Controls.Add($p.Dur, 2, 0)
-  $root.Controls.Add($time, 0, 2)
+  $root.Controls.Add($time, 0, 5)
 
-  # Row 3: transport buttons
+  # Row 6: transport buttons
   $rew = [string][char]0x23EA
   $fwd = [string][char]0x23E9
   $tr = New-PanelGrid 7 ([int]($fh * 2.5))
@@ -381,27 +499,17 @@ function New-ControlPanel {
   }
   $i = 0
   foreach ($b in @($p.Back30, $p.Back10, $p.Big, $p.Fwd10, $p.Fwd30, $p.Next, $p.Stop)) { $b.AutoEllipsis = $false; $tr.Controls.Add($b, $i, 0); $i++ }
-  $root.Controls.Add($tr, 0, 3)
+  $root.Controls.Add($tr, 0, 6)
 
-  # Rows 4-7: status, VRChat player, up next
+  # Rows 7-10: status, VRChat player, up next
   $p.Status = New-PanelLabel '' ($fh * 2 + 6) $null $null
   $p.Status.TextAlign = [System.Drawing.ContentAlignment]::TopLeft
   $p.Status.Margin = New-Object System.Windows.Forms.Padding(2, [int](6 * $k), 2, 1)
-  $root.Controls.Add($p.Status, 0, 4)
-  # The VRChat player's state, and on the right what the stream carries (picture size, fps, bitrate, server).
-  $pq = New-PanelGrid 2 ($fh + 6)
-  [void]$pq.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-  [void]$pq.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+  $root.Controls.Add($p.Status, 0, 7)
+  # The VRChat player's state (what the stream carries is the chip in the link bar).
   $p.Player = New-PanelLabel '' ($fh + 6) $null $c.Dim
-  $p.Quality = New-Object "$WF.Label"
-  $p.Quality.AutoSize = $true
-  $p.Quality.Anchor = [System.Windows.Forms.AnchorStyles]::Right
-  $p.Quality.ForeColor = $c.Dim
-  $p.Quality.Margin = New-Object System.Windows.Forms.Padding([int](8 * $k), 1, 2, 1)
-  $pq.Controls.Add($p.Player, 0, 0)
-  $pq.Controls.Add($p.Quality, 1, 0)
-  $root.Controls.Add($pq, 0, 5)
-  $root.Controls.Add((New-PanelLabel (T 'Up next') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 6)
+  $root.Controls.Add($p.Player, 0, 8)
+  $root.Controls.Add((New-PanelLabel (T 'Up next') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 9)
   $lb = New-Object "$WF.ListBox"
   $lb.Dock = [System.Windows.Forms.DockStyle]::Fill
   $lb.IntegralHeight = $false
@@ -410,11 +518,36 @@ function New-ControlPanel {
   $lb.ForeColor = $c.Text
   $lb.Margin = New-Object System.Windows.Forms.Padding(2, 0, 2, [int](4 * $k))
   $lb.MinimumSize = New-Object System.Drawing.Size(0, [int]($fh * 2.5))
+  # Right-click: play now, move, remove, clear (by the item's Id: the main thread may have changed the queue meanwhile).
+  $lb.Add_MouseDown({
+    param($sender, $e)
+    try {
+      if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
+        $ix = $sender.IndexFromPoint($e.Location)
+        if ($ix -ge 0) { $sender.SelectedIndex = $ix }
+      }
+    } catch {}
+  })
+  $qm = New-Object "$WF.ContextMenuStrip"
+  $p.QPlay = New-PanelMenuItem (T 'Play now') 'qplay'
+  $p.QUp = New-PanelMenuItem (T 'Move up') 'qup'
+  $p.QDown = New-PanelMenuItem (T 'Move down') 'qdown'
+  $p.QRemove = New-PanelMenuItem (T 'Remove') 'qremove'
+  $p.QClear = New-PanelMenuItem (T 'Clear the queue') 'qclear'
+  foreach ($mi in @($p.QPlay, $p.QUp, $p.QDown, $p.QRemove)) {
+    $mi.Add_Click({ try { $id = Get-PanelListId; if ($id -gt 0) { Add-PanelCommand ([string]$this.Tag.Cmd) @{ Id = $id } } } catch {} })
+  }
+  $p.QClear.Add_Click({ try { if (Confirm-Panel (T 'Remove everything from Up next?')) { Add-PanelCommand 'qclear' @{ Id = (Get-PanelListId) } } } catch { Write-PanelWarning $_ } })
+  foreach ($mi in @($p.QPlay, $p.QUp, $p.QDown, $p.QRemove)) { [void]$qm.Items.Add($mi) }
+  [void]$qm.Items.Add((New-Object "$WF.ToolStripSeparator"))
+  [void]$qm.Items.Add($p.QClear)
+  $qm.Add_Opening({ try { Update-PanelQueueMenu } catch { Write-PanelWarning $_ } })
+  $lb.ContextMenuStrip = $qm
   $p.List = $lb
-  $root.Controls.Add($lb, 0, 7)
+  $root.Controls.Add($lb, 0, 10)
 
-  # Rows 8-9: messages (everything the console window shows; right-click copies)
-  $root.Controls.Add((New-PanelLabel (T 'Messages') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 8)
+  # Rows 11-12: messages (everything the console window shows; right-click copies)
+  $root.Controls.Add((New-PanelLabel (T 'Messages') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 11)
   $lg = New-Object "$WF.ListBox"
   $lg.Dock = [System.Windows.Forms.DockStyle]::Fill
   $lg.IntegralHeight = $false
@@ -469,17 +602,7 @@ function New-ControlPanel {
   })
   $p.LogOpen = New-Object "$WF.ToolStripMenuItem"
   $p.LogOpen.Text = T 'Open log.txt'
-  $p.LogOpen.Add_Click({
-    try {
-      $f = [string]$script:PanelSync.LogPath
-      if ($f -and [System.IO.File]::Exists($f)) {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $f
-        $psi.UseShellExecute = $true
-        [void][System.Diagnostics.Process]::Start($psi)
-      }
-    } catch { Write-PanelWarning $_ }
-  })
+  $p.LogOpen.Add_Click({ try { Open-PanelLogFile } catch { Write-PanelWarning $_ } })
   [void]$lcm.Items.Add($p.LogCopy)
   [void]$lcm.Items.Add($lmi)
   [void]$lcm.Items.Add($p.LogOpen)
@@ -487,52 +610,35 @@ function New-ControlPanel {
     try {
       $q = $script:Panel
       $q.LogCopy.Enabled = ($q.Log.SelectedIndices.Count -gt 0)
-      $f = [string]$script:PanelSync.LogPath
-      $q.LogOpen.Enabled = [bool]($f -and [System.IO.File]::Exists($f))
+      $q.LogOpen.Enabled = (Test-PanelLogFile)
     } catch {}
   })
   $lg.ContextMenuStrip = $lcm
   $p.Log = $lg
-  $root.Controls.Add($lg, 0, 9)
+  $root.Controls.Add($lg, 0, 12)
 
-  # Row 10: add, viewer preview, copy link, resync
+  # Row 13: search / add in a second window, viewer preview, resync, settings
   $bot = New-PanelGrid 4 ([int]($fh * 2.7))
   $p.Add = New-PanelButton (T 'Add / search...') (T 'Add a video or a link, or search for one.') 'add' $null $null
   $p.Viewer = New-PanelButton (T 'Watch as viewers see it') (T 'Opens the real stream in a small player window, the way viewers get it (with their delay). Close it any time.') 'viewer' $null $null
-  $p.Copy = New-PanelButton (T 'Copy link') '' '' $null $null
-  $p.Copy.Add_Click({
-    try {
-      $q = $script:Panel
-      if ($q.Link) {
-        [System.Windows.Forms.Clipboard]::SetDataObject([string]$q.Link, $true, 5, 100)
-        $q.Copy.Text = T 'Copied!'
-        $q.CopiedUntil = [DateTime]::UtcNow.AddSeconds(1.5)
-      }
-    } catch {}
-  })
   $p.Resync = New-PanelButton ([string][char]0x21BB + ' ' + (T 'Resync everyone')) (T 'Everyone''s player reconnects to the live picture, so all viewers are in sync again. The video waits for them.') 'resync' $null $p.Sym
-  $p.CopyText = $p.Copy.Text
-  # Settings that change the link or the picture: only while nothing plays (the questions come in the console window).
-  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Server, picture size, upload speed test, new link. Available while nothing plays; the questions appear in the console window.') '' $null $p.Sym
+  # Settings: the same list as M in the console (the main thread sends it, see Update-PanelMenu), then log.txt and
+  # End stream. What changes the link or the picture works only while nothing plays.
+  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Where to stream, picture size, speed test, new link, language, log.txt and End stream. The stream settings work while nothing plays; questions that need typing appear in the console window.') '' $null $p.Sym
   $menu = New-Object "$WF.ContextMenuStrip"
-  foreach ($it in @(@((T 'Where to stream (server)...'), 'host'), @((T 'Picture size...'), 'res'), @((T 'Upload speed test'), 'speedtest'), @((T 'New link...'), 'newlink'))) {
-    $mi = New-Object "$WF.ToolStripMenuItem"
-    $mi.Text = $it[0]
-    $mi.Tag = $it[1]
-    $mi.Add_Click({ try { Add-PanelCommand ([string]$this.Tag) } catch {} })
-    [void]$menu.Items.Add($mi)
-  }
+  $menu.ShowItemToolTips = $true
+  $menu.Add_Opening({ try { Update-PanelMenu } catch { Write-PanelWarning $_ } })
   $p.Menu = $menu
+  Update-PanelMenu
   $p.More.Add_Click({ try { $q = $script:Panel; $q.Menu.Show($q.More, 0, $q.More.Height) } catch {} })
-  $bot.ColumnCount = 5
-  $bb = @($p.Add, $p.Viewer, $p.Copy, $p.Resync, $p.More)
+  $bb = @($p.Add, $p.Viewer, $p.Resync, $p.More)
   Set-PanelGridWidths $bot $bb ([int](24 * $k))
   foreach ($b in $bb) { $b.AutoEllipsis = $false }   # long translations wrap onto a second line
   $i = 0
   foreach ($b in $bb) { $bot.Controls.Add($b, $i, 0); $i++ }
-  $root.Controls.Add($bot, 0, 10)
+  $root.Controls.Add($bot, 0, 13)
 
-  # Row 11: checkboxes
+  # Row 14: checkboxes
   $flow = New-Object "$WF.FlowLayoutPanel"
   $flow.Dock = [System.Windows.Forms.DockStyle]::Fill
   $flow.Height = $fh + [int](12 * $k)
@@ -550,22 +656,338 @@ function New-ControlPanel {
   $p.OnTop.Add_CheckedChanged({ try { $script:Panel.Form.TopMost = $script:Panel.OnTop.Checked } catch {} })
   $flow.Controls.Add($p.Clock)
   $flow.Controls.Add($p.OnTop)
-  $root.Controls.Add($flow, 0, 11)
+  $root.Controls.Add($flow, 0, 14)
+  if ($sb -and $sb.Top) { $p.OnTop.Checked = $true }
 
   $f.Controls.Add($root)
   $f.Add_KeyDown({
     param($sender, $e)
-    try { if (Invoke-PanelKey $e.KeyData) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch {}
+    try {
+      if (Invoke-PanelPaste $e.KeyData) { $e.Handled = $true; $e.SuppressKeyPress = $true; return }
+      if (Invoke-PanelKey $e.KeyData) { $e.Handled = $true; $e.SuppressKeyPress = $true }
+    } catch {}
   })
   $f.Add_KeyUp({
     param($sender, $e)
     try { if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Space -and (Test-PanelKeyOurs $e.KeyCode)) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch {}
   })
+  $f.Add_Resize({ try { Update-PanelRows } catch {} })
+  $f.Add_FormClosing({ try { Save-PanelBounds } catch {} })
   $f.Add_FormClosed({ try { $script:Panel.Closed = $true; $script:PanelSync.Closed = $true; Remove-PanelImage } catch {} })
   Add-PanelKeyHook $f
+  Add-PanelDropHook $f
   $f.ResumeLayout($true)
   $f.ActiveControl = $p.Big
   Set-PanelMode 'off'
+}
+
+# A Settings / Up next menu item; Tag.Cmd = what a click queues (the click handler is the caller's).
+function New-PanelMenuItem([string]$text, [string]$cmd, $arg = $null) {
+  $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+  $mi.Text = $text
+  $mi.Tag = [pscustomobject]@{ Cmd = $cmd; Arg = $arg }
+  return $mi
+}
+
+# Every control takes dropped files / links / text (a control that doesn't allow it would refuse the drop).
+function Add-PanelDropHook($ctrl) {
+  $ctrl.AllowDrop = $true
+  $ctrl.Add_DragEnter({ param($sender, $e) try { $e.Effect = Get-PanelDropEffect $e.Data } catch {} })
+  $ctrl.Add_DragOver({ param($sender, $e) try { $e.Effect = Get-PanelDropEffect $e.Data } catch {} })
+  $ctrl.Add_DragDrop({ param($sender, $e) try { [void](Receive-PanelDrop $e.Data) } catch { Write-PanelWarning $_ } })
+  foreach ($ch in $ctrl.Controls) { Add-PanelDropHook $ch }
+}
+
+# What a drop / paste carries: @{ Kind = 'files'; Files } or @{ Kind = 'line'; Text }, or $null.
+function Get-PanelDropData($data) {
+  if ($null -eq $data) { return $null }
+  $DF = [System.Windows.Forms.DataFormats]
+  if ($data.GetDataPresent($DF::FileDrop)) {
+    $fs = @(@($data.GetData($DF::FileDrop)) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($fs.Count -gt 0) { return @{ Kind = 'files'; Files = [string[]]$fs } }
+  }
+  $t = ''
+  if ($data.GetDataPresent('UniformResourceLocatorW')) {
+    $o = $data.GetData('UniformResourceLocatorW')
+    if ($o -is [System.IO.MemoryStream]) { $t = [System.Text.Encoding]::Unicode.GetString($o.ToArray()) }
+    elseif ($null -ne $o) { $t = [string]$o }
+    $t = $t.Trim([char]0).Trim()
+  }
+  if (-not $t -and $data.GetDataPresent($DF::UnicodeText)) { $t = [string]$data.GetData($DF::UnicodeText) }
+  if (-not $t -and $data.GetDataPresent($DF::Text)) { $t = [string]$data.GetData($DF::Text) }
+  if ($t -and $t.Trim()) { return @{ Kind = 'line'; Text = $t.Trim() } }
+  return $null
+}
+
+function Get-PanelDropEffect($data) {
+  if (-not $script:Panel.InputOn) { return [System.Windows.Forms.DragDropEffects]::None }
+  $DF = [System.Windows.Forms.DataFormats]
+  foreach ($fm in @($DF::FileDrop, 'UniformResourceLocatorW', $DF::UnicodeText, $DF::Text)) {
+    if ($data.GetDataPresent($fm)) { return [System.Windows.Forms.DragDropEffects]::Copy }
+  }
+  return [System.Windows.Forms.DragDropEffects]::None
+}
+
+# A drop: files / a folder -> 'files', a link or text -> 'line' (as typed into the box and Enter). $true = posted.
+function Receive-PanelDrop($data) {
+  if (-not $script:Panel.InputOn) { return $false }
+  $d = Get-PanelDropData $data
+  if ($null -eq $d) { return $false }
+  if ($d.Kind -eq 'files') { Add-PanelCommand 'files' $d.Files } else { Add-PanelCommand 'line' $d.Text }
+  return $true
+}
+
+# Enter / [Add]: what the box holds goes to the main thread as a typed line.
+function Submit-PanelInput {
+  $q = $script:Panel
+  if (-not $q.InputOn) { return }
+  $t = [string]$q.Input.Text
+  if (-not $t.Trim()) { return }
+  Add-PanelCommand 'line' $t.Trim()
+  $q.Input.Clear()
+}
+
+# Ctrl+V outside a text box: copied files are added, text goes into the input box (focused). $true = handled.
+function Invoke-PanelPaste([System.Windows.Forms.Keys]$keyData) {
+  $K = [System.Windows.Forms.Keys]
+  if ($keyData -ne ($K::Control -bor $K::V)) { return $false }
+  $q = $script:Panel
+  $fc = $null
+  try { $fc = Get-PanelFocus } catch {}
+  if ($fc -is [System.Windows.Forms.TextBoxBase] -or $fc -is [System.Windows.Forms.ComboBox]) { return $false }
+  if (-not $q.InputOn) { return $true }
+  $do = $null
+  try { $do = [System.Windows.Forms.Clipboard]::GetDataObject() } catch {}
+  if ($do -and $do.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { [void](Receive-PanelDrop $do); return $true }
+  $q.Input.Focus() | Out-Null
+  $q.Input.SelectionStart = $q.Input.TextLength
+  $q.Input.Paste()
+  return $true
+}
+
+# The grey hint in the empty input box (EM_SETCUEBANNER through the tool's helper DLL; without it, no hint).
+function Set-PanelCue {
+  $q = $script:Panel
+  if ($q.CueSet -or -not $q.Input.IsHandleCreated) { return }
+  if (-not ('VRCLinkMaker.Win' -as [type])) { return }
+  [void][VRCLinkMaker.Win]::SendMessage($q.Input.Handle, 0x1501, [IntPtr]1, (T 'Type a title, paste a link, or drop videos here'))
+  $q.CueSet = $true
+}
+
+# A modal dialog / message from a click: the window's timer stops meanwhile (no state updates under the dialog).
+function Stop-PanelTimer { $q = $script:Panel; if ($q.Timer) { $q.Timer.Stop() } }
+function Start-PanelTimer { $q = $script:Panel; if ($q.Timer -and -not $q.Closed) { $q.Timer.Start() } }
+
+function Confirm-Panel([string]$text) {
+  $q = $script:Panel
+  Stop-PanelTimer
+  try {
+    $r = [System.Windows.Forms.MessageBox]::Show($q.Form, $text, 'VRChat Link Maker', [System.Windows.Forms.MessageBoxButtons]::YesNo,
+      [System.Windows.Forms.MessageBoxIcon]::Question, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    return ($r -eq [System.Windows.Forms.DialogResult]::Yes)
+  } finally { Start-PanelTimer }
+}
+
+function Show-PanelFileDialog {
+  $q = $script:Panel
+  if (-not $q.InputOn) { return }
+  $dlg = New-Object System.Windows.Forms.OpenFileDialog
+  $files = @()
+  try {
+    $dlg.Title = T 'Pick the videos to stream (you can pick several)'
+    $dlg.Multiselect = $true
+    $exts = [string]$script:PanelSync.MediaExts
+    if (-not $exts) { $exts = '*.*' }
+    $dlg.Filter = (T 'Videos') + '|' + $exts + '|' + (T 'All files') + '|*.*'
+    Stop-PanelTimer
+    try { if ($dlg.ShowDialog($q.Form) -eq [System.Windows.Forms.DialogResult]::OK) { $files = @($dlg.FileNames) } } finally { Start-PanelTimer }
+  } finally { $dlg.Dispose() }
+  if ($files.Count -gt 0) { Add-PanelCommand 'files' ([string[]]$files) }
+}
+
+function Show-PanelFolderDialog {
+  $q = $script:Panel
+  if (-not $q.InputOn) { return }
+  $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+  $dir = ''
+  try {
+    $dlg.Description = T 'Pick a folder with videos'
+    $dlg.ShowNewFolderButton = $false
+    Stop-PanelTimer
+    try { if ($dlg.ShowDialog($q.Form) -eq [System.Windows.Forms.DialogResult]::OK) { $dir = [string]$dlg.SelectedPath } } finally { Start-PanelTimer }
+  } finally { $dlg.Dispose() }
+  if ($dir) { Add-PanelCommand 'files' ([string[]]@($dir)) }
+}
+
+# Copies a link and shows "Copied!" on its button for a moment.
+function Set-PanelClipboard($btn, [string]$text) {
+  $q = $script:Panel
+  [System.Windows.Forms.Clipboard]::SetDataObject($text, $true, 5, 100)
+  Reset-PanelCopied
+  $btn.Text = T 'Copied!'
+  $q.CopiedBtn = $btn
+  $q.CopiedUntil = [DateTime]::UtcNow.AddSeconds(1.5)
+}
+
+function Reset-PanelCopied {
+  $q = $script:Panel
+  $q.CopiedUntil = [DateTime]::MinValue
+  $q.Copy.Text = $q.CopyText
+  $q.Quest.Text = $q.QuestText
+  $q.CopiedBtn = $null
+}
+
+function Test-PanelLogFile {
+  $f = [string]$script:PanelSync.LogPath
+  return [bool]($f -and [System.IO.File]::Exists($f))
+}
+
+function Open-PanelLogFile {
+  $f = [string]$script:PanelSync.LogPath
+  if ($f -and [System.IO.File]::Exists($f)) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $f
+    $psi.UseShellExecute = $true
+    [void][System.Diagnostics.Process]::Start($psi)
+  }
+}
+
+# The Settings menu, made again each time it opens from what the main thread sent last (State.Menu = Get-MenuItems:
+# Id, Label, On; State.Choices.<id> = the choices of host / res / lang with State.Chosen.<id> checked). A click queues
+# the item's Id (with the choice as Arg); the main thread runs it on the waiting screen (Invoke-Queue).
+function Update-PanelMenu {
+  $q = $script:Panel
+  $m = $q.Menu
+  $s = $null
+  try { $s = $script:PanelSync.State } catch {}
+  $old = @($m.Items)
+  $m.Items.Clear()
+  foreach ($x in $old) { try { $x.Dispose() } catch {} }
+  $prompt = ($s -and [bool]$s['Prompt'])
+  $mode = ''
+  if ($s) { $mode = [string]$s['Mode'] }
+  $waitOk = ($mode -eq 'waiting' -and -not $prompt)
+  $tip = T 'Available while nothing plays (press Stop first).'
+  $n = 0
+  if ($s -and $null -ne $s['Menu']) {
+    $choices = $s['Choices']
+    $chosen = $s['Chosen']
+    foreach ($it in @($s['Menu'])) {
+      $id = [string]$it['Id']
+      $list = @()
+      if ($choices -and $null -ne $choices[$id]) { $list = @($choices[$id]) }
+      $label = [string]$it['Label']
+      if ($list.Count -gt 0) { $label = $label.TrimEnd('.', [char]0x2026).TrimEnd() }
+      $mi = New-PanelMenuItem $label $id
+      if ($list.Count -gt 0) {
+        $cur = ''
+        if ($chosen) { $cur = [string]$chosen[$id] }
+        foreach ($ch in $list) {
+          $sub = New-PanelMenuItem ([string]$ch['Label']) $id ([string]$ch['Value'])
+          $sub.Checked = ([string]$ch['Value'] -ceq $cur)
+          if ($ch['Tip']) { $sub.ToolTipText = [string]$ch['Tip'] }
+          $sub.Add_Click({ try { Add-PanelCommand ([string]$this.Tag.Cmd) ([string]$this.Tag.Arg) } catch {} })
+          [void]$mi.DropDownItems.Add($sub)
+        }
+        try { $mi.DropDown.ShowItemToolTips = $true } catch {}
+      } else {
+        $mi.Add_Click({ try { Add-PanelCommand ([string]$this.Tag.Cmd) } catch {} })
+      }
+      $mi.Enabled = ($waitOk -and [bool]$it['On'])
+      if (-not $waitOk) { $mi.ToolTipText = $tip }
+      [void]$m.Items.Add($mi)
+      $n++
+    }
+  }
+  if ($n -gt 0) { [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
+  $lo = New-PanelMenuItem (T 'Open log.txt') 'openlog'
+  $lo.Enabled = (Test-PanelLogFile)
+  $lo.Add_Click({ try { Open-PanelLogFile } catch { Write-PanelWarning $_ } })
+  [void]$m.Items.Add($lo)
+  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  $en = New-PanelMenuItem (T 'End stream...') 'quit'
+  $en.Enabled = ($s -and $mode -and $mode -ne 'off' -and -not $prompt)
+  $en.Add_Click({ try { if (Confirm-Panel (T 'End the stream now? Viewers lose the picture.')) { Add-PanelCommand 'quit' } } catch { Write-PanelWarning $_ } })
+  [void]$m.Items.Add($en)
+}
+
+# The Id of the selected Up next line (0 = none).
+function Get-PanelListId {
+  $q = $script:Panel
+  $ix = $q.List.SelectedIndex
+  $ids = @($q.ListIds)
+  if ($ix -ge 0 -and $ix -lt $ids.Count) { return [int]$ids[$ix] }
+  return 0
+}
+
+function Update-PanelQueueMenu {
+  $q = $script:Panel
+  $s = $null
+  try { $s = $script:PanelSync.State } catch {}
+  $ok = ($null -ne $s -and -not [bool]$s['Prompt'])
+  $ids = @($q.ListIds)
+  $ix = $q.List.SelectedIndex
+  $has = ($ok -and (Get-PanelListId) -gt 0)
+  $q.QPlay.Enabled = $has
+  $q.QRemove.Enabled = $has
+  $q.QUp.Enabled = ($has -and $ix -gt 0)
+  $q.QDown.Enabled = ($has -and $ix -lt $ids.Count - 1)
+  $q.QClear.Enabled = ($ok -and $ids.Count -gt 0)
+}
+
+# Up next and Messages get a share of the room left by the fixed rows, but at least a few lines each; the preview
+# takes the rest, so on a small screen it is the one that shrinks.
+function Update-PanelRows {
+  $q = $script:Panel
+  if ($null -eq $q -or $q.InRows -or $null -eq $q.Root) { return }
+  $q.InRows = $true
+  try {
+    $root = $q.Root
+    $hs = $root.GetRowHeights()
+    $fixed = 0
+    for ($i = 0; $i -lt $hs.Length; $i++) { if ($i -ne $q.RowPreview -and $i -ne $q.RowList -and $i -ne $q.RowLog) { $fixed += $hs[$i] } }
+    $avail = $root.ClientSize.Height - $root.Padding.Vertical - $fixed
+    $list = [single][Math]::Max($q.ListMin, [int]($avail * 0.24))
+    $log = [single][Math]::Max($q.LogMin, [int]($avail * 0.26))
+    $changed = $false
+    if ($root.RowStyles[$q.RowList].Height -ne $list) { $root.RowStyles[$q.RowList].Height = $list; $changed = $true }
+    if ($root.RowStyles[$q.RowLog].Height -ne $log) { $root.RowStyles[$q.RowLog].Height = $log; $changed = $true }
+  } finally { $q.InRows = $false }
+}
+
+# The warnings banner: the latest yellow / red message line, for about 15 s.
+function Show-PanelBanner([string]$text, [string]$color) {
+  $q = $script:Panel
+  $line = ''
+  foreach ($l in ($text -split "`r?`n")) { if ($l.Trim()) { $line = $l.Trim(); break } }
+  if (-not $line) { return }
+  $bn = $q.Banner
+  if ($color -like '*Red') { $bn.BackColor = (New-PanelColor 84 34 34); $bn.ForeColor = (New-PanelColor 250 150 150) }
+  else { $bn.BackColor = (New-PanelColor 74 62 22); $bn.ForeColor = (New-PanelColor 240 214 120) }
+  $bn.Text = $line
+  $q.Tips.SetToolTip($bn, $text.Trim() + "`r`n" + (T 'Click to hide.'))
+  $q.BannerUntil = [DateTime]::UtcNow.AddSeconds(15)
+  if (-not $bn.Visible) { $bn.Visible = $true; Update-PanelRows }
+}
+
+function Hide-PanelBanner {
+  $q = $script:Panel
+  $q.BannerUntil = [DateTime]::MinValue
+  if ($q.Banner.Visible) { $q.Banner.Visible = $false; Update-PanelRows }
+}
+
+function Update-PanelBanner {
+  $q = $script:Panel
+  if ($q.Banner.Visible -and [DateTime]::UtcNow -ge $q.BannerUntil) { Hide-PanelBanner }
+}
+
+# Where the window is (for the next window of this run, e.g. after a language change).
+function Save-PanelBounds {
+  $q = $script:Panel
+  $f = $q.Form
+  $b = $f.Bounds
+  if ($f.WindowState -ne [System.Windows.Forms.FormWindowState]::Normal) { $b = $f.RestoreBounds }
+  $script:PanelSync.Bounds = @{ X = $b.X; Y = $b.Y; W = $b.Width; H = $b.Height; Top = [bool]$q.OnTop.Checked }
 }
 
 # ------------------------------------------------------------------ pieces the update uses
@@ -758,6 +1180,9 @@ function Open-ControlPanel {
     # The message pane: the queue outlives the window; a new window starts from the ring of recent lines.
     $backlog = $null
     $logPath = ''
+    # (The file dialog's filter: the same videos as the console's file picker.)
+    $exts = ''
+    try { if ($script:MediaExts) { $exts = (@($script:MediaExts) | ForEach-Object { '*' + $_ }) -join ';' } } catch {}
     try { if ($script:DataDir) { $logPath = [System.IO.Path]::Combine([string]$script:DataDir, 'log.txt') } } catch {}
     try {
       if ($null -ne $script:UiLogRing) { $backlog = $script:UiLogRing.ToArray() }
@@ -768,6 +1193,7 @@ function Open-ControlPanel {
       State = $null; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]')
       Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
       Log = $script:UiLog; Backlog = $backlog; LogPath = $logPath
+      StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts
     })
     $self = $script:PanelSelf
     if (-not $self) { $self = $script:PanelFile }
@@ -804,6 +1230,8 @@ function Close-ControlPanel {
   while (-not $run.IsCompleted -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 20 }
   if ($run.IsCompleted) { try { $ps.Dispose() } catch {} }
   else { $script:PanelRs = $null }   # its thread doesn't answer: it ends with the tool, and a new window gets a new one
+  # (Where it was: the next window of this run opens there.)
+  try { if ($sync -and $sync.Bounds) { $script:PanelBounds = $sync.Bounds } } catch {}
 }
 
 # $s: what the window shows (see Update-PanelView). The window's thread picks it up; this never waits.
@@ -831,7 +1259,8 @@ function Start-PanelUi($sync) {
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 100
     $timer.Add_Tick({ Invoke-PanelTick })
-    $q.Form.Add_Shown({ try { $script:PanelSync.Ready = $true } catch {} })
+    $q.Timer = $timer
+    $q.Form.Add_Shown({ try { $script:PanelSync.Ready = $true; Update-PanelRows; Set-PanelCue } catch {} })
     $timer.Start()
     [System.Windows.Forms.Application]::Run($q.Form)
   } finally {
@@ -857,6 +1286,7 @@ function Invoke-PanelTick {
   try { Update-PanelView $sync.State } catch { Write-PanelWarning $_ }
   if ($q.Closed) { return }
   try { Update-PanelLog $sync } catch { Write-PanelWarning $_ }
+  try { Update-PanelBanner } catch { Write-PanelWarning $_ }
 }
 
 # New message lines for the pane (at most 300 per tick). Past 1500 lines it drops the oldest down to 1200 (at once, not
@@ -869,12 +1299,18 @@ function Update-PanelLog($sync) {
   $bl = $sync.Backlog
   if ($bl) { $sync.Backlog = $null; foreach ($e in $bl) { $new.Add($e) } }
   $src = $sync.Log
+  # (The warnings banner: the newest yellow / red line that came in now, not one from the backlog of an earlier window.)
+  $warn = $null
   if ($null -ne $src) {
     $e = $null
     $n = 0
-    while ($n -lt 300 -and $src.TryDequeue([ref]$e)) { $new.Add($e); $n++ }
+    while ($n -lt 300 -and $src.TryDequeue([ref]$e)) {
+      $new.Add($e); $n++
+      try { if ([string]$e[1] -match '^(Dark)?(Yellow|Red)$' -and ([string]$e[0]).Trim()) { $warn = $e } } catch {}
+    }
   }
   if ($new.Count -eq 0) { return }
+  if ($warn) { try { Show-PanelBanner ([string]$warn[0]) ([string]$warn[1]) } catch { Write-PanelWarning $_ } }
   $rows = [Math]::Max(1, [int][Math]::Floor($lg.ClientSize.Height / [Math]::Max(1, $lg.ItemHeight)))
   $atEnd = ($lg.Items.Count -eq 0) -or (($lg.TopIndex + $rows) -ge ($lg.Items.Count - 1))
   $flags = [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
@@ -928,16 +1364,19 @@ function Remove-PanelResources {
   if ($null -eq $q) { return }
   try { Remove-PanelImage } catch {}
   try { if ($q.Form -and -not $q.Form.IsDisposed) { $q.Form.Dispose() } } catch {}
-  foreach ($x in @($q.Tips, $q.Font, $q.Bold, $q.Small, $q.Sym, $q.BigFont)) { try { if ($x) { $x.Dispose() } } catch {} }
+  foreach ($x in @($q.Tips, $q.Font, $q.Bold, $q.Small, $q.Sym, $q.BigFont, $q.Mono)) { try { if ($x) { $x.Dispose() } } catch {} }
   try { foreach ($x in $q.Brushes.Values) { $x.Dispose() } } catch {}
   $script:Panel = $null
 }
 
 # $s (from the main thread, $null before the first update): Mode ('content'|'paused'|'hold'|'waiting'|'reconnect'|
-# 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]), Link, Clock (bool), CanSeek (bool),
-# Prompt (bool: start questions in the tool's window, Next / Stop / Resync / Settings off).
+# 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]) and UpcomingIds (int[], the
+# queue items' Ids, same order), Link, QuestLink ('' = none), Clock (bool), CanSeek (bool), Quality / QualityLow /
+# QualityTip (the link bar's chip), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu),
+# Prompt (bool: start questions in the tool's window, Next / Stop / Resync / Settings / the input row off).
 function Update-PanelView($s) {
   try {
+    $hasState = ($null -ne $s)
     if ($null -eq $s) { $s = @{} }
     $q = $script:Panel
     $now = [DateTime]::UtcNow
@@ -974,8 +1413,30 @@ function Update-PanelView($s) {
     $q.Link = $link
     Set-PanelProp 'copy' $q.Copy 'Enabled' ([bool]$link)
     Set-PanelProp 'viewer' $q.Viewer 'Enabled' ([bool]$link)
+    Set-PanelProp 'linkbox' $q.LinkBox 'Text' $link
     if ($script:PanelLast['link'] -cne $link) { $script:PanelLast['link'] = $link; $q.Tips.SetToolTip($q.Copy, $link) }
-    if ($q.CopiedUntil -ne [DateTime]::MinValue -and $now -ge $q.CopiedUntil) { $q.CopiedUntil = [DateTime]::MinValue; $q.Copy.Text = $q.CopyText }
+    # [Quest link]: only when the host has one (its column is 0 wide otherwise).
+    $quest = [string]$s['QuestLink']
+    $q.QuestLink = $quest
+    if ($script:PanelLast['quest'] -cne $quest) {
+      $script:PanelLast['quest'] = $quest
+      $w = 0
+      if ($quest) { $w = $q.QuestW; $q.Tips.SetToolTip($q.Quest, (T 'Copies the link for Quest / Android viewers: {0}' $quest)) }
+      $q.Quest.Visible = [bool]$quest
+      $q.LinkBar.ColumnStyles[3].Width = [single]$w
+    }
+    if ($q.CopiedUntil -ne [DateTime]::MinValue -and $now -ge $q.CopiedUntil) { Reset-PanelCopied }
+    # The input row: off while the start questions wait in the console (the window's answers come later).
+    $inputOn = ($hasState -and -not [bool]$s['Prompt'])
+    $q.InputOn = $inputOn
+    foreach ($ctl in @($q.Input, $q.AddLine, $q.Files, $q.Folder)) { Set-PanelProp ('in' + $ctl.GetHashCode()) $ctl 'Enabled' $inputOn }
+    if ($script:PanelLast['inputtip'] -ne $inputOn) {
+      $script:PanelLast['inputtip'] = $inputOn
+      $t = ''
+      if (-not $inputOn) { $t = T 'Answer in the console window for now.' }
+      $q.Tips.SetToolTip($q.InputRow, $t)
+    }
+    if (-not $q.CueSet -and $q.CueTries -lt 50) { $q.CueTries++; Set-PanelCue }
 
     $st = [string]$s['Status']
     if ($script:PanelLast['status'] -cne $st) { $q.Tips.SetToolTip($q.Status, $st) }
@@ -987,19 +1448,34 @@ function Update-PanelView($s) {
     $qc = $q.Colors.Dim
     if ([bool]$s['QualityLow']) { $qc = (New-PanelColor 235 150 50) }
     Set-PanelProp 'qualitycol' $q.Quality 'ForeColor' $qc
-    if ($script:PanelLast['qtip'] -cne [string]$s['QualityTip']) { $script:PanelLast['qtip'] = [string]$s['QualityTip']; $q.Tips.SetToolTip($q.Quality, [string]$s['QualityTip']) }
-    Set-PanelProp 'more' $q.More 'Enabled' ($cmdOn -and $mode -eq 'waiting')
+    $qtipKey = [string]$s['QualityTip'] + "`n" + [string]$s['Quality']
+    if ($script:PanelLast['qtip'] -cne $qtipKey) {
+      $script:PanelLast['qtip'] = $qtipKey
+      $tip = [string]$s['QualityTip']
+      if ($s['Quality']) { $tip = [string]$s['Quality'] + "`r`n" + $tip }
+      $q.Tips.SetToolTip($q.Quality, $tip.Trim())
+    }
+    # (Settings: its stream items work only while nothing plays, see Update-PanelMenu; log.txt and End stream always.)
+    Set-PanelProp 'more' $q.More 'Enabled' $cmdOn
+    $q.CmdOn = $cmdOn
 
     $up = @()
     if ($null -ne $s['Upcoming']) { $up = @(foreach ($u in @($s['Upcoming'])) { [string]$u }) }
-    $upKey = $up -join "`n"
+    $ids = @()
+    if ($null -ne $s['UpcomingIds']) { $ids = @(foreach ($u in @($s['UpcomingIds'])) { [int]$u }) }
+    if ($ids.Count -ne $up.Count) { $ids = @() }
+    $upKey = ($up -join "`n") + "`n" + ($ids -join ',')
     if (-not $script:PanelLast.ContainsKey('up') -or $script:PanelLast['up'] -cne $upKey) {
       $script:PanelLast['up'] = $upKey
+      # (The same line stays selected when the list changes around it: by its Id.)
+      $selId = Get-PanelListId
+      $q.ListIds = $ids
       $q.List.BeginUpdate()
       $q.List.Items.Clear()
       if ($up.Count -eq 0) { [void]$q.List.Items.Add((T 'Nothing queued yet')) }
       $n = 1
       foreach ($u in $up) { [void]$q.List.Items.Add(('{0}. {1}' -f $n, $u)); $n++ }
+      if ($selId -gt 0) { $ix = [array]::IndexOf([int[]]$ids, $selId); if ($ix -ge 0) { $q.List.SelectedIndex = $ix } }
       $q.List.EndUpdate()
     }
 

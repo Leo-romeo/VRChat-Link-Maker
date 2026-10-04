@@ -166,27 +166,47 @@ WHILE IT'S STREAMING
 THE CONTROL WINDOW
 ------------------
 A small window opens by itself next to the console (F2 opens it again).
-It has a live preview of what's being streamed, a seek bar, and buttons:
+At the top:
+
+  Link for VRChat  the link to put in the world's video player, with Copy and
+                   Quest link (copies the link for Quest / Android viewers,
+                   when the server has one). On the right: what the stream
+                   carries (server, picture size, frames per second, video
+                   bitrate). Orange means too little bitrate for that picture
+                   size: a smaller size looks sharper.
+  The input box    type a title, paste a link or a file path and press Enter
+                   (or Add): it works like typing it into the console. Files...
+                   and Folder... pick videos. You can also drop files, a folder
+                   or a link anywhere on the window, or press Ctrl+V. While the
+                   console asks its first questions the box is off: answer in
+                   the console for now.
+  A yellow or red strip shows the latest warning for about 15 seconds (click it
+  to hide it; every message stays in Messages below).
+
+Below that: a live preview of what's being streamed, a seek bar, and buttons:
 
   << 30s  << 10s  Pause / Continue / Start now  10s >>  30s >>  Next
   Stop (click it twice)
-  Up next          the queue
-  Add / search...  add videos or search by title
+  Up next          the queue. Right-click a video: Play now, Move up, Move
+                   down, Remove (its download stops), Clear the queue. The
+                   video that plays can't be removed: use Next or Stop.
+  Messages         everything the console says (right-click: copy, log.txt)
+  Add / search...  search by title in a second window
   Watch as viewers see it   opens the real stream in a player on your PC,
                    with the same delay viewers have
-  Copy link
   Resync everyone  same as R R
-  Settings         server, picture size, upload speed test, new link (while
-                   nothing plays; the questions appear in the console window)
+  Settings         the same list as M in the console: where to stream, picture
+                   size and language to pick from a list, the upload speed
+                   test, a new link, "ask again". They work while nothing
+                   plays. What needs typing (a VPS code, your own server's
+                   links, a DuckDNS name) is asked in the console window.
+                   Also Open log.txt and End stream.
   Clock on the stream   shows the video time in a corner of the picture, so
                    you can compare who is behind
   Always on top
-On the right under the buttons it shows what the stream carries (picture size,
-frames per second, video bitrate, server). Orange means too little bitrate for
-that picture size: a smaller size looks sharper.
 
-Space and the arrow keys work in it too. Don't want it?
-Set "ControlWindow": false in config.json.
+Space and the arrow keys work in it too (not while you type in a box). Don't
+want it? Set "ControlWindow": false in config.json.
 
 
 CONTROL IT FROM THE WORLD'S VIDEO PLAYER
