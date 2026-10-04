@@ -827,5 +827,6 @@
   "Available while nothing plays (press Stop first).": "Доступно, когда ничего не играет (сначала нажмите «Стоп»).",
   "End stream...": "Завершить трансляцию...",
   "End the stream now? Viewers lose the picture.": "Завершить трансляцию сейчас? Зрители потеряют картинку.",
-  "Click to hide.": "Щёлкните, чтобы скрыть."
+  "Click to hide.": "Щёлкните, чтобы скрыть.",
+  "  Only the first title is searched for ({0}); {1} more skipped.": "  Ищу только первое название ({0}), остальные пропущены: {1}."
 }

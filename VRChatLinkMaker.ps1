@@ -4273,11 +4273,16 @@ function Receive-Commands([string]$kind) {
         'viewer' { Open-ViewerPreview }
         'clock' { Switch-Clock }
         # The window's input box: each line as if typed here and Enter pressed; files / a folder as if dropped here.
-        # (Several lines - a drop, a paste - are links / paths each; with a title among them only the first line counts:
-        # one search, one second window.)
+        # (Several lines - a drop, a paste - are links / paths each; of the titles among them only the first one counts,
+        # after the links: one search, one second window.)
         'line' {
           $lns = @(@(([string]$p.Arg) -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-          if ($lns.Count -gt 1 -and @($lns | Where-Object { Test-IsTitle $_ }).Count -gt 0) { $lns = @($lns[0]) }
+          if ($lns.Count -gt 1) {
+            $rest = @(); $titles = @()
+            foreach ($ln in $lns) { if (Test-IsTitle $ln) { $titles += $ln } else { $rest += $ln } }
+            if ($titles.Count -gt 0) { $lns = @($rest + $titles[0]) }
+            if ($titles.Count -gt 1) { Say (T '  Only the first title is searched for ({0}); {1} more skipped.' $titles[0] ($titles.Count - 1)) 'Yellow' }
+          }
           foreach ($ln in $lns) { Add-TypedLine $ln $kind }
         }
         'files' {

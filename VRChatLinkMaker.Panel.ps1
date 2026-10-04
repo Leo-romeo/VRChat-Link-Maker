@@ -200,7 +200,7 @@ function New-ControlPanel {
     Drag = $false; DragPos = 0.0; HoldPos = 0.0; HoldUntil = [DateTime]::MinValue
     StopArmedUntil = [DateTime]::MinValue; CopiedUntil = [DateTime]::MinValue; CopiedBtn = $null
     PrevCheck = [DateTime]::MinValue; PrevTime = [DateTime]::MinValue; PrevMissing = [DateTime]::MinValue
-    InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; CueSet = $false; CueTries = 0; InRows = $false; Timer = $null
+    InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; CueSet = $false; CueTries = 0; InputParked = $false; InRows = $false; Timer = $null
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -1437,7 +1437,21 @@ function Update-PanelView($s) {
     # answers come later): a line typed here meanwhile would only run after the question, as a new line.
     $inputOn = ($hasState -and -not [bool]$s['Prompt'] -and -not [bool]$s['Asking'])
     $q.InputOn = $inputOn
+    # (The focus first leaves the row for the read-only link box, which owns no transport keys: disabling a focused
+    # control would hand the focus to the next one, the Next button, and a later Enter / Space would skip / pause.
+    # It comes back to the input box with the row, unless the user moved it meanwhile.)
+    if (-not $inputOn) {
+      $fc = $null
+      try { $fc = Get-PanelFocus } catch {}
+      if ($fc -and $q.InputRow.Contains($fc)) { $q.Form.ActiveControl = $q.LinkBox; $q.InputParked = $true }
+    }
     foreach ($ctl in @($q.Input, $q.AddLine, $q.Files, $q.Folder)) { Set-PanelProp ('in' + $ctl.GetHashCode()) $ctl 'Enabled' $inputOn }
+    if ($inputOn -and $q.InputParked) {
+      $q.InputParked = $false
+      $fc = $null
+      try { $fc = Get-PanelFocus } catch {}
+      if ($fc -eq $q.LinkBox) { $q.Form.ActiveControl = $q.Input }
+    }
     if ($script:PanelLast['inputtip'] -ne $inputOn) {
       $script:PanelLast['inputtip'] = $inputOn
       $t = ''
