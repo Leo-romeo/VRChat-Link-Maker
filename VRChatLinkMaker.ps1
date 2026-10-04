@@ -1723,6 +1723,7 @@ function Clear-AskedPrefs {
   $script:TrackPref = $null
   $script:DubChoice = $null
   $script:DubPref = $null
+  $script:PinnedRefused = @{}
   Say (T '  OK: the next videos ask again which player, audio and subtitles.') 'Green'
 }
 
@@ -2538,7 +2539,7 @@ $script:RqbitUrl = 'https://github.com/ikatson/rqbit/releases/download/v9.0.1/rq
 $script:RqbitBytes = 12706816
 $script:RqbitSha256 = '2ed683203beca628e0c45f62f99feeef4242cecc3444c8422dfe5b1b6aa38cea'
 $script:PinnedChecked = @{}     # tool -> exe path whose checksum was checked this run
-$script:PinnedRefused = @{}     # tool -> $true: the person said no this run (not asked again)
+$script:PinnedRefused = @{}     # tool -> the flow (or $true outside one) where the person said no (see Test-PinnedRefused)
 $script:PinnedNoted = $false
 $script:Rqbit = $null           # the running engine: Proc, Port, Auth, Dir, DlDir, Lock, Ready, Started, Torrents (id -> group)
 $script:RqbitStarts = 0
@@ -2656,6 +2657,17 @@ function Save-WebFile([string]$url, [string]$dest, [string]$progress) {
   Clear-StatusLine
 }
 
+# Did the person say no to downloading $Name? A no holds for the flow it was given in (a Back re-run, or a second
+# torrent on the same line, doesn't ask again) and for asks outside a flow (background preparation); a torrent
+# submitted again (a new flow: '>' again, the second window, the waiting screen) asks again.
+function Test-PinnedRefused([string]$Name) {
+  $r = $script:PinnedRefused[$Name]
+  if ($null -eq $r) { return $false }
+  $root = Get-NavRoot
+  if (-not $root) { return $true }
+  return [object]::ReferenceEquals($r, $root)
+}
+
 # Path of a small helper program this tool downloads on demand (only 'rqbit' so far), or $null. It is downloaded only
 # after asking ($CanAsk), and only the pinned release whose size and SHA-256 match.
 function Get-PinnedTool([string]$Name, [bool]$CanAsk) {
@@ -2669,11 +2681,13 @@ function Get-PinnedTool([string]$Name, [bool]$CanAsk) {
     if ($ok) { $script:PinnedChecked[$Name] = $exe; return $exe }
     Say (T 'rqbit is missing or changed - your antivirus may have removed it.') 'Yellow'
   }
-  if (-not $CanAsk -or $script:PinnedRefused[$Name]) {
+  $refused = ($CanAsk -and (Test-PinnedRefused $Name))
+  if (-not $CanAsk -or $refused) {
     if (-not $CanAsk -and -not $script:PinnedNoted) {
       $script:PinnedNoted = $true
       Say (T 'Torrent links need rqbit - press + to set it up (a second window can ask).') 'Yellow'
     }
+    if ($refused) { Say (T '  (You said no to rqbit: type the torrent link again to be asked again.)') 'DarkGray' }
     return $null
   }
   Say ''
@@ -2681,7 +2695,14 @@ function Get-PinnedTool([string]$Name, [bool]$CanAsk) {
   Say (T 'While an episode downloads it also uploads to other people, capped at {0} KB/s, and it stops uploading when the episode is complete. Only download what you are allowed to.' (Get-TorrentUploadKBps)) 'Gray'
   Say (T 'Windows may ask whether rqbit may use the network: Cancel is fine, it works either way.') 'Gray'
   # (Like MediaMTX's: a one-off question Esc = no; inside a flow Esc goes back as at any of its questions.)
-  if (-not (Read-YesNoUi (T 'Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]' $script:RqbitVersion) $true -Key 'rqbit' -Esc $false)) { $script:PinnedRefused[$Name] = $true; return $null }
+  $yes = Read-YesNoUi (T 'Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]' $script:RqbitVersion) $true -Key 'rqbit' -Esc $false
+  # (Answered, it can't come again in this flow - rqbit is there, or the no holds - so a Back skips it.)
+  Remove-NavTapeStep 'rqbit'
+  if (-not $yes) {
+    $root = Get-NavRoot
+    if ($root) { $script:PinnedRefused[$Name] = $root } else { $script:PinnedRefused[$Name] = $true }
+    return $null
+  }
   $tmp = PathJoin $script:TempRoot 'rqbit-download.exe'
   try {
     if (-not [System.IO.Directory]::Exists($script:TempRoot)) { [void][System.IO.Directory]::CreateDirectory($script:TempRoot) }
@@ -4883,6 +4904,19 @@ function Add-NavTape($f, $a, $res) {
   if ($a.Kind -eq 'text' -and $n -gt 0 -and $f.Tape[$n - 1].Kind -eq 'text' -and $f.Tape[$n - 1].Key -ceq $e.Key) { $f.Tape[$n - 1] = $e }
   else { [void]$f.Tape.Add($e) }
   $f.Pos = $f.Tape.Count
+}
+
+# A question that can't come again once answered (e.g. downloading rqbit): its answer, the last one on the open flow's
+# tape, leaves it, so a Back skips it instead of stopping the replay there. (Not Lock-NavStep: the questions after it
+# can still go back.)
+function Remove-NavTapeStep([string]$Key) {
+  $f = $script:Nav
+  if (-not $f -or $f.Sealed) { return }
+  $n = $f.Tape.Count
+  if ($n -gt 0 -and ([string]$f.Tape[$n - 1].Key).StartsWith($Key + '|', [System.StringComparison]::Ordinal)) {
+    $f.Tape.RemoveAt($n - 1)
+    $f.Pos = $f.Tape.Count
+  }
 }
 
 # The one place that asks. Returns the answer (choice: 0-based index or -1; episodes: the list items; yesno: bool;

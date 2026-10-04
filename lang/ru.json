@@ -810,6 +810,7 @@
   "rqbit could not be downloaded: {0}": "Не удалось скачать rqbit: {0}",
   "rqbit isn't running": "rqbit не запущен",
   "torrents need rqbit, which isn't set up": "для торрентов нужен rqbit, а он не установлен",
+  "  (You said no to rqbit: type the torrent link again to be asked again.)": "  (Вы отказались от rqbit: введите ссылку на торрент ещё раз, чтобы вопрос появился снова.)",
   "rqbit stopped ({0})": "rqbit остановился ({0})",
   "rqbit didn't start": "rqbit не запустился",
   "rqbit started without a password - not used": "rqbit запустился без пароля - не используется",
