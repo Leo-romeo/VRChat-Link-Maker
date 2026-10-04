@@ -50,6 +50,8 @@
                                                  AniLibria: до 1080p)
   AnimeVost   https://animevost.org/tip/tv/...  (своя озвучка: 720p, где
                                                  он есть, иначе 480p)
+  YummyAnime  https://ru.yummyani.me/catalog/item/...   (все озвучки,
+                                                 у каждой несколько плееров)
   AnimeGO     https://animego.me/anime/...      (страница сериала или фильма)
   AnimeLib    https://anilib.me/ru/anime/...    (ссылки animelib.org тоже подходят)
   WPARTY      https://wparty.net/s/...          (комната: играет то же, что в ней)
@@ -100,9 +102,10 @@
 введите вместо ссылки название (по-русски или по-английски) и нажмите Enter.
 
 - Результаты берутся из поиска WPARTY (фильмы, сериалы и аниме, с
-  Kinopoisk), Shikimori (аниме) и AnimeLib, затем из каталогов AniLiberty,
-  AnimeVost и Dream Cast (у каждого только своя озвучка). Если основной
-  адрес AniLiberty или AnimeVost не отвечает, пробуются их другие адреса.
+  Kinopoisk), YummyAnime, Shikimori (аниме) и AnimeLib, затем из каталогов
+  AniLiberty, AnimeVost и Dream Cast (у каждого только своя озвучка). Если
+  основной адрес AniLiberty или AnimeVost не отвечает, пробуются их другие
+  адреса.
 - Выберите нужное, затем сезон / часть, озвучку (Enter = приоритетная) и
   серии.
 - Видео играет через Kodik, сайт Dream Cast, сайт AniLiberty (запасной —
@@ -515,6 +518,9 @@ config.json. Экраны, которые видят зрители («Пауз�
               начале списка, а первую берёт просто Enter.
               По умолчанию ["Dream Cast", "AniLibria", "official"]
               ("official" = любой официальный дубляж). [] = без приоритета.
+  YummyAppToken  пусто (по умолчанию). Сейчас YummyAnime работает без него;
+              если сайт начнёт требовать токен приложения, создайте его на
+              сайте (yummyani.me/dev/applications) и впишите сюда.
 Удалите config.json, чтобы получить совершенно новую ссылку.
 
 

@@ -184,6 +184,8 @@ function Open-Log {
 
 function Write-LogLine([string]$text) {
   if (-not $script:LogWriter) { return }
+  # Player links carry access tokens (Alloha's token= / token_movie=): not in the log file.
+  if ($text.IndexOf('token', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $text = [regex]::Replace($text, '(?i)([?&](?:token|token_movie)=)[^&#\s''"]+', '$1***') }
   try { $script:LogWriter.WriteLine((Get-Date).ToString('HH:mm:ss', $script:Inv) + '  ' + $text) } catch {}
 }
 
@@ -1966,6 +1968,7 @@ function Get-ShowKey($item) {
     'animego' { return "ag:$($s.AnimeId):$($s.DubName)" }
     'animelib' { return "al:$($s.Sid):$(@($s.Names)[0]):$($s.DubName)" }
     'shikimori' { return "sh:$($s.Sid):$($s.DubName)" }
+    'yummy' { return "ym:$($s.Id):$($s.Dub)" }
     # A release with its own player and a backup (AniLiberty: its HLS + Kodik): one show per release.
     'player' { if (@($s.Cands | Where-Object { -not $_.PSObject.Properties['Backup'] }).Count -gt 1) { return "pl:$($item.Source -replace '#.*$', ''):$(@($s.Cands)[0].Dub)" } }
   }
