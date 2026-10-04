@@ -5440,9 +5440,21 @@ function Remove-QueueItemAt([int]$i) {
     Remove-TorrentItemRef $it
     # (Other episodes of that torrent still queued: rqbit stops downloading (and uploading) it until the next one's
     # turn sets its files again, as when an episode completes. Not while seeding: "Torrents": "seed".)
-    $busy = @($script:Queue | Where-Object { $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' }).Count -gt 0
+    # (Others of it still downloading: rqbit gets just their files, so the removed one's stops - Step-TorrentPrep sets
+    # them only when an episode starts.)
+    $dls = @($script:Queue | Where-Object { $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' })
+    $busy = $dls.Count -gt 0
     if ($wasDl -and $g.Id -and -not $g.Paused -and -not $busy -and (Get-TorrentsSetting) -ne 'seed') {
       try { $r = Invoke-Rqbit 'POST' "/torrents/$($g.Id)/pause" $null '' 3; if ($r.Status -eq 200) { $g.Paused = $true } } catch {}
+    }
+    if ($wasDl -and $g.Id -and $g.Refs -gt 0 -and $busy) {
+      $want = @(@($dls | ForEach-Object { Get-TorrentItemFiles $_ }) | Sort-Object -Unique)
+      if ($want.Count -gt 0 -and ($want -join ',') -ne (@($g.Want | Sort-Object -Unique) -join ',')) {
+        try {
+          $r = Invoke-Rqbit 'POST' "/torrents/$($g.Id)/update_only_files" ('{"only_files":[' + ($want -join ',') + ']}') 'application/json' 3
+          if ($r.Status -eq 200) { $g.Want.Clear(); foreach ($x in $want) { $g.Want.Add([int]$x) } }
+        } catch {}
+      }
     }
   }
   $procs = @()
