@@ -2751,6 +2751,12 @@ function Get-WpartyRoom {
     [string]$Password = '',
     [int]$TimeoutSec = 10
   )
+  # While a flow asks its questions, a Back gets the room as read before (for up to 120 s: it is live data).
+  if ($script:Nav -and -not $script:Nav.Sealed -and -not $script:WpRoomMemoIn -and (Get-Command Use-NavMemo -CommandType Function -ErrorAction SilentlyContinue)) {
+    $script:WpRoomMemoIn = $true
+    try { return (Use-NavMemo ('wparty-room|' + $Url + '|' + $Password) { Get-WpartyRoom -Url $Url -Password $Password -TimeoutSec $TimeoutSec } -Seconds 120) }
+    finally { $script:WpRoomMemoIn = $false }
+  }
   $ref = ConvertFrom-WpartyUrl $Url
   if ($null -eq $ref) { throw ('WPARTY: not a WPARTY room link: ' + $Url) }
   # -TimeoutSec is the budget for the WHOLE call (vanity lookup + shard lookup + socket read), not only the socket:
@@ -4869,8 +4875,7 @@ function Get-QualityCap {
 # Asks a yes/no question (Enter = yes). Without a person to ask, the answer is yes.
 function Read-YesNo([string]$q) {
   if (-not (Test-CanAsk)) { return $true }
-  $ans = Read-Host (T '{0} [Y/n]' $q)
-  return (-not (Test-AnswerNo $ans))
+  return (Read-YesNoUi (T '{0} [Y/n]' $q) $true)
 }
 
 # ------------------------------------------------------------------ choices (asked here, or handed over by a second window)
@@ -4956,7 +4961,7 @@ function Select-SiteDub($names, [int]$defPos, [bool]$canAsk, [bool]$auto = $true
         elseif (@(Get-DubPriority | Where-Object { Test-DubRule $n $_ }).Count -gt 0) { $l = T '{0}   (preferred)' $l }
         $labels += $l
       }
-      $pick = Read-Choice (T 'Which voice-over (or subtitles)? Preferred ones are at the top ("DubPriority" in config.json).') $labels 0 $false
+      $pick = Read-Choice (T 'Which voice-over (or subtitles)? Preferred ones are at the top ("DubPriority" in config.json).') $labels 0 $false -Key 'dub' -Values @($order | ForEach-Object { [string]$names[$_] })
       $pos = $order[$pick]
       $script:DubChoice = [string]$names[$pos]
     }
@@ -4973,7 +4978,7 @@ function Select-SiteEpisodes($list, [int]$defPos, [bool]$canAsk) {
     $pick = @($list | Where-Object { $want -contains [string]$_.Number })
   }
   if ($pick.Count -eq 0) {
-    if ($canAsk -and $list.Count -gt 1) { $pick = @(Read-EpisodeSelection $list $defPos) }
+    if ($canAsk -and $list.Count -gt 1) { $pick = @(Read-EpisodeSelection $list $defPos -Key 'eps') }
     else {
       $pick = @($list[$defPos..($list.Count - 1)])
       if (-not $script:SiteChoice -and $pick.Count -gt $script:MaxUnasked) {
@@ -6042,19 +6047,20 @@ function Invoke-ContentSearch([string]$query, [switch]$AskPlayer) {
   $q = ([string]$query).Trim().Trim('"').Trim()
   if (-not $q) { return @() }
   Say (T 'Searching for "{0}"...' $q) 'Gray'
-  $rows = @(Find-SiteContent $q)
+  # (A Back to this list inside a flow shows the same rows again without searching again.)
+  $rows = @(Use-NavMemo ('search|' + $q) { Find-SiteContent $q })
   if ($rows.Count -eq 0) {
     Say (T 'Nothing found for "{0}". Try another spelling, or the title in Russian or English.' $q) 'Yellow'
     return @()
   }
   Say ''
-  $pick = Read-Choice (T 'Which one? (0 = none of these)') @($rows | ForEach-Object { Format-SearchRow $_ }) 0 $true
-  if ($pick -lt 0) { return @() }
+  $pick = Read-Choice (T 'Which one? (0 = none of these)') @($rows | ForEach-Object { Format-SearchRow $_ }) 0 $true -Key 'search' -Values @($rows | ForEach-Object { [string]$_.Link }) -NoneLabel (T '   0) None of these - back (or Esc)')
+  if ($pick -lt 0) { Exit-NavFlow; return @() }   # (in a flow: back to where the title was typed, text kept)
   $row = $rows[$pick]
   $script:LastDub = $null; $script:LastEps = $null; $script:LastPart = $null; $script:LastPlayer = $null
   $items = @()
   try { $items = @(Expand-SiteLink $row.Link) }
-  catch { Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
+  catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
   if ($items.Count -eq 0) { return @() }
   if ($AskPlayer) { Read-HandoverPlayer $items }
   if (@($items | Where-Object { $_.Kind -ne 'torrent' }).Count -eq 0) {
@@ -6088,7 +6094,7 @@ function Select-SitePart($ids, $labels, [int]$defPos, [bool]$canAsk) {
   $hit = -1
   if ($want) { for ($i = 0; $i -lt $ids.Count; $i++) { if ([string]$ids[$i] -eq $want) { $hit = $i; break } } }
   if ($hit -ge 0) { $pos = $hit }
-  elseif ($canAsk -and $ids.Count -gt 1) { $pos = Read-Choice (T 'Which season or part?') @($labels) $defPos $false }
+  elseif ($canAsk -and $ids.Count -gt 1) { $pos = Read-Choice (T 'Which season or part?') @($labels) $defPos $false -Key 'part' -Values @($ids | ForEach-Object { [string]$_ }) }
   $script:LastPart = [string]$ids[$pos]
   return $pos
 }

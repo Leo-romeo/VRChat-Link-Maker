@@ -33,6 +33,18 @@ If the file has several audio or subtitle tracks, it asks which ones you want
 fancy fonts anime releases come with. Picture-based Blu-ray subs and .srt/.ass
 files sitting next to the video work too.
 
+Answering its questions (the same keys in every question):
+- Enter takes the suggested answer, the one in "(just Enter = ...)".
+- Esc or the Left arrow goes back one question; "0) Back" in a list does too.
+  No Esc key (a VR on-screen keyboard)? In lists, episode and yes / no
+  questions, type B and press Enter.
+- The Right arrow gives your earlier answer to that question again; Home
+  cancels the whole task.
+- On the start screen, type Q and press Enter to end (Esc never ends it).
+  M + Enter opens the settings menu (where to stream, picture size, speed
+  test, new link, language). H, V, T, N and L open its parts directly, on the
+  start screen and on the waiting screen.
+
 
 ANIME SITES AND WATCH-TOGETHER ROOMS
 ------------------------------------

@@ -138,7 +138,7 @@ function Invoke-UpdateCheck {
     foreach ($l in ($lines | Select-Object -First 20)) { Say ('  ' + $l) 'Gray' }
     if ($lines.Count -gt 20) { Say ('  ... https://github.com/' + $script:UpdateRepo + '/releases') 'Gray' }
   }
-  $c = Read-Choice (T 'Update now? Your settings and your link stay as they are.') @((T 'Yes, update and restart'), (T 'Not now'), (T 'Skip this version')) 0 $false
+  $c = Read-Choice (T 'Update now? Your settings and your link stay as they are.') @((T 'Yes, update and restart'), (T 'Not now'), (T 'Skip this version')) 0 $false -Esc 1
   if ($c -eq 2) {
     if ($script:Cfg.PSObject.Properties['SkipVersion']) { $script:Cfg.SkipVersion = $latest.Tag }
     else { $script:Cfg | Add-Member -NotePropertyName 'SkipVersion' -NotePropertyValue $latest.Tag }

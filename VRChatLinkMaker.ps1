@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.4.4'
+$script:Version = '1.5'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -152,6 +152,8 @@ function Clear-StatusLine {
 }
 
 function Say([string]$text, [string]$color = '') {
+  # (While a flow re-runs its earlier answers after a Back, what it said before is only written to log.txt.)
+  if ($script:Nav -and $script:Nav.Replaying) { Write-LogLine $text; return }
   Clear-StatusLine
   if ($color) { Write-Host $text -ForegroundColor $color } else { Write-Host $text }
   Write-LogLine $text
@@ -192,6 +194,21 @@ function Write-LogLine([string]$text) {
 # Is the window scrolled up (someone reading what it said earlier)? Writing there would jump it back down.
 function Test-ScrolledUp {
   try { return ([Console]::CursorTop -ge [Console]::WindowTop + [Console]::WindowHeight) } catch { return $false }
+}
+
+# A status line that ends in keys ("...   Q Q = end" + $more = "   M = menu"): when it is wider than the window, the
+# text before the keys is cut ("...") instead of the keys (Show-Status cuts at the right edge). Console only: the
+# control window gets the whole text.
+function Join-StatusKeys([string]$s, [string]$more) {
+  $w = Get-ConsoleWidth
+  if ($s.Length -le $w -or -not $more -or -not $s.EndsWith($more)) { return $s }
+  $main = $s.Substring(0, $s.Length - $more.Length)
+  $cut = $main.LastIndexOf('   ')
+  if ($cut -le 0) { return $s }
+  $tail = $main.Substring($cut) + $more
+  $room = $w - $tail.Length - 3
+  if ($room -lt 20) { return $s }
+  return ($main.Substring(0, $room).TrimEnd() + '...' + $tail)
 }
 
 function Show-Status([string]$text) {
@@ -337,8 +354,9 @@ function Select-Language {
   Say ''
   # Asked in every language at once (the current one first), so it can be read whatever the window speaks now.
   $asks = @(@($langs[$cur].Ask) + @($langs | ForEach-Object { $_.Ask }) | Select-Object -Unique)
-  $pos = Read-Choice ($asks -join ' / ') @($langs | ForEach-Object { $_.Name }) $cur $false
+  $pos = Read-Choice ($asks -join ' / ') @($langs | ForEach-Object { $_.Name }) $cur $false -Key 'lang' -Values @($langs | ForEach-Object { $_.Code }) -Esc $cur
   $code = $langs[$pos].Code
+  Lock-NavStep
   Initialize-Language $code
   Save-LanguageSetting $code
   if ($script:SlateDir) { Initialize-Slate }   # the "Paused" / "Next video" screens viewers see
@@ -622,9 +640,9 @@ function Initialize-Tools {
   if ((-not $script:FFmpeg -or -not $script:FFprobe) -and $script:IsWin) {
     Say (T 'This tool needs ffmpeg (a free video toolkit) and it is not installed yet.') 'Yellow'
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-      $ans = 'y'
-      if ($script:Interactive) { $ans = Read-Host (T 'Install it now? [Y/n]') }
-      if (-not (Test-AnswerNo $ans)) {
+      $yes = $true
+      if ($script:Interactive) { $yes = Read-YesNoUi (T 'Install it now? [Y/n]') $true -Esc $false }
+      if ($yes) {
         [void](Invoke-Winget 'Gyan.FFmpeg')
         $script:FFmpeg = Find-Exe 'ffmpeg'
         $script:FFprobe = Find-Exe 'ffprobe'
@@ -659,8 +677,7 @@ function Get-YtDlp {
   if ($canAsk -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     $script:YtDlpAsked = $true
     Say (T 'Links to web pages need yt-dlp (a free video downloader) and it is not installed yet.') 'Yellow'
-    $ans = Read-Host (T 'Install it now? [Y/n]')
-    if (-not (Test-AnswerNo $ans)) {
+    if (Read-YesNoUi (T 'Install it now? [Y/n]') $true -Esc $false) {
       [void](Invoke-Winget 'yt-dlp.yt-dlp')
       $script:YtDlp = Find-Exe 'yt-dlp'
     }
@@ -1307,22 +1324,45 @@ function Find-TrackMatch($tracks, [string]$lang, [string]$title, [bool]$signs, [
   return -2
 }
 
-function Read-Choice([string]$title, [string[]]$options, [int]$default, [bool]$allowNone) {
-  Say $title 'Cyan'
-  if ($allowNone) { Say (T '   0) None') }
-  for ($i = 0; $i -lt $options.Count; $i++) { Say ('   {0}) {1}' -f ($i + 1), $options[$i]) }
-  $defLabel = '0'
-  if ($default -ge 0) { $defLabel = "$($default + 1)" }
-  while ($true) {
-    $ans = Read-Host (T 'Type a number and press Enter (just Enter = {0})' $defLabel)
-    if (-not $ans -or -not $ans.Trim()) { return $default }
-    $n = 0
-    if ([int]::TryParse($ans.Trim(), [ref]$n)) {
-      if ($allowNone -and $n -eq 0) { return -1 }
-      if ($n -ge 1 -and $n -le $options.Count) { return ($n - 1) }
-    }
-    Say (T '   Please type one of the numbers above.') 'Yellow'
+# A numbered list -> the 0-based index, or -1 ("0) None" with $allowNone, or a -1 default). Asked through Invoke-Ask:
+# inside a flow it gets a "0) Back / Cancel (or Esc)" line (when 0 isn't "None") and marks your earlier answer.
+# -Key: the step's name; -Values: what each option stands for (kept instead of the position, so a re-run finds the
+# same pick in a changed list); -Esc: the index Esc gives on a one-off question (marked "<- Esc"); -NoneLabel: the
+# whole "0) ..." line instead of "0) None".
+function Read-Choice {
+  [CmdletBinding(PositionalBinding = $false)]
+  param([Parameter(Position = 0)][string]$title, [Parameter(Position = 1)][string[]]$options, [Parameter(Position = 2)][int]$default,
+    [Parameter(Position = 3)][bool]$allowNone, [string]$Key = '', [object[]]$Values = $null, [object]$Esc = $null, [string]$NoneLabel = '',
+    [switch]$EnterDefault)
+  $a = New-NavAsk 'choice' $title $Key
+  $a.EnterDefault = [bool]$EnterDefault   # (just Enter = $default even when it was answered before: Right arrow = that)
+  $a.Options = @($options)
+  $a.Default = $default
+  $a.AllowNone = $allowNone
+  if ($null -ne $Values) {
+    # (The same value twice, e.g. two voice-overs with one name: the later ones get a count, so each stays itself.)
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+    $Values = @(foreach ($v in @($Values)) {
+        $k = [string]$v
+        if ($seen.ContainsKey($k)) { $seen[$k]++; $k + [string][char]31 + $seen[$k] } else { $seen[$k] = 1; $k }
+      })
   }
+  $a.Values = $Values
+  $a.NoneLabel = $NoneLabel
+  if ($PSBoundParameters.ContainsKey('Esc')) { $a.HasEsc = $true; $a.EscValue = [int]$Esc }
+  return (Invoke-Ask $a)
+}
+
+# A yes / no question -> $true / $false. $defaultYes: "[Y/n]" (anything but a no is yes, Test-AnswerNo) or "[y/N]"
+# (only a yes is yes, Test-AnswerYes). -Esc: what Esc gives on a one-off question (shown as "(Esc = no)").
+function Read-YesNoUi {
+  [CmdletBinding(PositionalBinding = $false)]
+  param([Parameter(Position = 0)][string]$prompt, [Parameter(Position = 1)][bool]$defaultYes = $true, [string]$Key = '', [object]$Esc = $null)
+  $a = New-NavAsk 'yesno' '' $Key
+  $a.Prompt = $prompt
+  $a.DefaultYes = $defaultYes
+  if ($PSBoundParameters.ContainsKey('Esc')) { $a.HasEsc = $true; $a.EscValue = [bool]$Esc }
+  return [bool](Invoke-Ask $a)
 }
 
 function Select-Tracks($item) {
@@ -1344,18 +1384,27 @@ function Select-Tracks($item) {
   if ($canAsk -and ($audio.Count -gt 1 -or $subs.Count -gt 0)) {
     Say ''
     Say (T 'Setting up: {0}' $item.Name) 'White'
-    if ($audio.Count -gt 1) {
-      $labels = @($audio | ForEach-Object { Get-TrackLabel $_ })
-      $aPos = Read-Choice (T 'Which audio track?') $labels $aPos $false
+    # (Preparation has started: no Back goes past the queue insert. The two questions are a flow of their own that
+    # can't be left: Back at subtitles returns to the audio track; Esc at the audio track does nothing.)
+    Lock-NavStep
+    $tr = Invoke-NavFlow -Name 'tracks' -Own -Body {
+      $ap = $aPos
+      if ($audio.Count -gt 1) {
+        $labels = @($audio | ForEach-Object { Get-TrackLabel $_ })
+        $ap = Read-Choice (T 'Which audio track?') $labels $aPos $false -Key 'audio'
+      }
+      $at = $null
+      if ($ap -ge 0) { $at = $audio[$ap] }
+      $sp = Get-DefaultSubPos $subs $at
+      if ($sp -lt 0) { $sp = $sitePos }
+      if ($subs.Count -gt 0) {
+        $labels = @($subs | ForEach-Object { Get-TrackLabel $_ })
+        $sp = Read-Choice (T 'Which subtitles? (they get drawn into the picture)') $labels $sp $true -Key 'subs'
+      }
+      @{ A = $ap; S = $sp }
     }
-    $aTrack = $null
-    if ($aPos -ge 0) { $aTrack = $audio[$aPos] }
-    $sPos = Get-DefaultSubPos $subs $aTrack
-    if ($sPos -lt 0) { $sPos = $sitePos }
-    if ($subs.Count -gt 0) {
-      $labels = @($subs | ForEach-Object { Get-TrackLabel $_ })
-      $sPos = Read-Choice (T 'Which subtitles? (they get drawn into the picture)') $labels $sPos $true
-    }
+    $aPos = [int]$tr.Value.A
+    $sPos = [int]$tr.Value.S
     $p = [pscustomobject]@{ ALang = ''; ATitle = ''; APos = $aPos; SNone = ($sPos -lt 0); SLang = ''; STitle = ''; SSigns = $false; SPos = $sPos; SExternal = $false }
     if ($aPos -ge 0) { $p.ALang = $audio[$aPos].Lang; $p.ATitle = $audio[$aPos].Title }
     if ($sPos -ge 0) { $p.SLang = $subs[$sPos].Lang; $p.STitle = $subs[$sPos].Title; $p.SSigns = (Test-Signs $subs[$sPos]); $p.SExternal = ($subs[$sPos].Kind -eq 'external') }
@@ -1514,7 +1563,7 @@ function Resolve-Entries([string[]]$entries) {
     if (Test-IsTitle $e) {
       if (-not (Test-CanAsk)) { Say (T '  To search while a video plays, press + (it opens a second window): {0}' $e) 'Yellow'; continue }
       try { foreach ($it in @(Invoke-ContentSearch $e)) { if ($it) { [void]$found.Add($it) } } }
-      catch { if ($script:CtrlCQuit) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+      catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
       continue
     }
     $full = $null
@@ -1549,12 +1598,12 @@ function Resolve-Entries([string[]]$entries) {
   foreach ($u in $urls) {
     if (Test-TorrentLink $u) {
       try { foreach ($it in @(Expand-Torrent $u)) { if ($it) { [void]$items.Add($it) } } }
-      catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
+      catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
       continue
     }
     if (Test-SiteLink $u) {
       try { foreach ($it in @(Expand-SiteLink $u)) { if ($it) { [void]$items.Add($it) } } }
-      catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
+      catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
       continue
     }
     [void]$items.Add((New-QueueItem 'url' $u))
@@ -1615,46 +1664,164 @@ function Show-FilePicker {
   return @()
 }
 
-function Read-Entries {
-  if (-not $script:Interactive) { return @() }
-  Say ''
-  Say (T 'What do you want to stream?') 'Cyan'
-  if (Get-Command Find-SiteContent -CommandType Function -ErrorAction SilentlyContinue) {
-    Say (T '  - Type a title (anime, film, series - in Russian or English) and press Enter to search for it')
+# ------------------------------------------------------------------ the settings menu (M) and its letters
+# One list for M, the letters on '>' and on the waiting screen, Resolve-Cmd and (later) the window's Settings button.
+# Id = the command's name; Letter = its shortcut ('' = only in the menu); Re = what can be typed for it (the words,
+# and the letter as a Russian keyboard layout types it); Need: host = a host to stream to, lang = translations.
+function Get-MenuItems([switch]$WithMenu) {
+  $items = @(
+    @{ Id = 'host'; Label = (T 'Where to stream (server)...'); Letter = 'H'; Need = 'host'; Re = '^\s*(?:h|host|\u0440)\s*$' },
+    @{ Id = 'res'; Label = (T 'Picture size...'); Letter = 'V'; Need = ''; Re = '^\s*(?:v|res|resolution|\u043c)\s*$' },
+    @{ Id = 'speedtest'; Label = (T 'Upload speed test'); Letter = 'T'; Need = 'host'; Re = '^\s*(?:t|test|speed|\u0435)\s*$' },
+    @{ Id = 'newlink'; Label = (T 'New link...'); Letter = 'N'; Need = 'host'; Re = '^\s*(?:n|new|\u0442)\s*$' },
+    # ("yazyk" = U+044F U+0437 U+044B U+043A)
+    @{ Id = 'lang'; Label = (T 'Language'); Letter = 'L'; Need = 'lang'; Re = '^\s*(?:l|lang|language|\u0434|\u044f\u0437\u044b\u043a)\s*$' },
+    @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' }
+  )
+  if ($WithMenu) { $items += @{ Id = 'menu'; Label = (T 'Settings'); Letter = 'M'; Need = ''; Re = '^\s*(?:m|menu|\u044c)\s*$' } }
+  return $items
+}
+
+# The item a typed line asks for (a letter or its word), or $null.
+function Get-MenuItemFor([string]$line) {
+  foreach ($it in @(Get-MenuItems -WithMenu)) { if ($it.Re -and $line -match $it.Re) { return $it } }
+  return $null
+}
+
+# Can it be used in this window now?
+function Test-MenuItemOn($it) {
+  if ($it.Need -eq 'host') { return ((Test-HostModule) -and [bool]$script:HostP) }
+  if ($it.Need -eq 'lang') { return (Test-HasTranslations) }
+  return $true
+}
+
+# Runs a menu item (on '>', or on the waiting screen through Invoke-Queue: the waiting screen stays on meanwhile).
+function Invoke-MenuAction([string]$id) {
+  switch ($id) {
+    'host' { Invoke-HostMenu }
+    'res' { Invoke-ResolutionMenu }
+    'speedtest' { Invoke-SpeedTestMenu }
+    'newlink' { Invoke-NewLinkMenu }
+    'lang' { Invoke-LanguageMenu }
+    'forget' { Clear-AskedPrefs }
+    'menu' { Invoke-SettingsMenu }
   }
-  Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
-  Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
-  Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
-  Say (T '  - or just press Enter to pick files')
-  if (Test-HasTranslations) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
-  $hostKeys = ((Test-HostModule) -and $script:HostP)
-  if ($hostKeys) { Say (T '  - H = where to stream (Topaz / this PC / your VPS),  T = test your upload speed,  N = new link') 'DarkGray' }
-  Say (T '  - V = picture size (resolution)') 'DarkGray'
-  $line = Read-Host '>'
-  if (-not $line -or -not $line.Trim()) { return @(Show-FilePicker) }
-  # A VPS connection code (it is a password: never search for it or print it): set up "My VPS" with it.
-  if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
-    $line += Read-PastedRest
-    if ($hostKeys) { Use-VpsCode $line } else { Say (T '  That is a VPS connection code: paste it in the window that streams (H -> My VPS).') 'Yellow' }
-    return @(Read-Entries)
-  }
-  # V = picture size (on a Russian keyboard layout the V key types U+043C)
-  if ($line -match '^\s*(?:v|res|resolution|\u043c)\s*$') { Invoke-ResolutionMenu; return @(Read-Entries) }
-  # H / T / N (on a Russian keyboard layout those keys type U+0440, U+0435, U+0442)
-  if ($hostKeys -and $line -match '^\s*(?:h|host|\u0440)\s*$') { Invoke-HostMenu; return @(Read-Entries) }
-  if ($hostKeys -and $line -match '^\s*(?:t|test|speed|\u0435)\s*$') { Invoke-SpeedTestMenu; return @(Read-Entries) }
-  if ($hostKeys -and $line -match '^\s*(?:n|new|\u0442)\s*$') { Invoke-NewLinkMenu; return @(Read-Entries) }
-  if (-not $hostKeys -and (Test-HostModule) -and $line -match '^\s*(?:h|t|n|\u0440|\u0435|\u0442)\s*$') {
-    Say (T '  H / T / N work in the window that streams.') 'Yellow'
-    return @(Read-Entries)
-  }
-  # L (or "lang"; on a Russian keyboard layout the L key types U+0434, "yazyk" = U+044F U+0437 U+044B U+043A)
-  if ($line -match '^\s*(?:l|lang|language|\u0434|\u044f\u0437\u044b\u043a)\s*$' -and (Test-HasTranslations)) {
+}
+
+function Invoke-LanguageMenu {
+  $was = $script:PromptOk
+  $script:PromptOk = $true
+  try {
     Select-Language
     if ($script:Cfg) { Show-Links }
-    return @(Read-Entries)
+  } finally { $script:PromptOk = $was }
+}
+
+# "Ask again": this session's answers to which player, which audio / subtitles and which voice-over are forgotten.
+function Clear-AskedPrefs {
+  $script:PlayerPref = $null
+  $script:TrackPref = $null
+  $script:DubChoice = $null
+  $script:DubPref = $null
+  Say (T '  OK: the next videos ask again which player, audio and subtitles.') 'Green'
+}
+
+# The settings menu (M): a numbered list, 0 / Esc / just Enter = back (also after a task: Right arrow = that task
+# again). Its tasks run in the same flow, so Esc at a task's first question comes back to this list (nothing saved);
+# once a task saved something it can't be undone. Home inside a task leaves the task, back to this list; Home at the
+# list leaves the menu.
+function Invoke-SettingsMenu {
+  $items = @(Get-MenuItems | Where-Object { Test-MenuItemOn $_ })
+  $labels = @($items | ForEach-Object { if ($_.Letter) { $_.Label + '   (' + $_.Letter + ')' } else { $_.Label } })
+  $ids = @($items | ForEach-Object { $_.Id })
+  $was = $script:PromptOk
+  $script:PromptOk = $true
+  try {
+    while ($true) {
+      $st = @{ Task = $false }
+      $r = Invoke-NavFlow -Name 'settings' -Origin 'menu' -Cfg -Body {
+        $st.Task = $false
+        Say ''
+        $i = Read-Choice (T 'Settings') $labels -1 $true -Key 'menu' -Values $ids -NoneLabel (T '   0) Back (or Esc)') -EnterDefault
+        if ($i -ge 0) { $st.Task = $true; Invoke-MenuAction $ids[$i] }
+      }
+      if ($r.Nav -eq 'home' -and $st.Task) { continue }
+      break
+    }
+  } finally { $script:PromptOk = $was }
+}
+
+# The start screen's question ('>'). It comes back here (no dead end) after a menu letter, a VPS code, a cancelled
+# file picker or Esc. Returns the entries, or @($script:QuitMark) for Q + Enter (and in a second window for Esc on
+# an empty line). -Prefill: text already typed (what a task that was left had). $script:EntryLine = the typed line.
+$script:QuitMark = [string][char]0 + 'quit'
+$script:EntryLine = ''
+$script:AddMode = $false   # a second window that hands what it finds to the streaming one (see Main)
+function Read-Entries([string]$Prefill = '') {
+  if (-not $script:Interactive) { return @() }
+  $keys = ($script:HasConsole -or $script:KeySource)
+  $add = [bool]$script:AddMode
+  while ($true) {
+    $script:EntryLine = ''
+    Say ''
+    Say (T 'What do you want to stream?') 'Cyan'
+    if (Get-Command Find-SiteContent -CommandType Function -ErrorAction SilentlyContinue) {
+      Say (T '  - Type a title (anime, film, series - in Russian or English) and press Enter to search for it')
+    }
+    Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
+    Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
+    Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
+    Say (T '  - or just press Enter to pick files')
+    if ((Test-HasTranslations) -and -not $add) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
+    $hostKeys = ((Test-HostModule) -and $script:HostP -and -not $add)
+    if ($hostKeys) { Say (T '  - H = where to stream (Topaz / this PC / your VPS),  T = test your upload speed,  N = new link') 'DarkGray' }
+    if (-not $add) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
+    if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
+    if ($add) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
+    $line = ''
+    while ($keys) {
+      $r = Read-AskLine '>' $Prefill -Nav
+      $Prefill = ''
+      if ($r.Nav -eq 'back') {
+        # (Esc never ends the stream: Q + Enter does. A second window just closes.)
+        if ($add) { return @($script:QuitMark) }
+        Show-NavHint (T '  Q + Enter = end the stream.')
+        continue
+      }
+      if ($r.Nav -eq 'forward') { Show-NavHint (T '  (Nothing to go forward to.)'); continue }
+      if ($r.Nav) { continue }
+      $line = [string]$r.Text
+      break
+    }
+    if (-not $keys) { $line = [string](Read-Host '>') }
+    $script:EntryLine = $line
+    if (-not $line.Trim()) {
+      $files = @(Show-FilePicker)
+      if ($files.Count -gt 0 -or -not $keys) { return $files }
+      continue   # (picker cancelled: ask again)
+    }
+    # Q + Enter (or "quit"; on a Russian keyboard layout the Q key types U+0439) = end.
+    if ($line -match '^\s*(?:q|quit|\u0439)\s*$') { return @($script:QuitMark) }
+    # A VPS connection code (it is a password: never search for it or print it): set up "My VPS" with it.
+    if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
+      $script:EntryLine = ''
+      $line += Read-PastedRest
+      if ($hostKeys) { Use-VpsCode $line } else { Say (T '  That is a VPS connection code: paste it in the window that streams (H -> My VPS).') 'Yellow' }
+      continue
+    }
+    # The menu letters (Get-MenuItems): H / V / T / N / L, and M = the settings menu.
+    $mi = Get-MenuItemFor $line
+    if ($mi -and -not $add -and (Test-MenuItemOn $mi)) { Invoke-MenuAction $mi.Id; continue }
+    if ($mi) {
+      # (A second window only hands videos over: the settings belong to the window that streams, which owns config.json.)
+      $msg = ''
+      if ($add -and ($mi.Id -eq 'res' -or $mi.Id -eq 'lang') -and (Test-MenuItemOn $mi)) { $msg = T '  V and L work in the window that streams.' }
+      elseif ($add -and $mi.Id -eq 'menu') { $msg = T '  {0} works in the window that streams.' $mi.Letter }
+      elseif ($mi.Need -eq 'host' -and (Test-HostModule) -and $line -match '^\s*(?:h|t|n|\u0440|\u0435|\u0442)\s*$') { $msg = T '  H / T / N work in the window that streams.' }
+      if ($msg) { Say $msg 'Yellow'; continue }
+    }
+    return @(Split-EntryLine $line)
   }
-  return @(Split-EntryLine $line)
 }
 
 # A line typed / pasted / dropped into the window while it streams.
@@ -1663,7 +1830,7 @@ function Read-PastedRest {
   $rest = ''
   try {
     Start-Sleep -Milliseconds 150
-    while ($script:HasConsole -and [Console]::KeyAvailable) { $rest += "$(Read-Host)"; Start-Sleep -Milliseconds 100 }
+    while (($script:HasConsole -or $script:KeySource) -and (Test-NavKeyWaiting)) { $rest += (Read-AskLine).Text; Start-Sleep -Milliseconds 100 }
   } catch {}
   return $rest
 }
@@ -1677,29 +1844,41 @@ function Add-TypedLine([string]$line, [string]$kind = '') {
     Say (T '  That is a VPS connection code: when nothing plays, type H, choose "My VPS" and paste it there.') 'Yellow'
     return
   }
-  if ($kind -eq 'waiting' -and (Test-HostModule) -and $script:HostP -and $line -match '^\s*(?:h|host|\u0440)\s*$') { Add-Cmd (New-Cmd 'host'); return }
-  if ($kind -eq 'waiting' -and (Test-HostModule) -and $script:HostP -and $line -match '^\s*(?:n|new|\u0442)\s*$') { Add-Cmd (New-Cmd 'newlink'); return }
-  if ($line -match '^\s*(?:v|res|resolution|\u043c)\s*$') {
-    if ($kind -eq 'waiting') { Add-Cmd (New-Cmd 'res') } else { Say (T '  The resolution can be changed while nothing plays (when the queue is done, or after S = stop).') 'Yellow' }
+  # The menu letters (H / V / T / N / L, M = the settings menu): asked while nothing plays (Invoke-Queue runs them
+  # with the waiting screen on); while a video plays they only say when they work.
+  $mi = Get-MenuItemFor $line
+  if ($mi -and (Test-MenuItemOn $mi)) {
+    if ($kind -eq 'waiting') { Add-Cmd (New-Cmd $mi.Id); return }
+    Say (T '  {0} works while nothing plays (after Q Q = stop).' $mi.Letter) 'Yellow'
     return
   }
   $entries = @(Split-EntryLine $line)
   if ($entries.Count -eq 0) { return }
   # A title while something plays: search in a second window, so this one keeps streaming undisturbed.
   if ($kind -ne 'waiting' -and $entries.Count -eq 1 -and (Test-IsTitle $entries[0])) { Open-AddWindow $entries[0]; return }
-  Invoke-AddEntries $entries $kind
+  Invoke-AddEntries $entries $kind $line
 }
 
 # Adds entries to the queue. While nothing plays (the waiting screen is on), this window may ask questions (which
-# voice-over, which episodes, continue where you stopped?); the waiting screen keeps running meanwhile.
-function Invoke-AddEntries([string[]]$entries, [string]$kind = '') {
+# voice-over, which episodes, continue where you stopped?); the waiting screen keeps running meanwhile. Those run as
+# a flow (Back / Forward): leaving it adds nothing and puts $line back as the text being typed.
+function Invoke-AddEntries([string[]]$entries, [string]$kind = '', [string]$line = '') {
   $ask = ($kind -eq 'waiting')
   if ($ask) { Clear-StatusLine; $script:PromptOk = $true }
   try {
-    $before = $script:Queue.Count
+    if ($ask) {
+      $r = Invoke-NavFlow -Name 'add' -Origin 'waiting' -Snap $script:SiteAnswerVars -Body {
+        $before = $script:Queue.Count
+        $n = Add-Entries $entries $true
+        if ($n -gt 0) { Invoke-ResumeOffer $before }
+        $n
+      }
+      if ($r.Nav) { if ($line) { $script:TypeBuf = $line }; return }
+      if ([int]$r.Value -eq 0) { Say (T '  Nothing added - couldn''t find: {0}' ($entries -join ' ')) 'Yellow' }
+      return
+    }
     $n = Add-Entries $entries $true
     if ($n -eq 0) { Say (T '  Nothing added - couldn''t find: {0}' ($entries -join ' ')) 'Yellow' }
-    elseif ($ask) { Invoke-ResumeOffer $before }
   } finally { $script:PromptOk = $false }
 }
 
@@ -1752,9 +1931,32 @@ $script:JsonSer = $null
 try { Add-Type -AssemblyName System.Web.Extensions } catch {}
 
 # One HTTP request. Never throws for HTTP error codes (check .Status); throws when the server can't be reached.
+# While a flow asks questions (Invoke-NavFlow, until its Lock-NavStep), the same request gets the same answer (or the
+# same error) again, so a Back re-runs without the network; WPARTY's live room requests are fetched again after 120 s.
+# A failure (an error, HTTP 0 / 408 / 429 / 5xx) is handed back only on a re-run: a retry in the same run asks again.
+# (Invoke-WebParallel copies this function into runspaces, where no flow is open: it then runs as it always did.)
 function Invoke-Web {
   param([Parameter(Mandatory = $true)][string]$Url, [string]$Method = 'GET', [hashtable]$Headers = @{}, [string]$Body = $null,
-    [string]$ContentType = $null, [int]$TimeoutSec = 20, [switch]$NoRedirect)
+    [string]$ContentType = $null, [int]$TimeoutSec = 20, [switch]$NoRedirect, [switch]$NoMemo)
+  if ($script:Nav -and -not $script:Nav.Sealed -and -not $NoMemo) {
+    $root = Get-NavRoot
+    $mk = 'web|' + $Method + '|' + $Url + '|' + $Body + '|' + ((@($Headers.Keys) | Sort-Object | ForEach-Object { "$_=$($Headers[$_])" }) -join '&')
+    $hit = $null
+    if ($root.Memo.TryGetValue($mk, [ref]$hit) -and (Test-NavMemoUse $hit)) {
+      if ($hit.Err) { throw $hit.Err }
+      return $hit.Res
+    }
+    $until = $null
+    if ($Url -match '(?i)^https?://(?:[^/]*[.])?wparty[.][a-z]+/api/') { $until = (Get-Date).AddSeconds(120) }
+    try { $res = Invoke-Web @PSBoundParameters -NoMemo }
+    catch {
+      if (-not (Test-NavAbort)) { $root.Memo[$mk] = @{ Res = $null; Err = $_.Exception; Until = $until; Fail = $true; Pass = $script:NavPass } }
+      throw
+    }
+    $fail = ($null -eq $res -or $res.Status -eq 0 -or $res.Status -eq 408 -or $res.Status -eq 429 -or $res.Status -ge 500)
+    $root.Memo[$mk] = @{ Res = $res; Err = $null; Until = $until; Fail = $fail; Pass = $script:NavPass }
+    return $res
+  }
   $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Url)
   $req.Method = $Method
   $req.UserAgent = $script:WebUA
@@ -1993,32 +2195,15 @@ function Get-DownloadText($item) {
 }
 
 # Asks which episodes to play. $list = objects with a .Number (text). $defPos = where "just Enter" starts.
-function Read-EpisodeSelection($list, [int]$defPos) {
+# -Key: the step's name in a flow (the tape keeps the typed text). Never returns an empty list.
+function Read-EpisodeSelection {
+  [CmdletBinding(PositionalBinding = $false)]
+  param([Parameter(Position = 0)]$list, [Parameter(Position = 1)][int]$defPos, [string]$Key = '')
   if ($list.Count -le 1) { return @($list) }
-  $defText = T 'all {0}' $list.Count
-  if ($defPos -gt 0) { $defText = "$($list[$defPos].Number)-$($list[$list.Count - 1].Number)" }
-  Say (T 'Which episodes? (1 to {0}; type e.g. 5, or 3-8, or 3- for 3 to the end)' ($list[$list.Count - 1].Number)) 'Cyan'
-  while ($true) {
-    $ans = Read-Host (T 'Type and press Enter (just Enter = {0})' $defText)
-    if (-not $ans -or -not $ans.Trim()) { return @($list[$defPos..($list.Count - 1)]) }
-    $ans = $ans -replace '\s*[-\u2013\u2014]\s*', '-'   # "3 - 8" means 3-8
-    $pick = New-Object System.Collections.ArrayList
-    foreach ($part in ($ans -split '[,; ]+')) {
-      if (-not $part) { continue }
-      $lo = $null; $hi = $null
-      if ($part -match '^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)?$') {
-        $lo = [double]::Parse($matches[1], $script:Inv)
-        if ($matches[2]) { $hi = [double]::Parse($matches[2], $script:Inv) } else { $hi = [double]::MaxValue }
-      } elseif ($part -match '^\d+(?:\.\d+)?$') { $lo = [double]::Parse($part, $script:Inv); $hi = $lo }
-      else { continue }
-      foreach ($e in $list) {
-        $n = 0.0
-        if ([double]::TryParse([string]$e.Number, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$n) -and $n -ge $lo -and $n -le $hi -and -not $pick.Contains($e)) { [void]$pick.Add($e) }
-      }
-    }
-    if ($pick.Count -gt 0) { return $pick.ToArray() }
-    Say (T '   Please type episode numbers from the list.') 'Yellow'
-  }
+  $a = New-NavAsk 'episodes' (T 'Which episodes? (1 to {0}; type e.g. 5, or 3-8, or 3- for 3 to the end)' ($list[$list.Count - 1].Number)) $Key
+  $a.List = @($list)
+  $a.DefPos = $defPos
+  return @(Invoke-Ask $a)
 }
 
 # ------------------------------------------------------------------ which player (Kodik, AniBoom, ...) a web video comes from
@@ -2077,7 +2262,9 @@ function Get-PlayerPref($item) {
   $opts = @((T 'Auto - check them all and take the sharpest picture (takes a few seconds more)'))
   foreach ($p in $provs) { $opts += (Get-ProviderTitle $p) }
   Say ''
-  $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false
+  # (Asked while preparing: a one-off question, Esc = Auto. No Back goes past the queue insert.)
+  Lock-NavStep
+  $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false -Key 'player' -Values (@('auto') + @($provs | ForEach-Object { [string]$_ })) -Esc 0
   if ($i -le 0) { $script:PlayerPref = 'auto' } else { $script:PlayerPref = [string]$provs[$i - 1] }
   return $script:PlayerPref
 }
@@ -2101,7 +2288,7 @@ function Read-HandoverPlayer($items) {
   $opts = @((T 'Auto - check them all and take the sharpest picture (takes a few seconds more)'))
   foreach ($p in $provs) { $opts += (Get-ProviderTitle $p) }
   Say ''
-  $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false
+  $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false -Key 'player' -Values (@('auto') + @($provs | ForEach-Object { [string]$_ }))
   if ($i -le 0) { $script:LastPlayer = 'auto' } else { $script:LastPlayer = [string]$provs[$i - 1] }
 }
 
@@ -2493,8 +2680,8 @@ function Get-PinnedTool([string]$Name, [bool]$CanAsk) {
   Say (T 'Torrents need rqbit, a free torrent program (12.7 MB, Apache-2.0, github.com/ikatson/rqbit). Nothing is installed.') 'Cyan'
   Say (T 'While an episode downloads it also uploads to other people, capped at {0} KB/s, and it stops uploading when the episode is complete. Only download what you are allowed to.' (Get-TorrentUploadKBps)) 'Gray'
   Say (T 'Windows may ask whether rqbit may use the network: Cancel is fine, it works either way.') 'Gray'
-  $ans = Read-Host (T 'Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]' $script:RqbitVersion)
-  if (Test-AnswerNo $ans) { $script:PinnedRefused[$Name] = $true; return $null }
+  # (Like MediaMTX's: a one-off question Esc = no; inside a flow Esc goes back as at any of its questions.)
+  if (-not (Read-YesNoUi (T 'Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]' $script:RqbitVersion) $true -Key 'rqbit' -Esc $false)) { $script:PinnedRefused[$Name] = $true; return $null }
   $tmp = PathJoin $script:TempRoot 'rqbit-download.exe'
   try {
     if (-not [System.IO.Directory]::Exists($script:TempRoot)) { [void][System.IO.Directory]::CreateDirectory($script:TempRoot) }
@@ -2964,7 +3151,15 @@ function Expand-Torrent([string]$link) {
   if ($kind -eq 'hash') { Say (T '  A bare hash finds the people sharing it only through DHT: a magnet link or a .torrent file is faster.') 'DarkGray' }
   $items = New-Object System.Collections.ArrayList
   if (Test-CanAsk) {
-    Get-TorrentFileList $g
+    # (Inside a flow a Back re-runs this: the file list it got is used again, without another wait for the people
+    # sharing it. Only the list is kept: nothing was added to rqbit yet.)
+    $got = @(Use-NavMemo ('torrent|' + $link) {
+        $null = Get-TorrentFileList $g
+        [pscustomobject]@{ Files = @($g.Files); Hash = $g.Hash; Name = $g.Name; Body = $g.Body; BodyUrl = $g.BodyUrl }
+      })
+    if ($got.Count -gt 0 -and $got[0]) {
+      $g.Files = @($got[0].Files); $g.Hash = $got[0].Hash; $g.Name = $got[0].Name; $g.Body = $got[0].Body; $g.BodyUrl = $got[0].BodyUrl
+    }
     $list = @(Get-TorrentEpisodes $g.Files)
     if ($list.Count -eq 0) { throw (T 'there is no video in this torrent') }
     if ($g.Name) { Say (T 'Torrent: {0} ({1} videos)' $g.Name $list.Count) 'White' }
@@ -4144,8 +4339,8 @@ function Invoke-PanelPump {
   } catch {}
 }
 
-# Questions in this window (Read-Host) while the control window is open: the keys are read here, so the control
-# window keeps getting its state, and Ctrl+C ends the tool cleanly.
+# Questions in this window: the keys are read here (Read-AskLine), so the control window keeps getting its state,
+# Back / Forward work, and Ctrl+C ends the tool cleanly.
 $script:CtrlCQuit = $false
 function Stop-ByCtrlC {
   $script:CtrlCQuit = $true
@@ -4154,42 +4349,758 @@ function Stop-ByCtrlC {
   throw (New-Object System.OperationCanceledException (T 'Stopped (Ctrl+C).'))
 }
 
-function Read-Host {
-  param([Parameter(Position = 0)][object]$Prompt)
-  if (-not $script:PanelShown -or -not $script:HasConsole) {
-    # Ctrl+C at a question works as usual (it ends the tool), also while the stream reads keys itself.
-    $ctrlKey = $false
+# ------------------------------------------------------------------ the key reader
+# Every question reads its answer line here. Navigation keys count only on an empty line and only where the question
+# allows them (-Nav): Esc or Left = back, Right = your earlier answer again (forward), Home = leave the task.
+# Esc on a line with text clears it, as always; an Esc within 400 ms of such a clear never goes back, and a held
+# navigation key (auto-repeat) counts once. Backspace on an empty line does nothing.
+# $script:KeySource: $null = the console. A test sets a scriptblock: & $KeySource 'avail' -> [bool] (a key waits),
+# & $KeySource 'read' -> [ConsoleKeyInfo]; it throws System.IO.EndOfStreamException when it has no more keys.
+$script:KeySource = $null
+$script:NavKeyAhead = New-Object System.Collections.ArrayList   # keys read while dropping repeated navigation keys
+$script:NavEscGuardMs = 400
+$script:NavRepeatMs = 200
+# A held key repeats first after the keyboard's repeat delay (Windows: 250-1000 ms, 500 by default), then every
+# NavRepeatMs or less: the same navigation key again within that delay counts as held too, unless the key was seen
+# let go meanwhile (Update-NavKeyUp, while the reader waits): then it is a new press.
+$script:NavHoldMs = 650
+try { $script:NavHoldMs = ([Math]::Min(3, [Math]::Max(0, [int](Get-ItemProperty 'HKCU:\Control Panel\Keyboard' -ErrorAction Stop).KeyboardDelay)) + 1) * 250 + 150 } catch {}
+$script:NavRepeatKey = $null
+$script:NavHeldUntil = [datetime]::MinValue
+$script:NavKeyUp = $true
+$script:NavKeyState = $null    # can the key's state be read ($null = not tried yet)
+
+function Update-NavKeyUp {
+  if ($script:NavKeyUp -or -not $script:NavRepeatKey) { return }
+  if ($null -eq $script:NavKeyState) {
+    $script:NavKeyState = $false
+    try {
+      Add-Type -Namespace VRCLinkMaker -Name KeyState -MemberDefinition '[DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);'
+      $script:NavKeyState = $true
+    } catch {}
+  }
+  if (-not $script:NavKeyState) { return }
+  try { if (([VRCLinkMaker.KeyState]::GetAsyncKeyState([int]$script:NavRepeatKey) -band 0x8000) -eq 0) { $script:NavKeyUp = $true } } catch {}
+}
+
+function Test-NavKeyWaiting {
+  if ($script:NavKeyAhead.Count -gt 0) { return $true }
+  if ($script:KeySource) { return [bool](& $script:KeySource 'avail') }
+  return [Console]::KeyAvailable
+}
+
+function Read-NavKey {
+  if ($script:NavKeyAhead.Count -gt 0) { $k = $script:NavKeyAhead[0]; $script:NavKeyAhead.RemoveAt(0); return $k }
+  if ($script:KeySource) { return (& $script:KeySource 'read') }
+  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
+  return [Console]::ReadKey($true)
+}
+
+# Ctrl+C as a key. Not AltGr+C (Windows sends AltGr as Ctrl+Alt: e.g. a Polish c with an accent).
+function Test-CtrlCKey($k) {
+  return ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control) -and -not ($k.Modifiers -band [ConsoleModifiers]::Alt))
+}
+
+# Takes $n typed characters off the screen, also back over a wrapped line (a backspace stops at the row's start).
+function Remove-AskEcho([int]$n) {
+  if ($n -le 0) { return }
+  if ($script:HasConsole -and -not $script:KeySource) {
+    try {
+      $w = [Console]::BufferWidth
+      $pos = [Console]::CursorTop * $w + [Console]::CursorLeft - $n
+      if ($w -gt 0 -and $pos -ge 0) {
+        $l = $pos % $w
+        $t = [int][Math]::Floor($pos / $w)
+        [Console]::SetCursorPosition($l, $t)
+        Write-Host (' ' * $n) -NoNewline
+        [Console]::SetCursorPosition($l, $t)
+        return
+      }
+    } catch {}
+  }
+  Write-Host (([string][char]8 + ' ' + [string][char]8) * $n) -NoNewline
+}
+
+# Writes the prompt or typed text. Text that ends exactly at the right edge leaves the cursor in the last column until
+# the next character comes (VT consoles): it is put at the next row's start here, as older consoles do, so that
+# Remove-AskEcho counts back from the right cell.
+function Write-AskEcho([string]$s) {
+  $l0 = -1
+  if ($script:HasConsole -and -not $script:KeySource) { try { $l0 = [Console]::CursorLeft } catch {} }
+  Write-Host $s -NoNewline
+  if ($l0 -lt 0) { return }
+  try {
+    $nl = $s.LastIndexOf("`n")
+    if ($nl -ge 0) { $l0 = 0; $s = $s.Substring($nl + 1) }
+    $w = [Console]::BufferWidth
+    if ($w -gt 0 -and $s.Length -gt 0 -and ($l0 + $s.Length) % $w -eq 0 -and [Console]::CursorLeft -ne 0) {
+      if ([Console]::CursorTop + 1 -lt [Console]::BufferHeight) { [Console]::SetCursorPosition(0, [Console]::CursorTop + 1) }
+      else { Write-Host '' }
+    }
+  } catch {}
+}
+
+function Test-NavKey($k) {
+  $c = $k.Key
+  return ($c -eq [ConsoleKey]::Escape -or $c -eq [ConsoleKey]::LeftArrow -or $c -eq [ConsoleKey]::RightArrow -or $c -eq [ConsoleKey]::Home)
+}
+
+# After a Back / Forward / Home: the Esc / Left / Right / Home presses still waiting (a held key) are thrown away.
+function Clear-NavRepeat {
+  try {
+    while (Test-NavKeyWaiting) {
+      $k = Read-NavKey
+      if (Test-NavKey $k) {
+        $t = (Get-Date).AddMilliseconds($script:NavRepeatMs)
+        if ($t -gt $script:NavHeldUntil) { $script:NavHeldUntil = $t }
+        continue
+      }
+      [void]$script:NavKeyAhead.Insert(0, $k)
+      break
+    }
+  } catch {}
+}
+
+# Reads one answer line -> @{ Nav = '' | 'back' | 'forward' | 'home'; Text }. -Prefill: text already typed (editable).
+# -Secret: the typed characters show as '*'.
+function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav, [switch]$Secret) {
+  $out = @{ Nav = ''; Text = '' }
+  # Before the control window opens, Ctrl+C at a question works as usual (it ends the tool), also while the stream
+  # reads keys itself. With the control window open it arrives here as a key: a clean stop.
+  $ctrlKey = $false
+  if (-not $script:PanelShown -and -not $script:KeySource) {
     try { $ctrlKey = ($script:HasConsole -and [Console]::TreatControlCAsInput) } catch {}
     if ($ctrlKey) { Set-CtrlCAsKey $false }
-    try {
-      if ($null -ne $Prompt) { return (Microsoft.PowerShell.Utility\Read-Host -Prompt $Prompt) }
-      return (Microsoft.PowerShell.Utility\Read-Host)
-    } finally { if ($ctrlKey) { Set-CtrlCAsKey $true } }
+  } elseif ($script:CtrlCQuit) { throw (New-Object System.OperationCanceledException (T 'Stopped (Ctrl+C).')) }
+  try {
+    Clear-StatusLine
+    if ($Prompt) { Write-AskEcho ($Prompt + ': ') }
+    $sb = New-Object System.Text.StringBuilder
+    if ($Prefill -and -not $Secret) { [void]$sb.Append($Prefill); Write-AskEcho $Prefill }
+    $clearedAt = [datetime]::MinValue
+    while ($true) {
+      $k = $null
+      try { $k = Read-NavKey }
+      catch [System.IO.EndOfStreamException] { throw }
+      catch { break }
+      if ($k.Key -eq [ConsoleKey]::Enter) { break }
+      if (Test-CtrlCKey $k) { Write-Host ''; Stop-ByCtrlC }
+      $now = Get-Date
+      if ($Nav -and (Test-NavKey $k)) {
+        $held = ($script:NavRepeatMs -gt 0 -and $k.Key -eq $script:NavRepeatKey -and $now -lt $script:NavHeldUntil -and -not $script:NavKeyUp)
+        $script:NavRepeatKey = $k.Key
+        $script:NavKeyUp = $false
+        $script:NavHeldUntil = $now.AddMilliseconds($(if ($held) { $script:NavRepeatMs } else { $script:NavHoldMs }))
+        if ($held) { continue }
+      }
+      if ($k.Key -eq [ConsoleKey]::Backspace) {
+        if ($sb.Length -gt 0) { $sb.Length = $sb.Length - 1; Remove-AskEcho 1 }
+        continue
+      }
+      if ($k.Key -eq [ConsoleKey]::Escape) {
+        if ($sb.Length -gt 0) {
+          Remove-AskEcho $sb.Length
+          $sb.Length = 0
+          $clearedAt = $now
+          continue
+        }
+        if ($Nav -and ($now - $clearedAt).TotalMilliseconds -ge $script:NavEscGuardMs) { $out.Nav = 'back'; break }
+        continue
+      }
+      if ($Nav -and $sb.Length -eq 0) {
+        if ($k.Key -eq [ConsoleKey]::LeftArrow) { $out.Nav = 'back'; break }
+        if ($k.Key -eq [ConsoleKey]::RightArrow) { $out.Nav = 'forward'; break }
+        if ($k.Key -eq [ConsoleKey]::Home) { $out.Nav = 'home'; break }
+      }
+      if ([int]$k.KeyChar -ge 32) {
+        # (A paste or dropped files arrive as many keys at once: they are echoed in one go.)
+        $chunk = New-Object System.Text.StringBuilder
+        [void]$chunk.Append($k.KeyChar)
+        while (Test-NavKeyWaiting) {
+          $k2 = Read-NavKey
+          if ([int]$k2.KeyChar -lt 32 -or ($k2.Modifiers -band [ConsoleModifiers]::Control)) { [void]$script:NavKeyAhead.Insert(0, $k2); break }
+          [void]$chunk.Append($k2.KeyChar)
+        }
+        [void]$sb.Append($chunk.ToString())
+        if ($Secret) { Write-AskEcho ('*' * $chunk.Length) } else { Write-AskEcho $chunk.ToString() }
+      }
+    }
+    Write-Host ''
+    $out.Text = $sb.ToString()
+    if ($out.Nav) { $out.Text = ''; Clear-NavRepeat }
+  } finally { if ($ctrlKey) { Set-CtrlCAsKey $true } }
+  return $out
+}
+
+# Read-Host everywhere in the tool (also in Sites / Hosts / Update): the key reader above when there is a console, so
+# the keys are the same before and after the control window opens and in a second window. Without a console
+# (redirected input) the plain line reader.
+function Read-Host {
+  param([Parameter(Position = 0)][object]$Prompt)
+  if ($script:HasConsole -or $script:KeySource) {
+    $p = ''
+    if ($null -ne $Prompt) { $p = "$Prompt" }
+    return (Read-AskLine $p).Text
   }
-  if ($script:CtrlCQuit) { throw (New-Object System.OperationCanceledException (T 'Stopped (Ctrl+C).')) }
-  Clear-StatusLine
-  if ($null -ne $Prompt -and "$Prompt") { Write-Host ("$Prompt" + ': ') -NoNewline }
-  $sb = New-Object System.Text.StringBuilder
+  if ($null -ne $Prompt) { return (Microsoft.PowerShell.Utility\Read-Host -Prompt $Prompt) }
+  return (Microsoft.PowerShell.Utility\Read-Host)
+}
+
+# ------------------------------------------------------------------ questions with Back / Forward (Ask, flows)
+# Every question (Read-Choice, Read-EpisodeSelection, Read-YesNoUi, Read-HostLine) is an "Ask" (New-NavAsk) that
+# Invoke-Ask draws and reads. The Ask is what the control window will show too (G4 bus.Ask): Id, Kind (choice |
+# episodes | yesno | text), Title, Options, Values, Default, Prev (your earlier answer), Crumb, CanBack, BackLabel,
+# EscValue, CanForward, Secret. A reply (a console line, later a window button) is @{ Nav = '' | 'back' | 'forward' |
+# 'home'; Text }; Resolve-AskReply is the one place that turns it into an answer.
+#
+# A task with several questions runs as a flow (Invoke-NavFlow):
+#   $r = Invoke-NavFlow -Name 'search' -Origin start -Snap DubChoice, DubPref -Body { ...questions... }
+#   $r.Nav = '' (the body finished, $r.Value = what it returned), 'leave' (Back at its first question) or 'home'.
+# Back re-runs the body from its start with the answers it already has (the tape): those questions answer themselves
+# silently (Say only writes log.txt meanwhile) and the earlier question is asked again, your answer marked; Enter
+# keeps it. Before every re-run the named $script: variables, the queue and (-Cfg) the config are put back as they
+# were at the start, and Invoke-Web / Use-NavMemo hand back what they fetched before, so a re-run is instant.
+# Lock-NavStep marks a step that can't be undone (saved, imported, written): no Back crosses it, and the questions
+# after it act as one-off questions. A flow started inside an open (not locked) flow joins it; after a lock, or
+# outside any flow, it gets its own frame. One-off questions (no flow): Esc gives the safe answer (-Esc) or nothing.
+$script:Nav = $null            # the innermost open flow frame
+$script:NavSignal = ''         # 'back' / 'leave' / 'home' while a navigation unwinds; sticky until its flow takes it
+$script:NavSignalFrame = $null
+$script:NavAskSeq = 0
+$script:NavPass = 0          # counts the runs of flow bodies (Invoke-NavFlow): a re-run is a new pass
+# The session answers the search / site questions set (Invoke-NavFlow -Snap): put back when a flow goes back or is left.
+$script:SiteAnswerVars = @('DubChoice', 'DubPref', 'LastDub', 'LastEps', 'LastPart', 'LastPlayer', 'LastSearchLink', 'SiteChoice')
+
+function New-NavCancel { return (New-Object System.OperationCanceledException 'vrclm-nav') }
+
+# Leaves the open flow (like Esc at its first question), e.g. "0 = none of these" in the search list. Outside a flow,
+# or after its Lock-NavStep, it does nothing (the caller then goes on as before).
+function Exit-NavFlow {
+  $f = $script:Nav
+  if (-not $f -or $f.Sealed -or $f.Own) { return }
+  Set-NavSignal 'leave' $f
+  throw (New-NavCancel)
+}
+
+# Ctrl+C or a Back / Home on its way out: a catch around a question must pass these on (throw).
+function Test-NavAbort { return ([bool]$script:CtrlCQuit -or [bool]$script:NavSignal) }
+
+function Set-NavSignal([string]$sig, $frame) {
+  $script:NavSignal = $sig
+  $script:NavSignalFrame = $frame
+}
+
+function Test-NavSealed {
+  $f = $script:Nav
+  while ($f) { if ($f.Sealed) { return $true }; $f = $f.Parent }
+  return $false
+}
+
+function Get-NavRoot {
+  $f = $script:Nav
+  if (-not $f) { return $null }
+  while ($f.Parent) { $f = $f.Parent }
+  return $f
+}
+
+# May a memo entry (Invoke-Web / Use-NavMemo) answer now? Not after its -Seconds, and a failure not in the run
+# (pass) that got it: there the caller's own "try once more" must reach the network, as outside a flow.
+function Test-NavMemoUse($hit) {
+  if ($null -ne $hit.Until -and (Get-Date) -ge $hit.Until) { return $false }
+  if ($hit.Fail -and $hit.Pass -eq $script:NavPass) { return $false }
+  return $true
+}
+
+function New-NavAsk([string]$Kind, [string]$Title = '', [string]$Key = '') {
+  return @{ Id = ''; Kind = $Kind; Key = $Key; CheckKey = ''; Title = $Title; Prompt = ''; Options = @(); Values = $null
+    Default = $null; AllowNone = $false; NoneLabel = ''; List = $null; DefPos = 0; DefaultYes = $true; Secret = $false; Private = $false
+    HasEsc = $false; EscValue = $null; Prev = $null; Crumb = ''; BackMode = ''; CanBack = $false; BackLabel = ''
+    CanForward = $false; NavOn = $false; RedoHit = $false; EnterDefault = $false }
+}
+
+# The check key: replay gives a stored answer only to the same question (its title and its options; with -Values
+# the stored value itself must still be among the values, wherever it is now).
+function Get-AskCheckKey($a) {
+  $k = [string]$a.Key + '|' + $a.Kind + '|' + [string]$a.Title
+  if ($a.Kind -eq 'choice') {
+    $k += '|' + [string]$a.AllowNone
+    if ($null -eq $a.Values) { $k += '|' + (@($a.Options) -join [string][char]31) }
+  }
+  elseif ($a.Kind -eq 'episodes') { $k += '|' + (@($a.List | ForEach-Object { [string]$_.Number }) -join ',') }
+  else { $k += '|' + [string]$a.Prompt }
+  return $k
+}
+
+function Get-NavShort([string]$s, [int]$max = 40) {
+  $s = ($s -replace '\s+', ' ').Trim()
+  if ($s.Length -gt $max) { $s = $s.Substring(0, $max - 3) + '...' }
+  return $s
+}
+
+function Get-NavRootLabel([string]$origin) {
+  if ($origin -eq 'waiting') { return (T 'Waiting screen') }
+  if ($origin -eq 'menu') { return (T 'Settings') }
+  if ($origin -eq 'addwin') { return (T 'Add window') }
+  return (T 'Start')
+}
+
+# "  Start > Frieren > Season 2 > AniLibria", cut from the left to the window's width; secrets show as ***.
+function Get-NavCrumb($f, [int]$count = -1) {
+  $parts = @(Get-NavRootLabel $f.Origin)
+  if ($count -lt 0) { $count = $f.Tape.Count }
+  for ($i = 0; $i -lt $count; $i++) {
+    $e = $f.Tape[$i]
+    if ($e.Secret) { $parts += '***' } else { $parts += (Get-NavShort ([string]$e.Label)) }
+  }
+  $s = '  ' + ($parts -join ' > ')
+  $w = Get-ConsoleWidth
+  if ($s.Length -gt $w) { $s = '  ...' + $s.Substring($s.Length - ($w - 5)) }
+  return $s
+}
+
+function Show-NavHint([string]$text) { if ($text) { Say $text 'DarkGray' } }
+
+# Episodes from typed text ('' = from $defPos to the end): "5", "3-8", "3-", "1,4 7", en / em dashes, decimals.
+function ConvertFrom-EpisodeText($list, [int]$defPos, [string]$ans) {
+  if (-not $ans -or -not $ans.Trim()) { return @($list[$defPos..($list.Count - 1)]) }
+  $ans = $ans -replace '\s*[-\u2013\u2014]\s*', '-'   # "3 - 8" means 3-8
+  $pick = New-Object System.Collections.ArrayList
+  foreach ($part in ($ans -split '[,; ]+')) {
+    if (-not $part) { continue }
+    $lo = $null; $hi = $null
+    if ($part -match '^(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)?$') {
+      $lo = [double]::Parse($matches[1], $script:Inv)
+      if ($matches[2]) { $hi = [double]::Parse($matches[2], $script:Inv) } else { $hi = [double]::MaxValue }
+    } elseif ($part -match '^\d+(?:\.\d+)?$') { $lo = [double]::Parse($part, $script:Inv); $hi = $lo }
+    else { continue }
+    foreach ($e in $list) {
+      $n = 0.0
+      if ([double]::TryParse([string]$e.Number, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$n) -and $n -ge $lo -and $n -le $hi -and -not $pick.Contains($e)) { [void]$pick.Add($e) }
+    }
+  }
+  return $pick.ToArray()
+}
+
+function Get-EpisodeDefaultText($list, [int]$defPos) {
+  if ($defPos -gt 0) { return "$($list[$defPos].Number)-$($list[$list.Count - 1].Number)" }
+  return (T 'all {0}' $list.Count)
+}
+
+function Get-ChoiceLabel($a, [int]$i) {
+  # (Without the markers after 3 spaces: '   <- auto (just Enter)', '   (preferred)', '   [default]'.)
+  if ($i -ge 0 -and $i -lt @($a.Options).Count) { return ([string]@($a.Options)[$i] -replace ' {3,}\S.*$', '') }
+  if ($a.NoneLabel) { return ([string]$a.NoneLabel -replace '^\s*0\)\s*', '') }
+  return ((T '   0) None') -replace '^\s*0\)\s*', '')
+}
+
+# An answer -> @{ Act = 'value'; Result (what the question returns); Stored (what the tape keeps); Label (crumb) }.
+function Get-AskValue($a, $result, [string]$typed = '') {
+  $r = @{ Act = 'value'; Result = $result; Stored = $result; Label = '' }
+  if ($a.Kind -eq 'choice') {
+    $i = [int]$result
+    $r.Result = $i
+    $r.Stored = $i
+    if ($null -ne $a.Values) { if ($i -ge 0) { $r.Stored = [string]@($a.Values)[$i] } else { $r.Stored = [string][char]0 + 'none' } }
+    $r.Label = Get-ChoiceLabel $a $i
+  } elseif ($a.Kind -eq 'episodes') {
+    $r.Stored = $typed.Trim()
+    $r.Label = $r.Stored
+    if (-not $r.Label) { $r.Label = Get-EpisodeDefaultText $a.List $a.DefPos }
+  } elseif ($a.Kind -eq 'yesno') {
+    $r.Result = [bool]$result
+    $r.Stored = [bool]$result
+    if ($result) { $r.Label = T 'yes' } else { $r.Label = T 'no' }
+  } else {
+    $r.Result = [string]$result
+    $r.Stored = [string]$result
+    $r.Label = [string]$result
+  }
+  return $r
+}
+
+# A stored answer (tape / earlier answer) for this question -> @{ Ok; Result; Stored; Label }. Not Ok = it doesn't
+# fit this question any more (the options changed): then it is asked.
+function ConvertFrom-AskValue($a, $stored) {
+  $bad = @{ Ok = $false }
+  if ($a.Kind -eq 'choice') {
+    $i = -2
+    if ($null -ne $a.Values) {
+      if ([string]$stored -ceq ([string][char]0 + 'none')) { $i = -1 }
+      else { $vals = @($a.Values); for ($j = 0; $j -lt $vals.Count; $j++) { if ([string]$vals[$j] -ceq [string]$stored) { $i = $j; break } } }
+    } else { $n = 0; if ([int]::TryParse([string]$stored, [ref]$n)) { $i = $n } }
+    $ok = ($i -ge 0 -and $i -lt @($a.Options).Count) -or ($i -eq -1 -and ($a.AllowNone -or $a.Default -eq -1))
+    if (-not $ok) { return $bad }
+    $r = Get-AskValue $a $i
+  } elseif ($a.Kind -eq 'episodes') {
+    $p = @(ConvertFrom-EpisodeText $a.List $a.DefPos ([string]$stored))
+    if ($p.Count -eq 0) { return $bad }
+    $r = Get-AskValue $a $p ([string]$stored)
+  } elseif ($a.Kind -eq 'yesno') {
+    if ($stored -isnot [bool]) { return $bad }
+    $r = Get-AskValue $a $stored
+  } else {
+    $r = Get-AskValue $a ([string]$stored)
+  }
+  $r.Ok = $true
+  return $r
+}
+
+function Get-AskEscValue($a) {
+  if ($a.Kind -eq 'episodes') { return (Get-AskValue $a @(ConvertFrom-EpisodeText $a.List $a.DefPos '') '') }
+  return (Get-AskValue $a $a.EscValue)
+}
+
+# Does '0' mean Back / Cancel in this list (shown as its first line)? Only where 0 isn't an answer already.
+function Test-AskZeroBack($a) {
+  return ($a.Kind -eq 'choice' -and -not $a.AllowNone -and ($a.BackMode -eq 'back' -or $a.BackMode -eq 'leave'))
+}
+
+function Get-AskEscHint($a) {
+  if ($a.BackMode -eq 'back') { return (T '  (Esc = back)') }
+  if ($a.BackMode -eq 'leave') { return (T '  (Esc = cancel)') }
+  return ''
+}
+
+function Get-AskMarks($a, [int]$i) {
+  $s = ''
+  if ($a.Prev -and [int]$a.Prev.Result -eq $i) { $s += T '   <- your answer' }
+  if ($a.BackMode -eq 'esc' -and $null -ne $a.EscValue -and [int]$a.EscValue -eq $i) { $s += T '   <- Esc' }
+  return $s
+}
+
+# Draws the question: the path so far, the title, the options (with "0) Back" and the markers) and the Esc hint.
+function Show-AskBody($a) {
+  if ($a.Crumb) { Show-NavHint $a.Crumb }
+  $nav = ($a.BackMode -eq 'back' -or $a.BackMode -eq 'leave')
+  if ($a.Kind -eq 'choice') {
+    Say $a.Title 'Cyan'
+    $zero = Test-AskZeroBack $a
+    if ($zero) {
+      if ($a.BackMode -eq 'back') { Say (T '   0) Back (or Esc)') } else { Say (T '   0) Cancel (or Esc)') }
+    } elseif ($a.AllowNone) {
+      $l = T '   0) None'
+      if ($a.NoneLabel) { $l = [string]$a.NoneLabel }
+      Say ($l + (Get-AskMarks $a -1))
+    }
+    $opts = @($a.Options)
+    for ($i = 0; $i -lt $opts.Count; $i++) { Say (('   {0}) {1}' -f ($i + 1), $opts[$i]) + (Get-AskMarks $a $i)) }
+    if ($nav -and -not $zero -and -not ($a.AllowNone -and $a.NoneLabel)) { Show-NavHint (Get-AskEscHint $a) }   # (a NoneLabel says it)
+  } elseif ($a.Kind -eq 'episodes') {
+    Say $a.Title 'Cyan'
+    if ($nav) { Show-NavHint (Get-AskEscHint $a) }
+  } elseif ($a.Kind -eq 'yesno') {
+    if ($nav -and $a.Prev) {
+      $yn = T 'no'
+      if ($a.Prev.Result) { $yn = T 'yes' }
+      Show-NavHint (T '  (Esc = back; just Enter = {0} as before)' $yn)
+    } elseif ($nav) { Show-NavHint (Get-AskEscHint $a) }
+    elseif ($a.BackMode -eq 'esc' -and $a.EscValue -eq $false) { Show-NavHint (T '  (Esc = no)') }
+  } else {
+    if ($nav -and $a.Prev -and ($a.Secret -or $a.Private)) { Show-NavHint (T '  (Esc = back; Right arrow = what you typed before)') }
+    elseif ($nav) { Show-NavHint (Get-AskEscHint $a) }
+    elseif ($a.BackMode -eq 'esc') { Show-NavHint (T '  (Esc = cancel)') }
+  }
+}
+
+function Get-AskPrompt($a) {
+  if ($a.Kind -eq 'choice') {
+    $n = [int]$a.Default
+    if ($a.Prev -and -not $a.EnterDefault) { $n = [int]$a.Prev.Result }
+    $lab = '0'
+    if ($n -ge 0) { $lab = "$($n + 1)" }
+    return (T 'Type a number and press Enter (just Enter = {0})' $lab)
+  }
+  if ($a.Kind -eq 'episodes') {
+    $d = Get-EpisodeDefaultText $a.List $a.DefPos
+    if ($a.Prev) { $d = T '{0}, as before' $a.Prev.Label }
+    return (T 'Type and press Enter (just Enter = {0})' $d)
+  }
+  return [string]$a.Prompt
+}
+
+# One reply: the console's key reader, or (no console) the plain line reader, where a typed '<' / '>' means Back /
+# Forward. Later the control window's answers come in here too.
+function Read-AskReply($a) {
+  $prompt = Get-AskPrompt $a
+  if ($script:HasConsole -or $script:KeySource) {
+    $pre = ''
+    if ($a.Kind -eq 'text' -and $a.Prev -and -not $a.Secret -and -not $a.Private) { $pre = [string]$a.Prev.Stored }
+    $r = Read-AskLine $prompt $pre -Nav:([bool]$a.NavOn) -Secret:([bool]$a.Secret)
+    return @{ Nav = $r.Nav; Text = $r.Text; Typed = $false; Prefilled = [bool]$pre }
+  }
+  $t = Read-Host $prompt
+  return @{ Nav = ''; Text = [string]$t; Typed = $true; Prefilled = $false }
+}
+
+# A reply -> @{ Act = 'value' | 'back' | 'forward' | 'home' | 'again'; ... }. Typed answers give exactly what they gave
+# before; the typed back words (b, back, the Cyrillic i = the B key on a Russian layout, "nazad") count only in number,
+# episode and yes/no questions where Back means something, and before the yes/no testers ("nazad" starts with "n").
+function Resolve-AskReply($a, $reply) {
+  if ($reply.Nav) { return @{ Act = [string]$reply.Nav } }
+  $t = [string]$reply.Text
+  $tt = $t.Trim()
+  if ($reply.Typed -and $a.NavOn) {
+    if ($tt -eq '<') { return @{ Act = 'back' } }
+    if ($tt -eq '>') { return @{ Act = 'forward' } }
+  }
+  if ($a.Kind -ne 'text' -and $a.BackMode -and $tt -match '^(?i)(?:b|back|\u0438|\u043d\u0430\u0437\u0430\u0434)$') { return @{ Act = 'back' } }
+  # (Just Enter = the earlier answer, except where Enter has its own meaning: a hidden text answer's empty answer
+  # ('keep the saved one' / 'skip'; Right arrow gives the earlier one) and -EnterDefault lists like the settings menu.)
+  $hidden = ($a.Kind -eq 'text' -and ($a.Secret -or $a.Private))
+  if (-not $tt -and $a.Prev -and -not $reply.Prefilled -and -not $hidden -and -not $a.EnterDefault) { $r = $a.Prev.Clone(); $r.Act = 'value'; return $r }
+  if ($a.Kind -eq 'choice') {
+    if (-not $tt) { return (Get-AskValue $a ([int]$a.Default)) }
+    $n = 0
+    if ([int]::TryParse($tt, [ref]$n)) {
+      if ($n -eq 0 -and (Test-AskZeroBack $a)) { return @{ Act = 'back' } }
+      if ($a.AllowNone -and $n -eq 0) { return (Get-AskValue $a (-1)) }
+      if ($n -ge 1 -and $n -le @($a.Options).Count) { return (Get-AskValue $a ($n - 1)) }
+    }
+    return @{ Act = 'again'; Msg = (T '   Please type one of the numbers above.') }
+  }
+  if ($a.Kind -eq 'episodes') {
+    $p = @(ConvertFrom-EpisodeText $a.List $a.DefPos $t)
+    if ($p.Count -gt 0) { return (Get-AskValue $a $p $t) }
+    return @{ Act = 'again'; Msg = (T '   Please type episode numbers from the list.') }
+  }
+  if ($a.Kind -eq 'yesno') {
+    if ($a.DefaultYes) { return (Get-AskValue $a (-not (Test-AnswerNo $t))) }
+    return (Get-AskValue $a ([bool](Test-AnswerYes $t)))
+  }
+  return (Get-AskValue $a $t)
+}
+
+function Add-NavTape($f, $a, $res) {
+  $e = @{ Key = $a.CheckKey; Value = $res.Stored; Label = $res.Label; Secret = ([bool]$a.Secret -or [bool]$a.Private); Kind = $a.Kind }
+  # The earlier answers ahead (Forward): this question's is used up, the later ones stay as suggestions even when this
+  # answer changed (each is offered only to the same question with a value that still fits, see Invoke-Ask). A
+  # question that had none ahead means the flow went another way: the rest is dropped.
+  if ($f.Redo.Count -gt 0) {
+    if ($a.RedoHit) { $f.Redo.RemoveAt(0) } else { $f.Redo.Clear() }
+  }
+  $n = $f.Tape.Count
+  # A text question asked again right away (the answer didn't fit) keeps one entry.
+  if ($a.Kind -eq 'text' -and $n -gt 0 -and $f.Tape[$n - 1].Kind -eq 'text' -and $f.Tape[$n - 1].Key -ceq $e.Key) { $f.Tape[$n - 1] = $e }
+  else { [void]$f.Tape.Add($e) }
+  $f.Pos = $f.Tape.Count
+}
+
+# The one place that asks. Returns the answer (choice: 0-based index or -1; episodes: the list items; yesno: bool;
+# text: the string). Inside a flow: replays the tape, records the answer, and throws for Back / Home.
+function Invoke-Ask($a) {
+  if ($script:NavSignal) { throw (New-NavCancel) }
+  $f = $script:Nav
+  $step = ($null -ne $f -and -not $f.Sealed)
+  $a.CheckKey = Get-AskCheckKey $a
+  $script:NavAskSeq++
+  $a.Id = 'm' + $script:NavAskSeq
+  if ($step -and $f.Pos -lt $f.Target) {
+    $e = $f.Tape[$f.Pos]
+    if ($e.Key -ceq $a.CheckKey) {
+      $r = ConvertFrom-AskValue $a $e.Value
+      if ($r.Ok) { $f.Pos++; return $r.Result }
+    }
+    # This time the flow went another way (a page answered differently): stop replaying and ask from here on.
+    Write-LogLine '  (replay stopped: the questions changed)'
+    $f.Tape.RemoveRange($f.Pos, $f.Tape.Count - $f.Pos)
+    $f.Redo.Clear()
+    $f.Target = $f.Pos
+  }
+  if ($step) { $f.Replaying = $false }
+  $sealed = Test-NavSealed
+  $a.Prev = $null
+  $a.RedoHit = $false
+  if ($step -and $f.Redo.Count -gt 0 -and $f.Redo[0].Key -ceq $a.CheckKey) {
+    $a.RedoHit = $true
+    $r = ConvertFrom-AskValue $a $f.Redo[0].Value
+    if ($r.Ok) { $a.Prev = $r }
+  }
+  # The same text question asked again right away (the caller said "try again"): the last tape entry is the answer
+  # that didn't fit. Back skips it (it goes to the question before), and the path doesn't show it.
+  $rej = $false
+  $n = 0
+  if ($step) {
+    $n = $f.Tape.Count
+    if ($a.Kind -eq 'text' -and $n -gt 0 -and $f.Tape[$n - 1].Kind -eq 'text' -and $f.Tape[$n - 1].Key -ceq $a.CheckKey) { $rej = $true; $n-- }
+  }
+  $a.BackMode = ''
+  if ($step -and $n -gt 0) { $a.BackMode = 'back'; $a.BackLabel = T 'Back' }
+  elseif ($step -and -not $f.Own) { $a.BackMode = 'leave'; $a.BackLabel = T 'Cancel' }
+  elseif ($a.HasEsc) { $a.BackMode = 'esc'; $a.BackLabel = (Get-AskEscValue $a).Label }
+  elseif ($f -and $sealed) { $a.BackMode = 'saved' }
+  $a.CanBack = [bool]$a.BackMode
+  $a.CanForward = [bool]$a.Prev
+  $a.NavOn = ($a.CanBack -or $a.CanForward)
+  $a.Crumb = ''
+  if ($step -and $n -gt 0) { $a.Crumb = Get-NavCrumb $f $n }
+  Show-AskBody $a
+  $res = $null
   while ($true) {
-    $k = $null
-    try {
-      while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Start-Sleep -Milliseconds 40 }
-      $k = [Console]::ReadKey($true)
-    } catch { break }
-    if ($k.Key -eq [ConsoleKey]::Enter) { break }
-    if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { Write-Host ''; Stop-ByCtrlC }
-    if ($k.Key -eq [ConsoleKey]::Backspace) {
-      if ($sb.Length -gt 0) { $sb.Length = $sb.Length - 1; Write-Host ([string][char]8 + ' ' + [string][char]8) -NoNewline }
-      continue
+    $res = Resolve-AskReply $a (Read-AskReply $a)
+    if ($res.Act -eq 'again') { if ($res.Msg) { Say $res.Msg 'Yellow' }; continue }
+    if ($res.Act -eq 'forward') {
+      if (-not $a.Prev) { Show-NavHint (T '  (Nothing to go forward to.)'); continue }
+      $res = $a.Prev.Clone()
+      $res.Act = 'value'
     }
-    if ($k.Key -eq [ConsoleKey]::Escape) {
-      while ($sb.Length -gt 0) { $sb.Length = $sb.Length - 1; Write-Host ([string][char]8 + ' ' + [string][char]8) -NoNewline }
-      continue
+    if ($res.Act -eq 'home') {
+      # (Not out of a locked task, nor out of one that can't be left: there Home is one step back.)
+      if ($step -and -not $sealed -and -not $f.Own) { Set-NavSignal 'home' $f; throw (New-NavCancel) }
+      $res = @{ Act = 'back' }
     }
-    if ([int]$k.KeyChar -ge 32) { [void]$sb.Append($k.KeyChar); Write-Host ([string]$k.KeyChar) -NoNewline }
+    if ($res.Act -eq 'back') {
+      if ($a.BackMode -eq 'back') {
+        if ($rej) { $f.Tape.RemoveAt($f.Tape.Count - 1) }
+        $last = $f.Tape[$f.Tape.Count - 1]
+        $f.Tape.RemoveAt($f.Tape.Count - 1)
+        $f.Redo.Insert(0, $last)
+        $f.Target = $f.Tape.Count
+        Set-NavSignal 'back' $f
+        throw (New-NavCancel)
+      }
+      if ($a.BackMode -eq 'leave') { Set-NavSignal 'leave' $f; throw (New-NavCancel) }
+      if ($a.BackMode -eq 'esc') { $res = Get-AskEscValue $a }
+      else {
+        if ($a.BackMode -eq 'saved') { Show-NavHint (T '  (Already saved - that step can''t be undone. M = menu to change it.)') }
+        continue
+      }
+    }
+    break
   }
-  Write-Host ''
-  return $sb.ToString()
+  if ($step) { Add-NavTape $f $a $res }
+  return $res.Result
+}
+
+function Copy-NavValue($v) {
+  if ($v -is [array] -or $v -is [hashtable]) { return , $v.Clone() }
+  return , $v
+}
+
+# What a re-run starts from: the named $script: variables, the queue, and (-Cfg) the config as JSON.
+function Save-NavSnap($f, [string[]]$names, [bool]$cfg) {
+  foreach ($n in @($names)) {
+    if (-not $n -or $f.SnapVars.ContainsKey($n)) { continue }
+    $v = $null
+    $var = Get-Variable -Name $n -Scope Script -ErrorAction SilentlyContinue
+    if ($var) { $v = $var.Value }
+    $f.SnapVars[$n] = (Copy-NavValue $v)
+  }
+  if ($cfg -and $null -eq $f.CfgJson -and $script:Cfg) { $f.CfgJson = ($script:Cfg | ConvertTo-Json -Depth 8 -Compress) }
+  if ($null -eq $f.QueueSnap -and $null -ne $script:Queue) { $f.QueueSnap = @($script:Queue.ToArray()); $f.QueueFinished = $script:QueueFinished }
+}
+
+# The config back as it was, in the same object (other code holds $script:Cfg), property by property.
+function Restore-NavCfg([string]$json) {
+  if (-not $json -or -not $script:Cfg) { return }
+  if (($script:Cfg | ConvertTo-Json -Depth 8 -Compress) -ceq $json) { return }
+  $o = $json | ConvertFrom-Json
+  $names = @($o.PSObject.Properties | ForEach-Object { $_.Name })
+  foreach ($p in @($script:Cfg.PSObject.Properties)) { if ($names -notcontains $p.Name) { $script:Cfg.PSObject.Properties.Remove($p.Name) } }
+  foreach ($p in $o.PSObject.Properties) {
+    $q = $script:Cfg.PSObject.Properties[$p.Name]
+    if ($q) { $q.Value = $p.Value } else { $script:Cfg | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value }
+  }
+}
+
+function Restore-NavSnap($f) {
+  foreach ($n in @($f.SnapVars.Keys)) { Set-Variable -Name $n -Scope Script -Value (Copy-NavValue $f.SnapVars[$n]) }
+  if ($null -ne $f.QueueSnap -and $null -ne $script:Queue) {
+    $script:Queue.Clear()
+    if ($f.QueueSnap.Count -gt 0) { $script:Queue.AddRange($f.QueueSnap) }
+    $script:QueueFinished = $f.QueueFinished
+  }
+  if ($f.CfgJson) { Restore-NavCfg $f.CfgJson }
+}
+
+# Runs a task's questions as a flow (see above). -Origin: start | waiting | menu | addwin (the path's first word).
+# -Snap: the $script: variable names the body sets as answers (site flows: DubChoice, DubPref, LastDub, LastEps,
+# LastPart, LastPlayer, LastSearchLink, SiteChoice). -Cfg: the body changes $script:Cfg. -Own: Back at its first
+# question doesn't leave it (Esc there = the question's -Esc answer, or nothing). Locals are $__af-prefixed: the body
+# runs in a scope below this function and reads the caller's variables through it. Returns @{ Nav; Value }.
+function Invoke-NavFlow {
+  param([Alias('Name')][string]$__afName = 'flow', [Alias('Origin')][string]$__afOrigin = 'start', [Alias('Snap')][string[]]$__afSnap = @(),
+    [Alias('Cfg')][switch]$__afCfg, [Alias('Own')][switch]$__afOwn, [Alias('Body')][scriptblock]$__afBody)
+  $__afTop = $script:Nav
+  if ($__afTop -and -not $__afTop.Sealed) {
+    # Inside an open flow: one tape, so Back goes from this flow's first question to the one before it.
+    Save-NavSnap $__afTop $__afSnap ([bool]$__afCfg)
+    $__afV = & $__afBody
+    return @{ Nav = ''; Value = $__afV }
+  }
+  $__afF = @{ Name = $__afName; Origin = $__afOrigin; Own = [bool]$__afOwn; Parent = $__afTop; Sealed = $false
+    Tape = (New-Object System.Collections.ArrayList); Redo = (New-Object System.Collections.ArrayList); Pos = 0; Target = 0
+    Replaying = $false; Memo = $null; SnapVars = @{}; CfgJson = $null; QueueSnap = $null; QueueFinished = $false }
+  if (-not $__afTop) { $__afF.Memo = New-Object 'System.Collections.Generic.Dictionary[string,object]' }
+  Save-NavSnap $__afF $__afSnap ([bool]$__afCfg)
+  $script:Nav = $__afF
+  try {
+    while ($true) {
+      $__afF.Pos = 0
+      $script:NavPass++
+      $__afV = $null
+      try { $__afV = & $__afBody }
+      catch { if ($script:CtrlCQuit -or -not $script:NavSignal) { throw } }
+      $__afF.Replaying = $false
+      $__afSig = $script:NavSignal
+      if (-not $__afSig) { return @{ Nav = ''; Value = $__afV } }
+      if (-not [object]::ReferenceEquals($script:NavSignalFrame, $__afF)) { throw (New-NavCancel) }
+      Write-LogLine ('  (' + $__afSig + ': ' + $__afName + ')')
+      Restore-NavSnap $__afF
+      if ($__afSig -eq 'back') {
+        $script:NavSignal = ''
+        $script:NavSignalFrame = $null
+        $__afF.Replaying = $true
+        continue
+      }
+      if ($__afSig -eq 'home' -and $__afF.Parent) { $script:NavSignalFrame = $__afF.Parent; throw (New-NavCancel) }
+      $script:NavSignal = ''
+      $script:NavSignalFrame = $null
+      return @{ Nav = $__afSig; Value = $null }
+    }
+  } finally {
+    $script:Nav = $__afF.Parent
+    if ([object]::ReferenceEquals($script:NavSignalFrame, $__afF)) { $script:NavSignal = ''; $script:NavSignalFrame = $null }
+  }
+}
+
+# A step that can't be undone happened (config saved, code imported, files written, handed over): no Back crosses it.
+function Lock-NavStep {
+  $f = $script:Nav
+  if ($f -and -not $f.Sealed) {
+    $f.Sealed = $true
+    $f.Replaying = $false
+    $f.Redo.Clear()
+    Write-LogLine ('  (saved: ' + $f.Name + ')')
+  }
+}
+
+# Is a flow re-running its earlier answers (Say only writes log.txt then)?
+function Test-NavReplaying { return ($null -ne $script:Nav -and [bool]$script:Nav.Replaying) }
+
+# What a flow fetched once it gets again on a re-run (Back), with no network. Outside a flow it just runs.
+# Errors are kept too, so a re-run takes the same way (e.g. the same fallback player); in the same run they are not
+# (Test-NavMemoUse), so a site's own retry right after a failure goes to the network again. -Seconds: fetched again after
+# that long (live data, e.g. a WPARTY room's position). Returns the items (callers wrap it in @()).
+function Use-NavMemo {
+  param([Parameter(Position = 0)][Alias('Key')][string]$__amKey, [Parameter(Position = 1)][Alias('Script')][scriptblock]$__amScript,
+    [Alias('Seconds')][int]$__amTtl = 0)
+  $__amRoot = Get-NavRoot
+  if (-not $__amRoot) { return (& $__amScript) }
+  $__amK = 'memo|' + $__amKey
+  $__amHit = $null
+  if ($__amRoot.Memo.TryGetValue($__amK, [ref]$__amHit) -and (Test-NavMemoUse $__amHit)) {
+    if ($__amHit.Err) { throw $__amHit.Err }
+    return $__amHit.Res
+  }
+  $__amUntil = $null
+  if ($__amTtl -gt 0) { $__amUntil = (Get-Date).AddSeconds($__amTtl) }
+  try { $__amRes = @(& $__amScript) }
+  catch {
+    if (-not (Test-NavAbort)) { $__amRoot.Memo[$__amK] = @{ Err = $_.Exception; Res = $null; Until = $__amUntil; Fail = $true; Pass = $script:NavPass } }
+    throw
+  }
+  $__amRoot.Memo[$__amK] = @{ Err = $null; Res = $__amRes; Until = $__amUntil; Fail = $false; Pass = $script:NavPass }
+  return $__amRes
 }
 
 function Read-Progress([string]$file) {
@@ -4352,7 +5263,7 @@ function Resolve-Cmd($c, [string]$kind, [ref]$why) {
     'content' { @('pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'sync', 'lost', 'restart', 'playnow') }
     'paused' { @('resume', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow') }
     'hold' { @('start', 'pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow') }
-    default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest') }
+    default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest', 'lang', 'forget', 'menu') }
   }
   # The waiting screen while a torrent episode downloads for its turn: S S gives that episode up.
   if ($kind -eq 'waiting' -and (Get-WaitingSkipItem)) { $fits = @($fits) + @('skip') }
@@ -4456,16 +5367,20 @@ function Open-ViewerPreview {
 function Read-KeyCommand([string]$kind) {
   if (-not $script:HasConsole) { return $null }
   $keys = New-Object System.Collections.Generic.List[System.ConsoleKeyInfo]
+  # (Keys the question reader took off the console but didn't use, e.g. an Enter right after the Esc that left a
+  # flow: they belong to this screen now, not to a later question.)
+  foreach ($k in $script:NavKeyAhead) { $keys.Add([System.ConsoleKeyInfo]$k) }
+  $script:NavKeyAhead.Clear()
   try {
-    if (-not [Console]::KeyAvailable) { return $null }
+    if ($keys.Count -eq 0 -and -not [Console]::KeyAvailable) { return $null }
     $quietUntil = (Get-Date).AddMilliseconds(40)
     while ((Get-Date) -lt $quietUntil) {
       if ([Console]::KeyAvailable) { $keys.Add([Console]::ReadKey($true)); $quietUntil = (Get-Date).AddMilliseconds(40) }
       else { Start-Sleep -Milliseconds 5 }
     }
-  } catch { return $null }
+  } catch { if ($keys.Count -eq 0) { return $null } }
   foreach ($k in $keys) {
-    if ($k.Key -eq [ConsoleKey]::C -and ($k.Modifiers -band [ConsoleModifiers]::Control)) { $script:TypeBuf = ''; $script:Armed = $null; return (New-Cmd 'quit') }
+    if (Test-CtrlCKey $k) { $script:TypeBuf = ''; $script:Armed = $null; return (New-Cmd 'quit') }
   }
   if ($keys.Count -eq 1 -and $script:TypeBuf.Length -eq 0) {
     $k = $keys[0]
@@ -4727,9 +5642,12 @@ function Select-Resolution {
   $ci = [array]::IndexOf($hs, $cur)
   if ($ci -lt 0) { $ci = 0; Say (T 'Now: {0}p (set in config.json).' $cur) 'Gray' }
   Say ''
-  $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false
+  # (Esc = keep the size as it is: not offered when config.json's size isn't in the list, so Esc can't pick Auto.)
+  if ([array]::IndexOf($hs, $cur) -ge 0) { $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false -Key 'res' -Values $hs -Esc $ci }
+  else { $i = Read-Choice (T 'Which picture size should the stream have?') $opts $ci $false -Key 'res' -Values $hs }
   $h = $hs[$i]
   if ($h -eq $cur) { return $false }
+  Lock-NavStep
   $val = 'auto'
   if ($h -gt 0) { $val = $h }
   if ($script:Cfg.PSObject.Properties['Height']) { $script:Cfg.Height = $val } else { $script:Cfg | Add-Member -NotePropertyName Height -NotePropertyValue $val }
@@ -5164,9 +6082,9 @@ function Get-StatusText([string]$kind, $src, $media, [double]$pos, $speed, $hold
   if ($kind -eq 'hold') { return (Get-HoldText $hold $media $holdAt) }
   $nx = $null
   if ($script:Idx -lt $script:Queue.Count) { $nx = $script:Queue[$script:Idx] }
-  if ($nx -and $nx.State -eq 'downloading') { return (T '  Waiting screen is on. Next: {0}   Q Q = end' (Get-DownloadText $nx)) }
-  if ($nx) { return (T '  Waiting screen is on. Getting {0} ready...   Q Q = end' $nx.Name) }
-  return (T '  Waiting screen is on. Type a title or paste a link + Enter (Enter alone = pick files).   Q Q = end')
+  if ($nx -and $nx.State -eq 'downloading') { return ((T '  Waiting screen is on. Next: {0}   Q Q = end' (Get-DownloadText $nx)) + (T '   M = menu')) }
+  if ($nx) { return ((T '  Waiting screen is on. Getting {0} ready...   Q Q = end' $nx.Name) + (T '   M = menu')) }
+  return ((T '  Waiting screen is on. Type a title or paste a link + Enter (Enter alone = pick files).   Q Q = end') + (T '   M = menu'))
 }
 
 function Show-Panel {
@@ -5398,7 +6316,7 @@ function Invoke-Source {
         }
       }
       $st = Get-StatusText $Kind $src $Media ($Start + $pos) $speed $Hold $holdAt
-      Show-Status $st
+      Show-Status (Join-StatusKeys $st (T '   M = menu'))
       $script:LastStatus = $st
     }
     if ($now -ge $nextPanel) {
@@ -5538,6 +6456,7 @@ function Show-Controls {
   Say (T '  Controls:  Space = pause / continue    Left / Right = 10 s back / forward (Shift: 30 s)') 'DarkCyan'
   Say (T '             S S = next video    Q Q = stop (then pick something else)    R R = resync everyone') 'DarkCyan'
   Say (T '             + = search / add in a second window    F2 = control window with preview') 'DarkCyan'
+  Say (T '             M + Enter = settings menu (while nothing plays)') 'DarkCyan'
 }
 
 # Stops what plays and empties the queue; the stream stays on the air with the waiting screen, and the window
@@ -5687,6 +6606,7 @@ function Invoke-Queue {
         Say (T 'Queue finished. The stream stays live with a "Next video starting soon" screen,') 'Cyan'
         Say (T 'so viewers stay connected. To keep going, type a title or paste a link here and press') 'Gray'
         Say (T 'Enter (or drop videos on the .bat file). Q Q = end. It ends by itself after {0} idle minutes.' ($script:IdleMinutes.ToString($script:Inv))) 'Gray'
+        Say (T 'M + Enter = the settings menu (where to stream, picture size, speed test, new link, language).') 'Gray'
       }
       $r = Invoke-Source -Kind 'waiting' -UntilNextReady
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { break }
@@ -5702,13 +6622,10 @@ function Invoke-Queue {
       # The Settings menus ask in this window: the waiting screen goes on meanwhile (a server drops viewers of a
       # stream that stops sending). A menu that changes the stream stops / restarts it itself.
       $lost = ($r.Outcome -eq 'relay')
-      if (@('host', 'newlink', 'res', 'speedtest') -contains $r.Outcome) {
+      if (@(Get-MenuItems -WithMenu | ForEach-Object { $_.Id }) -contains $r.Outcome) {
         $alive = Test-RelayAlive
         if ($alive) { Start-Standby }
-        if ($r.Outcome -eq 'host') { Invoke-HostMenu }
-        elseif ($r.Outcome -eq 'newlink') { Invoke-NewLinkMenu }
-        elseif ($r.Outcome -eq 'res') { Invoke-ResolutionMenu }
-        else { Invoke-SpeedTestMenu }
+        Invoke-MenuAction $r.Outcome
         # (The connection broke while the menu waited: reconnect as below, instead of ending the stream.)
         $lost = $alive -and -not (Test-RelayAlive)
         if (-not $lost) { continue }
@@ -6048,12 +6965,12 @@ function Start-HostServer {
   $p = $script:HostP
   # My VPS: ask the server first (does it answer, know this PC's link and take its password; is anyone else on it?).
   if ($p -and $p.Id -eq 'vps' -and (Get-Command Test-VpsReady -CommandType Function -ErrorAction SilentlyContinue)) {
-    try { return (Test-VpsReady $p) } catch { if ($script:CtrlCQuit) { throw }; return $true }
+    try { return (Test-VpsReady $p) } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; return $true }
   }
   if (-not $p -or -not $p.UsesMediaMtx) { return $true }
   $s = Get-Prop $script:Cfg 'SelfHost'
   $exe = $null
-  try { $exe = Get-MediaMtxExe (Test-CanAsk) } catch { Say $_.Exception.Message 'Yellow' }
+  try { $exe = Get-MediaMtxExe (Test-CanAsk) } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say $_.Exception.Message 'Yellow' }
   if (-not $exe) { Say (T 'Streaming from this PC needs MediaMTX, so this time it streams through Topaz Chat (H on the start screen = change).') 'Yellow'; return $false }
   $ports = @([int]$s.RtspPort, [int]$s.RtmpPort)
   # (Not the HLS port: on this PC HLS listens on 127.0.0.1 only, for Tailscale Funnel, so nothing outside needs it.)
@@ -6067,7 +6984,7 @@ function Start-HostServer {
   }
   if ($cg -and $cg.Verdict -eq 'cgnat' -and (Test-CanAsk)) {
     $pick = Read-Choice (T 'Stream from this PC anyway?') @((T 'No - stream through Topaz Chat this time'), (T 'No - always stream through Topaz Chat (don''t ask again; H = change the host)'),
-      (T 'Yes - only the IPv6 link can work'), (T 'Choose another host')) 0 $false
+      (T 'Yes - only the IPv6 link can work'), (T 'Choose another host')) 0 $false -Esc 0
     if ($pick -eq 0) { return $false }
     if ($pick -eq 1) {
       # Remembered: the next starts skip this check (and its few seconds) and go straight to Topaz Chat.
@@ -6090,8 +7007,7 @@ function Start-HostServer {
   $up = Get-Prop $s 'Upnp'
   if (-not ($cg -and $cg.Verdict -eq 'cgnat')) {
     if ($null -eq $up -and (Test-CanAsk)) {
-      $ans = Read-Host (T 'Open the port(s) {0} on your router automatically (UPnP)? They are closed again when you stop. [y/N]' (($ports | ForEach-Object { "$_" }) -join ', '))
-      $up = (Test-AnswerYes $ans)
+      $up = Read-YesNoUi (T 'Open the port(s) {0} on your router automatically (UPnP)? They are closed again when you stop. [y/N]' (($ports | ForEach-Object { "$_" }) -join ', ')) $false -Esc $false
       $s.Upnp = $up
       try { Save-Config $script:Cfg } catch {}
     }
@@ -6122,6 +7038,7 @@ function Stop-HostServer {
 # Makes the host in config.json the active one: its links, bitrate and (for this PC) its server.
 $script:HostFallback = $false
 function Set-ActiveHost {
+  Lock-NavStep   # (starting a host can't be undone: its questions are one-off ones, Esc = their safe answer)
   if (-not (Test-HostModule)) { Update-StreamQuality; $script:ShownLink = Get-ShownLink; return }
   $script:HostP = Get-HostProfile
   $script:HostFallback = $false
@@ -6130,7 +7047,7 @@ function Set-ActiveHost {
   # (Compared as a string: in PowerShell $true -eq 'menu' is true.)
   if ($ok -is [string] -and $ok -eq 'menu') {
     Stop-HostServer
-    if (Select-Host) { Set-ActiveHost; return }
+    if (Invoke-HostChoice) { Set-ActiveHost; return }
     $ok = Start-HostServer
   }
   if (-not ($ok -is [bool] -and $ok)) {
@@ -6150,14 +7067,25 @@ function Reset-VrcPlayer {
   $script:Players = @{}
 }
 
+# The host menu as a flow: Back inside its questions; Esc (or 0) at "Where should the stream go?" leaves it with
+# nothing saved and nothing restarted (the config goes back to how it was). $true = the host or its links changed.
+function Invoke-HostChoice {
+  $r = Invoke-NavFlow -Name 'host' -Origin 'menu' -Cfg -Body { Select-Host }
+  if ($r.Nav) { return $false }
+  return [bool](@($r.Value) | Select-Object -Last 1)
+}
+
 # The host menu (H): another host means another link; viewers get the new one.
 function Invoke-HostMenu {
   if (-not (Test-HostModule) -or -not $script:HostP) { return }
   $was = $script:PromptOk
   $script:PromptOk = $true
   try {
-    $changed = Select-Host
+    $changed = Invoke-HostChoice
     if ($changed) {
+      # (A restart can't be undone: no Back crosses it, so the server's questions below are one-off ones with their Esc
+      # answers, also when the same host was picked again after a fallback to Topaz and nothing was saved.)
+      Lock-NavStep
       Stop-Relay
       Stop-HostServer
       Set-ActiveHost
@@ -6211,7 +7139,7 @@ function Invoke-SpeedTestMenu {
     $watched = $wasOn
     $testRan = @{ Yes = $false }
     $r = $null
-    try { $r = Invoke-SpeedTest $script:HostP -BeforeRun { $testRan.Yes = $true; Stop-Relay } -ViewersWatch:$watched } catch { if ($script:CtrlCQuit) { throw }; Say (T '  The speed test didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+    try { $r = Invoke-SpeedTest $script:HostP -BeforeRun { Lock-NavStep; $testRan.Yes = $true; Stop-Relay } -ViewersWatch:$watched } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  The speed test didn''t work: {0}' $_.Exception.Message) 'Yellow' }
     # (Also a relay that ended by itself while the question waited: Start-Standby below starts a new one.)
     $stopped = $wasOn -and -not (Test-RelayAlive)
     if ($testRan.Yes) {
@@ -6292,13 +7220,13 @@ function Invoke-ResumeOffer([int]$from = 0) {
   for ($i = $from; $i -lt $script:Queue.Count; $i++) {
     $it = $script:Queue[$i]
     if (($it.Kind -eq 'file' -or $it.Kind -eq 'site') -and [string]::Equals($it.Source, [string]$st.Path, [System.StringComparison]::OrdinalIgnoreCase)) {
-      $ans = 'n'
-      if ($env:VRCLM_RESUME) { $ans = $env:VRCLM_RESUME }
+      $yes = $false
+      if ($env:VRCLM_RESUME) { $yes = -not (Test-AnswerNo $env:VRCLM_RESUME) }
       elseif ($script:Interactive) {
         Say ''
-        $ans = Read-Host (T 'Last time you stopped ''{0}'' at {1}. Continue from there? [Y/n]' $it.Name (Format-Time $pos))
+        $yes = Read-YesNoUi (T 'Last time you stopped ''{0}'' at {1}. Continue from there? [Y/n]' $it.Name (Format-Time $pos)) $true -Esc $false
       }
-      if (-not (Test-AnswerNo $ans)) {
+      if ($yes) {
         if ($i -gt $from) { $script:Queue.RemoveRange($from, $i - $from) }
         $it.ResumeAt = [Math]::Max(0.0, $pos - 5)
       }
@@ -6345,47 +7273,67 @@ function Main {
     try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - add to the stream') } catch {}
     # config.json's "DubPriority" and "Player" count here too (only read: the streaming window owns the file).
     if ([System.IO.File]::Exists((Get-ConfigPath))) { try { $script:Cfg = Get-Config } catch {} }
-    if ($entries.Count -eq 0) { $entries = @(Read-Entries) }
-    if ($entries.Count -eq 1 -and (Test-IsTitle ([string]$entries[0]))) { $entries = @([string]$entries[0]) }
+    $script:AddMode = $true
+    # The questions (search, voice-over, episodes, player, now or after) run as one flow: Esc goes back, Esc at the
+    # first one returns to '>' with the text kept, and nothing found asks again. Esc on an empty '>' closes the window.
+    # Only what the flow ends with is handed over (Add-ToQueueFile, after it).
+    $prefill = ''
+    if ($entries.Count -eq 1) { $prefill = [string]$entries[0] }
+    $again = ($script:Interactive -and ($script:HasConsole -or $script:KeySource))
     $abs = @()
-    foreach ($e in $entries) {
-      $t = "$e".Trim().Trim('"')
-      if (Test-TorrentLink $t) {
-        # A torrent (magnet, bare hash, .torrent file or link): its file list and which episodes are asked here; the
-        # streaming window gets the link with the episodes (a bare hash as a magnet link, a file with its full path).
-        if ($script:Interactive) {
-          try {
-            $its = @(Expand-Torrent $t)
-            if ($its.Count -gt 0) { $abs += (Get-TorrentHandover $its $t) }
-          } catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow' }
-        } else { $abs += (Get-TorrentHandover @() $t) }
-        continue
+    while ($true) {
+      if ($entries.Count -eq 0) {
+        $entries = @(Read-Entries $prefill)
+        $prefill = $script:EntryLine
       }
-      if ($script:Interactive -and $t -notmatch '^(?i)[a-z][a-z0-9+.-]*://' -and (Test-IsTitle $t)) {
-        # A title: search, pick, answer the questions here; the streaming window gets the link with the answers.
-        $script:LastSearchLink = $null
-        try { [void](Invoke-ContentSearch $t -AskPlayer) } catch { if ($script:CtrlCQuit) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
-        if ($script:LastSearchLink) { $abs += $script:LastSearchLink }
-        continue
-      }
-      if ($t -match '^(?i)[a-z][a-z0-9+.-]*://') {
-        if ($script:Interactive -and (Test-SiteLink $t)) {
-          # The running window can't ask which voice-over / episodes: ask here and hand the answers over.
-          try {
-            $script:LastDub = $null; $script:LastEps = $null; $script:LastPlayer = $null
-            $its = @(Expand-SiteLink $t)
-            if ($its.Count -eq 0) { continue }
-            Read-HandoverPlayer $its
-            $choice = Get-SiteChoiceText $its
-            if ($choice) { $t = $t + '#vrclm=' + $choice }
-          } catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow'; continue }
+      if ($entries -contains $script:QuitMark) { $script:NoPause = $true; return }
+      if ($entries.Count -eq 1 -and (Test-IsTitle ([string]$entries[0]))) { $entries = @([string]$entries[0]) }
+      $r = Invoke-NavFlow -Name 'add' -Origin 'addwin' -Snap $script:SiteAnswerVars -Body {
+        $abs = @()
+        foreach ($e in $entries) {
+          $t = "$e".Trim().Trim('"')
+          if (Test-TorrentLink $t) {
+            # A torrent (magnet, bare hash, .torrent file or link): its file list and which episodes are asked here; the
+            # streaming window gets the link with the episodes (a bare hash as a magnet link, a file with its full path).
+            if ($script:Interactive) {
+              try {
+                $its = @(Expand-Torrent $t)
+                if ($its.Count -gt 0) { $abs += (Get-TorrentHandover $its $t) }
+              } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow' }
+            } else { $abs += (Get-TorrentHandover @() $t) }
+            continue
+          }
+          if ($script:Interactive -and $t -notmatch '^(?i)[a-z][a-z0-9+.-]*://' -and (Test-IsTitle $t)) {
+            # A title: search, pick, answer the questions here; the streaming window gets the link with the answers.
+            $script:LastSearchLink = $null
+            try { [void](Invoke-ContentSearch $t -AskPlayer) } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+            if ($script:LastSearchLink) { $abs += $script:LastSearchLink }
+            continue
+          }
+          if ($t -match '^(?i)[a-z][a-z0-9+.-]*://') {
+            if ($script:Interactive -and (Test-SiteLink $t)) {
+              # The running window can't ask which voice-over / episodes: ask here and hand the answers over.
+              try {
+                $script:LastDub = $null; $script:LastEps = $null; $script:LastPlayer = $null
+                $its = @(Expand-SiteLink $t)
+                if ($its.Count -eq 0) { continue }
+                Read-HandoverPlayer $its
+                $choice = Get-SiteChoiceText $its
+                if ($choice) { $t = $t + '#vrclm=' + $choice }
+              } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow'; continue }
+            }
+            $abs += $t
+          } else { try { $abs += [System.IO.Path]::GetFullPath($t) } catch {} }
         }
-        $abs += $t
-      } else { try { $abs += [System.IO.Path]::GetFullPath($t) } catch {} }
-    }
-    if ($abs.Count -gt 0 -and $script:Interactive) {
-      $when = Read-Choice (T 'Play it now, or after what is queued?') @((T 'After what is queued'), (T 'Now (instead of what plays now)')) 0 $false
-      if ($when -eq 1) { $abs = @('#vrclm-now') + $abs }
+        if ($abs.Count -gt 0 -and $script:Interactive) {
+          $when = Read-Choice (T 'Play it now, or after what is queued?') @((T 'After what is queued'), (T 'Now (instead of what plays now)')) 0 $false -Key 'when'
+          if ($when -eq 1) { $abs = @('#vrclm-now') + $abs }
+        }
+        $abs
+      }
+      $abs = @($r.Value | Where-Object { $_ })
+      if ($abs.Count -gt 0 -or -not $again) { break }
+      $entries = @()   # (left, or nothing found: ask again, with the text kept)
     }
     if ($abs.Count -gt 0 -and (Add-ToQueueFile $abs)) {
       Say (T 'Added to the stream that is already running:') 'Green'
@@ -6447,12 +7395,29 @@ function Main {
 
   $script:PromptOk = $true
   try {
-    if ($entries.Count -eq 0) { $entries = @(Read-Entries) }
-    [void](Add-Entries $entries $false)
-    Receive-QueueFile
-    if ($script:Queue.Count -eq 0) { Say (T 'Nothing to stream.') 'Yellow'; return }
-    Show-Queue
-    Invoke-ResumeOffer
+    # The start screen: what to stream, then its questions as one flow (Back / Forward). Leaving the flow, or nothing
+    # to add (a typo, nothing found, "none of these"), returns to '>' with the text kept. Only Q + Enter ends here.
+    $prefill = ''
+    if ($entries.Count -eq 1) { $prefill = [string]$entries[0] }
+    $again = ($script:Interactive -and ($script:HasConsole -or $script:KeySource))
+    while ($true) {
+      if ($entries.Count -eq 0) {
+        $entries = @(Read-Entries $prefill)
+        $prefill = $script:EntryLine
+      }
+      if ($entries -contains $script:QuitMark) { Say (T 'Nothing to stream.') 'Yellow'; return }
+      [void](Invoke-NavFlow -Name 'start' -Origin 'start' -Snap $script:SiteAnswerVars -Body {
+          [void](Add-Entries $entries $false)
+          if ($script:Queue.Count -gt 0) { Show-Queue; Invoke-ResumeOffer }
+        })
+      # (What a second window handed over meanwhile: after the flow, so a Back never takes it away.)
+      $before = $script:Queue.Count
+      Receive-QueueFile
+      if ($script:Queue.Count -gt $before) { Show-Queue; Invoke-ResumeOffer $before }
+      if ($script:Queue.Count -gt 0) { break }
+      if (-not $again) { Say (T 'Nothing to stream.') 'Yellow'; return }
+      $entries = @()
+    }
   } finally { $script:PromptOk = $false }
   # Next / Stop / Resync / Settings clicked in the control window during those questions were about nothing playing
   # yet: dropped, so they don't hit the first video. Add, viewer preview and clock still happen.
