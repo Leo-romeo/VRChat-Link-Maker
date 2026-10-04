@@ -710,10 +710,13 @@ function Get-YtDlp {
   if ($canAsk -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     $script:YtDlpAsked = $true
     Say (T 'Links to web pages need yt-dlp (a free video downloader) and it is not installed yet.') 'Yellow'
+    $tos = $script:AskTimeouts
     if (Read-YesNoUi (T 'Install it now? [Y/n]') $true -Esc $false) {
       [void](Invoke-Winget 'yt-dlp.yt-dlp')
       $script:YtDlp = Find-Exe 'yt-dlp'
     }
+    # (A "no" that came from nobody answering asks again with the next link.)
+    if ($script:AskTimeouts -ne $tos) { $script:YtDlpAsked = $false }
   }
   return $script:YtDlp
 }
@@ -1382,6 +1385,7 @@ function Select-Tracks($item) {
   for ($i = 0; $i -lt $subs.Count; $i++) { if ($subs[$i].PSObject.Properties['FromSite']) { $sitePos = $i; break } }
   $aPos = Get-DefaultAudioPos $audio
   $sPos = -1
+  $noSubs = $false   # ("no subtitles" picked: this answer, or the session's)
   $canAsk = (Test-CanAsk) -and ($null -eq $script:TrackPref)
   if ($canAsk -and ($audio.Count -gt 1 -or $subs.Count -gt 0)) {
     Say ''
@@ -1411,6 +1415,7 @@ function Select-Tracks($item) {
     $p = [pscustomobject]@{ ALang = ''; ATitle = ''; APos = $aPos; SNone = ($sPos -lt 0); SLang = ''; STitle = ''; SSigns = $false; SPos = $sPos; SExternal = $false }
     if ($aPos -ge 0) { $p.ALang = $audio[$aPos].Lang; $p.ATitle = $audio[$aPos].Title }
     if ($sPos -ge 0) { $p.SLang = $subs[$sPos].Lang; $p.STitle = $subs[$sPos].Title; $p.SSigns = (Test-Signs $subs[$sPos]); $p.SExternal = ($subs[$sPos].Kind -eq 'external') }
+    $noSubs = $p.SNone
     # (Kept for the next videos only when someone answered: a question that timed out asks again next time.)
     if ($script:AskTimeouts -eq $tos) { $script:TrackPref = $p }
   } elseif ($script:TrackPref) {
@@ -1421,6 +1426,7 @@ function Select-Tracks($item) {
     }
     $aTrack = $null
     if ($aPos -ge 0) { $aTrack = $audio[$aPos] }
+    $noSubs = $p.SNone
     if ($p.SNone) { $sPos = -1 }
     elseif ($p.SExternal) {
       $sPos = -1
@@ -1437,7 +1443,7 @@ function Select-Tracks($item) {
     $sPos = Get-DefaultSubPos $subs $aTrack
   }
   # (Whatever language the sound is tagged with, unless "no subtitles" was picked.)
-  if ($sPos -lt 0 -and $sitePos -ge 0 -and -not ($script:TrackPref -and $script:TrackPref.SNone)) { $sPos = $sitePos }
+  if ($sPos -lt 0 -and $sitePos -ge 0 -and -not $noSubs) { $sPos = $sitePos }
   $item.AudioTrack = $null
   if ($aPos -ge 0 -and $aPos -lt $audio.Count) { $item.AudioTrack = $audio[$aPos] }
   $item.SubTrack = $null
