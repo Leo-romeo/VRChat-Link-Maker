@@ -765,7 +765,7 @@
   "  (Nothing to go forward to.)": "  (Вперёд пока некуда.)",
   "  (Already saved - that step can't be undone. M = menu to change it.)": "  (Уже сохранено - этот шаг не отменить. M = меню, чтобы изменить.)",
   "   0) None of these - back (or Esc)": "   0) Ни один - назад (или Esc)",
-  "  - In questions: Enter = the suggested answer, Esc = back, Right arrow = your earlier answer again, Home = cancel": "  - В вопросах: Enter = предложенный ответ, Esc = назад, стрелка вправо = прежний ответ, Home = отмена",
+  "  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel": "  - В вопросах: Enter = предложенный ответ, Esc или И = назад, стрелка вправо = прежний ответ, Home = отмена",
   "  - M = menu (all settings),  Q + Enter = end": "  - M = меню (все настройки),  Q и Enter = закончить",
   "  Q + Enter = end the stream.": "  Q и Enter = закончить трансляцию.",
   "  - Esc = close this window": "  - Esc = закрыть это окно",

@@ -194,12 +194,13 @@ function Test-ScrolledUp {
   try { return ([Console]::CursorTop -ge [Console]::WindowTop + [Console]::WindowHeight) } catch { return $false }
 }
 
-# A status line that ends in keys ("...   Q Q = end" + "   M = menu"): when it is wider than the window, the text
-# before the keys is cut ("...") instead of the keys (Show-Status cuts at the right edge).
-function Join-StatusKeys([string]$main, [string]$more) {
-  $s = $main + $more
+# A status line that ends in keys ("...   Q Q = end" + $more = "   M = menu"): when it is wider than the window, the
+# text before the keys is cut ("...") instead of the keys (Show-Status cuts at the right edge). Console only: the
+# control window gets the whole text.
+function Join-StatusKeys([string]$s, [string]$more) {
   $w = Get-ConsoleWidth
-  if ($s.Length -le $w) { return $s }
+  if ($s.Length -le $w -or -not $more -or -not $s.EndsWith($more)) { return $s }
+  $main = $s.Substring(0, $s.Length - $more.Length)
   $cut = $main.LastIndexOf('   ')
   if ($cut -le 0) { return $s }
   $tail = $main.Substring($cut) + $more
@@ -1728,7 +1729,7 @@ function Read-Entries([string]$Prefill = '') {
     $hostKeys = ((Test-HostModule) -and $script:HostP -and -not $add)
     if ($hostKeys) { Say (T '  - H = where to stream (Topaz / this PC / your VPS),  T = test your upload speed,  N = new link') 'DarkGray' }
     if (-not $add) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
-    if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
+    if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
     if ($add) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
     $line = ''
     while ($keys) {
@@ -3283,8 +3284,28 @@ $script:KeySource = $null
 $script:NavKeyAhead = New-Object System.Collections.ArrayList   # keys read while dropping repeated navigation keys
 $script:NavEscGuardMs = 400
 $script:NavRepeatMs = 200
+# A held key repeats first after the keyboard's repeat delay (Windows: 250-1000 ms, 500 by default), then every
+# NavRepeatMs or less: the same navigation key again within that delay counts as held too, unless the key was seen
+# let go meanwhile (Update-NavKeyUp, while the reader waits): then it is a new press.
+$script:NavHoldMs = 650
+try { $script:NavHoldMs = ([Math]::Min(3, [Math]::Max(0, [int](Get-ItemProperty 'HKCU:\Control Panel\Keyboard' -ErrorAction Stop).KeyboardDelay)) + 1) * 250 + 150 } catch {}
 $script:NavRepeatKey = $null
-$script:NavRepeatAt = [datetime]::MinValue
+$script:NavHeldUntil = [datetime]::MinValue
+$script:NavKeyUp = $true
+$script:NavKeyState = $null    # can the key's state be read ($null = not tried yet)
+
+function Update-NavKeyUp {
+  if ($script:NavKeyUp -or -not $script:NavRepeatKey) { return }
+  if ($null -eq $script:NavKeyState) {
+    $script:NavKeyState = $false
+    try {
+      Add-Type -Namespace VRCLinkMaker -Name KeyState -MemberDefinition '[DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);'
+      $script:NavKeyState = $true
+    } catch {}
+  }
+  if (-not $script:NavKeyState) { return }
+  try { if (([VRCLinkMaker.KeyState]::GetAsyncKeyState([int]$script:NavRepeatKey) -band 0x8000) -eq 0) { $script:NavKeyUp = $true } } catch {}
+}
 
 function Test-NavKeyWaiting {
   if ($script:NavKeyAhead.Count -gt 0) { return $true }
@@ -3295,7 +3316,7 @@ function Test-NavKeyWaiting {
 function Read-NavKey {
   if ($script:NavKeyAhead.Count -gt 0) { $k = $script:NavKeyAhead[0]; $script:NavKeyAhead.RemoveAt(0); return $k }
   if ($script:KeySource) { return (& $script:KeySource 'read') }
-  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Start-Sleep -Milliseconds 40 }
+  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
   return [Console]::ReadKey($true)
 }
 
@@ -3324,6 +3345,25 @@ function Remove-AskEcho([int]$n) {
   Write-Host (([string][char]8 + ' ' + [string][char]8) * $n) -NoNewline
 }
 
+# Writes the prompt or typed text. Text that ends exactly at the right edge leaves the cursor in the last column until
+# the next character comes (VT consoles): it is put at the next row's start here, as older consoles do, so that
+# Remove-AskEcho counts back from the right cell.
+function Write-AskEcho([string]$s) {
+  $l0 = -1
+  if ($script:HasConsole -and -not $script:KeySource) { try { $l0 = [Console]::CursorLeft } catch {} }
+  Write-Host $s -NoNewline
+  if ($l0 -lt 0) { return }
+  try {
+    $nl = $s.LastIndexOf("`n")
+    if ($nl -ge 0) { $l0 = 0; $s = $s.Substring($nl + 1) }
+    $w = [Console]::BufferWidth
+    if ($w -gt 0 -and $s.Length -gt 0 -and ($l0 + $s.Length) % $w -eq 0 -and [Console]::CursorLeft -ne 0) {
+      if ([Console]::CursorTop + 1 -lt [Console]::BufferHeight) { [Console]::SetCursorPosition(0, [Console]::CursorTop + 1) }
+      else { Write-Host '' }
+    }
+  } catch {}
+}
+
 function Test-NavKey($k) {
   $c = $k.Key
   return ($c -eq [ConsoleKey]::Escape -or $c -eq [ConsoleKey]::LeftArrow -or $c -eq [ConsoleKey]::RightArrow -or $c -eq [ConsoleKey]::Home)
@@ -3334,7 +3374,11 @@ function Clear-NavRepeat {
   try {
     while (Test-NavKeyWaiting) {
       $k = Read-NavKey
-      if (Test-NavKey $k) { $script:NavRepeatAt = Get-Date; continue }
+      if (Test-NavKey $k) {
+        $t = (Get-Date).AddMilliseconds($script:NavRepeatMs)
+        if ($t -gt $script:NavHeldUntil) { $script:NavHeldUntil = $t }
+        continue
+      }
       [void]$script:NavKeyAhead.Insert(0, $k)
       break
     }
@@ -3354,9 +3398,9 @@ function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav,
   } elseif ($script:CtrlCQuit) { throw (New-Object System.OperationCanceledException (T 'Stopped (Ctrl+C).')) }
   try {
     Clear-StatusLine
-    if ($Prompt) { Write-Host ($Prompt + ': ') -NoNewline }
+    if ($Prompt) { Write-AskEcho ($Prompt + ': ') }
     $sb = New-Object System.Text.StringBuilder
-    if ($Prefill -and -not $Secret) { [void]$sb.Append($Prefill); Write-Host $Prefill -NoNewline }
+    if ($Prefill -and -not $Secret) { [void]$sb.Append($Prefill); Write-AskEcho $Prefill }
     $clearedAt = [datetime]::MinValue
     while ($true) {
       $k = $null
@@ -3367,9 +3411,10 @@ function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav,
       if (Test-CtrlCKey $k) { Write-Host ''; Stop-ByCtrlC }
       $now = Get-Date
       if ($Nav -and (Test-NavKey $k)) {
-        $held = ($k.Key -eq $script:NavRepeatKey -and ($now - $script:NavRepeatAt).TotalMilliseconds -lt $script:NavRepeatMs)
+        $held = ($script:NavRepeatMs -gt 0 -and $k.Key -eq $script:NavRepeatKey -and $now -lt $script:NavHeldUntil -and -not $script:NavKeyUp)
         $script:NavRepeatKey = $k.Key
-        $script:NavRepeatAt = $now
+        $script:NavKeyUp = $false
+        $script:NavHeldUntil = $now.AddMilliseconds($(if ($held) { $script:NavRepeatMs } else { $script:NavHoldMs }))
         if ($held) { continue }
       }
       if ($k.Key -eq [ConsoleKey]::Backspace) {
@@ -3401,7 +3446,7 @@ function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav,
           [void]$chunk.Append($k2.KeyChar)
         }
         [void]$sb.Append($chunk.ToString())
-        if ($Secret) { Write-Host ('*' * $chunk.Length) -NoNewline } else { Write-Host $chunk.ToString() -NoNewline }
+        if ($Secret) { Write-AskEcho ('*' * $chunk.Length) } else { Write-AskEcho $chunk.ToString() }
       }
     }
     Write-Host ''
@@ -4235,14 +4280,18 @@ function Open-ViewerPreview {
 function Read-KeyCommand([string]$kind) {
   if (-not $script:HasConsole) { return $null }
   $keys = New-Object System.Collections.Generic.List[System.ConsoleKeyInfo]
+  # (Keys the question reader took off the console but didn't use, e.g. an Enter right after the Esc that left a
+  # flow: they belong to this screen now, not to a later question.)
+  foreach ($k in $script:NavKeyAhead) { $keys.Add([System.ConsoleKeyInfo]$k) }
+  $script:NavKeyAhead.Clear()
   try {
-    if (-not [Console]::KeyAvailable) { return $null }
+    if ($keys.Count -eq 0 -and -not [Console]::KeyAvailable) { return $null }
     $quietUntil = (Get-Date).AddMilliseconds(40)
     while ((Get-Date) -lt $quietUntil) {
       if ([Console]::KeyAvailable) { $keys.Add([Console]::ReadKey($true)); $quietUntil = (Get-Date).AddMilliseconds(40) }
       else { Start-Sleep -Milliseconds 5 }
     }
-  } catch { return $null }
+  } catch { if ($keys.Count -eq 0) { return $null } }
   foreach ($k in $keys) {
     if (Test-CtrlCKey $k) { $script:TypeBuf = ''; $script:Armed = $null; return (New-Cmd 'quit') }
   }
@@ -4946,9 +4995,9 @@ function Get-StatusText([string]$kind, $src, $media, [double]$pos, $speed, $hold
   if ($kind -eq 'hold') { return (Get-HoldText $hold $media $holdAt) }
   $nx = $null
   if ($script:Idx -lt $script:Queue.Count) { $nx = $script:Queue[$script:Idx] }
-  if ($nx -and $nx.State -eq 'downloading') { return (Join-StatusKeys (T '  Waiting screen is on. Next: {0}   Q Q = end' (Get-DownloadText $nx)) (T '   M = menu')) }
-  if ($nx) { return (Join-StatusKeys (T '  Waiting screen is on. Getting {0} ready...   Q Q = end' $nx.Name) (T '   M = menu')) }
-  return (Join-StatusKeys (T '  Waiting screen is on. Type a title or paste a link + Enter (Enter alone = pick files).   Q Q = end') (T '   M = menu'))
+  if ($nx -and $nx.State -eq 'downloading') { return ((T '  Waiting screen is on. Next: {0}   Q Q = end' (Get-DownloadText $nx)) + (T '   M = menu')) }
+  if ($nx) { return ((T '  Waiting screen is on. Getting {0} ready...   Q Q = end' $nx.Name) + (T '   M = menu')) }
+  return ((T '  Waiting screen is on. Type a title or paste a link + Enter (Enter alone = pick files).   Q Q = end') + (T '   M = menu'))
 }
 
 function Show-Panel {
@@ -5179,7 +5228,7 @@ function Invoke-Source {
         }
       }
       $st = Get-StatusText $Kind $src $Media ($Start + $pos) $speed $Hold $holdAt
-      Show-Status $st
+      Show-Status (Join-StatusKeys $st (T '   M = menu'))
       $script:LastStatus = $st
     }
     if ($now -ge $nextPanel) {
