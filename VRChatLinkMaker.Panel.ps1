@@ -2017,8 +2017,10 @@ function Update-PanelView($s) {
     $upKey = ($up -join "`n") + "`n" + ($ids -join ',')
     if (-not $script:PanelLast.ContainsKey('up') -or $script:PanelLast['up'] -cne $upKey) {
       $script:PanelLast['up'] = $upKey
-      # (The same line stays selected when the list changes around it: by its Id.)
+      # (The same line stays selected when the list changes around it: by its Id. The view stays scrolled where it
+      # was too: a download's progress changes the texts every second or two.)
       $selId = Get-PanelListId
+      $top = $q.List.TopIndex
       $q.ListIds = $ids
       $q.List.BeginUpdate()
       $q.List.Items.Clear()
@@ -2026,6 +2028,7 @@ function Update-PanelView($s) {
       $n = 1
       foreach ($u in $up) { [void]$q.List.Items.Add(('{0}. {1}' -f $n, $u)); $n++ }
       if ($selId -gt 0) { $ix = [array]::IndexOf([int[]]$ids, $selId); if ($ix -ge 0) { $q.List.SelectedIndex = $ix } }
+      if ($top -gt 0 -and $q.List.Items.Count -gt 0) { $q.List.TopIndex = [Math]::Min($top, $q.List.Items.Count - 1) }
       $q.List.EndUpdate()
     }
 

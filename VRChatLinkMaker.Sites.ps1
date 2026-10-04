@@ -4766,6 +4766,8 @@ function Get-ProviderTitle([string]$p) { if ($script:ProviderNames.ContainsKey($
 
 function Test-SiteLink([string]$u) {
   $u = (Split-SiteChoice $u)[0]
+  if ((Test-SubsPleaseLink $u) -or (Test-NyaaGroupLink $u)) { return $true }
+  if ((Get-Command Test-TorrentLink -CommandType Function -ErrorAction SilentlyContinue) -and (Test-TorrentLink $u)) { return $true }
   if ($u -match '^(?i)https?://(?:www\.)?animego\.[a-z]{2,10}/anime/') { return $true }
   if (Test-DreamcastUrl $u) { return $true }
   if (Test-AnilibertyUrl $u) { return $true }
@@ -5002,6 +5004,9 @@ function Expand-SiteLink([string]$u) {
 }
 
 function Expand-SiteLinkNow([string]$u) {
+  if (Test-SubsPleaseLink $u) { return @(Expand-SubsPlease $u) }
+  if (Test-NyaaGroupLink $u) { return @(Expand-NyaaGroup $u) }
+  if ((Get-Command Test-TorrentLink -CommandType Function -ErrorAction SilentlyContinue) -and (Test-TorrentLink $u)) { return @(Expand-Torrent $u) }
   if ($u -match $script:KinopoiskLinkRe) { return @(Expand-Kinopoisk $u) }
   if ($u -match $script:ShikimoriLinkRe) { return @(Expand-Shikimori $u) }
   if ($u -match '^(?i)https?://(?:www\.)?animego\.') { return @(Expand-Animego $u) }
@@ -5457,8 +5462,8 @@ function Expand-KodikSerial([string]$u) {
 $script:ShikimoriBase = 'https://shikimori.io'
 $script:SearchTimeoutSec = 10
 $script:SearchMaxRows = 20
-$script:SearchQuota = @{ 'dreamcast' = 3; 'wparty' = 8; 'yummy' = 3; 'shikimori' = 3; 'animelib' = 2; 'aniliberty' = 2; 'animevost' = 2 }   # rows per source before the rest fills up
-$script:SearchSourceNames = @{ 'dreamcast' = 'Dream Cast'; 'wparty' = 'WPARTY'; 'yummy' = 'YummyAnime'; 'shikimori' = 'Shikimori'; 'animelib' = 'AnimeLib'; 'aniliberty' = 'AniLiberty'; 'animevost' = 'AnimeVost' }
+$script:SearchQuota = @{ 'dreamcast' = 3; 'wparty' = 8; 'yummy' = 3; 'shikimori' = 3; 'animelib' = 2; 'aniliberty' = 2; 'animevost' = 2; 'subsplease' = 3; 'nyaa' = 3 }   # rows per source before the rest fills up
+$script:SearchSourceNames = @{ 'dreamcast' = 'Dream Cast'; 'wparty' = 'WPARTY'; 'yummy' = 'YummyAnime'; 'shikimori' = 'Shikimori'; 'animelib' = 'AnimeLib'; 'aniliberty' = 'AniLiberty'; 'animevost' = 'AnimeVost'; 'subsplease' = 'SubsPlease'; 'nyaa' = 'Nyaa' }
 $script:KinopoiskLinkRe = '^(?i)https?://(?:www\.)?kinopoisk\.ru/(film|series)/(\d+)'
 $script:ShikimoriLinkRe = '^(?i)https?://(?:www\.)?(?:shikimori\.(?:io|one|me)|shiki\.one)/animes/[a-z]*(\d+)'
 $script:MovieCheckCache = @{}     # Kinopoisk id -> movieCheck answer (this session)
@@ -5472,6 +5477,7 @@ function Test-SearchQuery([string]$text) {
   if ($t -notmatch '\p{L}') { return $false }
   if ($t -match '(?i)vrclm-vps\d*:') { return $false }   # a VPS connection code (a password): never searched for
   if ($t -match '^[A-Za-z0-9_-]{40,}$') { return $false }   # (nor a piece of one: no title is one 40-letter word)
+  if ($t -match '^(?i)magnet:\?' -or $t -cmatch '^[A-Z2-7]{32}$') { return $false }   # a torrent (magnet link, info hash)
   if ($t -match '^(?i)[a-z][a-z0-9+.-]*://' -or $t -match '^(?i)www\.') { return $false }
   if ($t -match '^(?i)[a-z0-9-]+(\.[a-z0-9-]+)+/' ) { return $false }   # animego.me/anime/... without https://
   if ($t -match '^[a-zA-Z]:' -or $t.StartsWith('\\') -or $t -match '^\.{1,2}[\\/]' -or $t.Contains('\')) { return $false }
@@ -5621,9 +5627,10 @@ function ConvertFrom-AnimelibSearch([string]$text) {
 }
 
 # Searches WPARTY (films, series, anime by Kinopoisk id), YummyAnime, Shikimori and AnimeLib (anime) for a title, and
-# the catalogues of AniLiberty, AnimeVost and Dream Cast (their own voice-overs).
+# the catalogues of AniLiberty, AnimeVost and Dream Cast (their own voice-overs); English anime on SubsPlease and Nyaa
+# (torrents: rows tagged [EN], last).
 # Returns up to $script:SearchMaxRows rows: Title, Year, Kind, Extra, Source ('wparty'|'yummy'|'shikimori'|'animelib'|
-# 'aniliberty'|'animevost'|'dreamcast'), Id, Link.
+# 'aniliberty'|'animevost'|'dreamcast'|'subsplease'|'nyaa'), Id, Link.
 # A source that doesn't answer gets one short line; the others still show.
 function Find-SiteContent([string]$query) {
   $q = ([string]$query).Trim()
@@ -5632,8 +5639,9 @@ function Find-SiteContent([string]$query) {
   $alApi = 'https://api.cdnlibs.org/api'
   if ($script:AnimelibApiGoodHost) { $alApi = $script:AnimelibApiGoodHost }
   $sec = $script:SearchTimeoutSec
-  $srcs = @('dreamcast', 'wparty', 'yummy', 'shikimori', 'animelib', 'aniliberty', 'animevost')
-  $apart = @('dreamcast', 'aniliberty', 'animevost')   # (their own voice-over only: never merged with the others)
+  $srcs = @('dreamcast', 'wparty', 'yummy', 'shikimori', 'animelib', 'aniliberty', 'animevost', 'subsplease', 'nyaa')
+  $apart = @('dreamcast', 'aniliberty', 'animevost', 'subsplease', 'nyaa')   # (their own voice-over / releases only: never merged with the others)
+  $en = @('subsplease', 'nyaa')   # (English, torrents: after everything else)
   $reqs = @(
     (Get-DreamcastSearchRequest $q $sec),
     @{ Url = $script:WpartyBase + '/api/movieSearch'; Method = 'POST'; Body = (ConvertTo-Json @{ q = $q } -Compress); ContentType = 'application/json'
@@ -5642,8 +5650,17 @@ function Find-SiteContent([string]$query) {
     @{ Url = $script:ShikimoriBase + '/api/animes?search=' + $esc + '&limit=8'; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $sec },
     @{ Url = $alApi + '/anime?q=' + $esc + '&site_id[]=' + $script:AnimelibSiteId; Headers = (Get-AnimelibApiHeaders -NoAuth); TimeoutSec = $sec },
     (Get-AnilibertySearchRequest $q $sec),
-    (Get-AnimevostSearchRequest $q $sec)
+    (Get-AnimevostSearchRequest $q $sec),
+    @{ Url = 'https://subsplease.org/api/?f=search&tz=UTC&s=' + $esc; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $sec },
+    # (Trusted uploads only; the size we send narrows the 75 newest down to one resolution.)
+    @{ Url = 'https://nyaa.si/?page=rss&q=' + [Uri]::EscapeDataString("$q $(Get-QualityCap)p") + '&c=1_2&f=2'; TimeoutSec = $sec }
   )
+  # ("Torrents": "off": the English torrent sources aren't asked at all.)
+  if ((Get-TorrentsSetting) -eq 'off') {
+    $keep = @(for ($i = 0; $i -lt $srcs.Count; $i++) { if ($en -notcontains $srcs[$i]) { $i } })
+    $reqs = @($keep | ForEach-Object { $reqs[$_] })
+    $srcs = @($keep | ForEach-Object { $srcs[$_] })
+  }
   $answers = @(Invoke-WebParallel $reqs)
   # AniLiberty / AnimeVost not answering at that address: all their other addresses at once, in one more round (as
   # Invoke-MirrorApi would try them one after the other: the first one in its order that answers is taken).
@@ -5693,11 +5710,19 @@ function Find-SiteContent([string]$query) {
         elseif ($s -eq 'aniliberty') { $found[$s] = @(ConvertFrom-AnilibertySearch $a.Text $q) }
         elseif ($s -eq 'animevost') { $found[$s] = @(ConvertFrom-AnimevostSearch $a.Text $q) }
         elseif ($s -eq 'yummy') { $found[$s] = @(ConvertFrom-YummySearch $a.Text $q) }
+        elseif ($s -eq 'subsplease') { $found[$s] = @(ConvertFrom-SubsPleaseSearch $a.Text) }
+        elseif ($s -eq 'nyaa') { $found[$s] = @(ConvertFrom-NyaaRss $a.Text) }
         else { $found[$s] = @(ConvertFrom-AnimelibSearch $a.Text) }
       } catch { $why = T 'unexpected answer' }
     }
     if ($why -and $s -eq 'yummy' -and ($a.Status -eq 401 -or $a.Status -eq 403)) { Say (T '  YummyAnime wants an app token now: put one in "YummyAppToken" in config.json (see README).') 'DarkGray' }
     elseif ($why) { Say (T '  {0} search isn''t answering ({1}).' $script:SearchSourceNames[$s] (Get-ShortText ([string]$why) 60)) 'DarkGray' }
+  }
+  # SubsPlease's own row for a show beats Nyaa's row of SubsPlease's releases of it (the same files).
+  if ($found['subsplease'].Count -gt 0 -and $found['nyaa'].Count -gt 0) {
+    $spKeys = @{}
+    foreach ($r in $found['subsplease']) { $spKeys[(ConvertTo-SearchKey $r.Title)] = $true }
+    $found['nyaa'] = @($found['nyaa'] | Where-Object { -not ($_.Title -match '^\[SubsPlease\] (.+)$' -and $spKeys.ContainsKey((ConvertTo-SearchKey $matches[1]))) })
   }
   # Drop what an earlier source already has (same title and year, or the same Shikimori id: YummyAnime's row, which lists
   # more players, keeps the Shikimori id and Shikimori's own row goes). Dream Cast's, AniLiberty's
@@ -5721,7 +5746,8 @@ function Find-SiteContent([string]$query) {
   }
   # A few from each, then fill up with whatever is left (WPARTY's first, Dream Cast's last). The own-voice-over rows go
   # last too: Enter should take the show with every voice-over (picked by DubPriority), not "Overlord 4" from Dream Cast.
-  $order = @($srcs | Where-Object { $apart -notcontains $_ }) + @($apart | Where-Object { $_ -ne 'dreamcast' }) + @('dreamcast')
+  $order = @($srcs | Where-Object { $apart -notcontains $_ }) + @($apart | Where-Object { $_ -ne 'dreamcast' -and $en -notcontains $_ }) + @('dreamcast') + $en
+  $order = @($order | Where-Object { $srcs -contains $_ })
   $take = @{}
   $n = 0
   foreach ($s in $srcs) { $take[$s] = [Math]::Min($kept[$s].Count, $script:SearchQuota[$s]); $n += $take[$s] }
@@ -5732,7 +5758,8 @@ function Find-SiteContent([string]$query) {
   # own-voice-over rows, which stay after the others.
   $qk = ConvertTo-SearchKey $q
   $out = @()
-  foreach ($grp in @(@($rows | Where-Object { $apart -notcontains $_.Source }), @($rows | Where-Object { $apart -contains $_.Source }))) {
+  foreach ($grp in @(@($rows | Where-Object { $apart -notcontains $_.Source }), @($rows | Where-Object { $apart -contains $_.Source -and $en -notcontains $_.Source }),
+      @($rows | Where-Object { $en -contains $_.Source }))) {
     $exact = @($grp | Where-Object { @($_.Names | Where-Object { (ConvertTo-SearchKey $_) -eq $qk }).Count -gt 0 })
     $out += $exact
     $out += @($grp | Where-Object { $exact -notcontains $_ })
@@ -5744,10 +5771,262 @@ function Find-SiteContent([string]$query) {
 # or challenge page, an error) makes the sources that have other addresses try those.
 function Test-SearchAnswer([string]$source, $a) {
   if ($a.Error) { return $false }
+  # (Nyaa: RSS; SubsPlease: JSON. A Cloudflare / DDoS-Guard check page instead counts as not answering.)
+  if ($source -eq 'nyaa') { $t = ([string]$a.Text).TrimStart(); return ($a.Status -eq 200 -and ($t.StartsWith('<?xml') -or $t.StartsWith('<rss'))) }
+  if ($source -eq 'subsplease') { $t = ([string]$a.Text).TrimStart(); return ($a.Status -eq 200 -and ($t.StartsWith('{') -or $t.StartsWith('['))) }
   if (-not ($a.Status -eq 200 -or ($source -eq 'animevost' -and $a.Status -eq 404))) { return $false }
   if ($source -notin @('aniliberty', 'animevost', 'yummy')) { return $true }
   $t = ([string]$a.Text).TrimStart()
   return ($t.StartsWith('{') -or $t.StartsWith('['))
+}
+
+# ------------------------------------------------------------------ English anime: SubsPlease + Nyaa (torrents)
+# Searched together with the Russian sources; their rows are tagged [EN] and listed last. Every episode is a torrent
+# (see "torrents" in VRChatLinkMaker.ps1): it downloads completely, then plays.
+#   SubsPlease GET https://subsplease.org/api/?f=search&tz=UTC&s=<q>   -> {"<Show> - <ep>": {show, episode, page, downloads:[{res, magnet}]}}
+#   Nyaa       GET https://nyaa.si/?page=rss&q=<q> <res>p&c=1_2&f=2    -> RSS: English-translated anime, trusted uploads only
+# Row links (they survive the #vrclm= hand-over to a running window):
+#   https://subsplease.org/shows/<page>/?name=<show>                    -> that show's episodes (asked again, or cached)
+#   https://nyaa.si/?f=2&c=1_2&q=<q>&grp=<group>&show=<show>&res=<res>   -> one group's episodes of a show at one size
+#   https://nyaa.si/view/<id>                                            -> one torrent (a batch, another group's release)
+$script:EnSearchCache = @{}     # row link -> @{ At; Eps } (10 minutes)
+$script:NyaaSpRx = '^\[SubsPlease\] (?<show>.+?) - (?<ep>\d+(?:\.\d+)?)(?:v\d+)? \((?<res>\d{3,4})p\) \[(?<crc>[0-9A-F]{8})\]\.mkv$'
+$script:NyaaEraiRx = '^\[Erai-raws\] (?<show>.+?) - (?<ep>\d+(?:\.\d+)?)(?:v\d+)? \[(?<res>\d{3,4})p (?<src>[^\]]*)\](?<tags>(?:\[[^\]]+\])*)$'
+$script:NyaaBatchRx = '\((?<a>\d+)-(?<b>\d+)\) \((?<res>\d{3,4})p\)(?: \[V\d\])? \[(?:Unofficial )?Batch\]'
+
+function Test-SubsPleaseLink([string]$u) { return ($u -match '^(?i)https?://(?:www\.)?subsplease\.org/shows/[^/?#]+') }
+function Test-NyaaGroupLink([string]$u) { return ($u -match '^(?i)https?://(?:www\.)?nyaa\.si/\?[^#]*[?&]grp=') }
+
+function Get-UrlParam([string]$u, [string]$name) {
+  $m = [regex]::Match($u, '[?&]' + [regex]::Escape($name) + '=([^&#]*)')
+  if (-not $m.Success) { return '' }
+  return [Uri]::UnescapeDataString($m.Groups[1].Value.Replace('+', ' '))
+}
+
+# What a release's title says about its subtitles / sound (before the download; after it, ffprobe knows for sure).
+function Get-ReleaseBadge([string]$title) {
+  if ($title -match '(?i)english dub|dual[ -]audio') { return (T 'EN dub') }
+  if ($title -match '(?i)hard-?sub|\[HS\]') { return (T 'hard subs') }
+  if ($title -match '(?i)multi-?subs?') { return (T 'multi-sub') }
+  return (T 'EN subs')
+}
+
+function Get-EpisodeNumberText([string]$ep) {
+  $n = 0.0
+  if ([double]::TryParse($ep.Trim(), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$n)) { return (Format-Num $n) }
+  return $ep.Trim()
+}
+
+function Get-EpisodeSortKey([string]$n) {
+  $v = 0.0
+  if ([double]::TryParse(($n -split '-')[0], [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$v)) { return $v }
+  return [double]::MaxValue
+}
+
+# SubsPlease's answer -> its shows (page -> Show, Page, Eps), each episode at the size closest to $cap: Number, Label,
+# Batch, Res, Magnet.
+function Get-SubsPleaseShows([string]$text, [int]$cap) {
+  $shows = [ordered]@{}
+  $t = ([string]$text).Trim()
+  if (-not $t -or $t -eq '[]' -or $t -eq '{}') { return $shows }
+  $j = ConvertFrom-JsonDict $t
+  if ($j -isnot [System.Collections.IDictionary]) { throw 'bad answer' }
+  foreach ($k in @($j.Keys)) {
+    $x = $j[$k]
+    $show = [string](Get-JsonVal $x 'show'); $page = [string](Get-JsonVal $x 'page'); $ep = [string](Get-JsonVal $x 'episode')
+    if (-not $show -or $page -notmatch '^[A-Za-z0-9._-]+$') { continue }
+    $best = $null; $bestD = [int]::MaxValue
+    foreach ($d in @(Get-JsonVal $x 'downloads')) {
+      $res = 0
+      [void][int]::TryParse([string](Get-JsonVal $d 'res'), [ref]$res)
+      $mag = [string](Get-JsonVal $d 'magnet')
+      if ($mag -notmatch '^(?i)magnet:\?') { continue }
+      $dist = 2 * [Math]::Abs($res - $cap)
+      if ($res -gt $cap) { $dist++ }   # (equally far: the smaller one)
+      if ($dist -lt $bestD) { $best = [pscustomobject]@{ Res = $res; Magnet = $mag }; $bestD = $dist }
+    }
+    if (-not $best) { continue }
+    if (-not $shows.Contains($page)) { $shows[$page] = [pscustomobject]@{ Show = $show; Page = $page; Eps = (New-Object System.Collections.ArrayList) } }
+    $batch = ($ep -match '^\s*\d+(?:\.\d+)?\s*-\s*\d+')
+    $num = $ep.Trim()
+    if (-not $batch) { $num = Get-EpisodeNumberText $ep }
+    [void]$shows[$page].Eps.Add([pscustomobject]@{ Number = $num; Label = "$show - $($ep.Trim())"; Batch = $batch; Res = $best.Res; Magnet = $best.Magnet })
+  }
+  return $shows
+}
+
+function ConvertFrom-SubsPleaseSearch([string]$text) {
+  $rows = @()
+  $shows = Get-SubsPleaseShows $text (Get-QualityCap)
+  foreach ($s in $shows.Values) {
+    $single = @($s.Eps | Where-Object { -not $_.Batch })
+    $link = 'https://subsplease.org/shows/' + $s.Page + '/?name=' + [Uri]::EscapeDataString($s.Show)
+    $script:EnSearchCache[$link] = [pscustomobject]@{ At = (Get-Date); Eps = @($s.Eps) }
+    $res = @($s.Eps)[0].Res
+    if ($single.Count -gt 0) { $extra = T '{0} ep. - {1}p - EN subs - downloads first' $single.Count $res }
+    else { $extra = T 'batch - {0}p - EN subs - downloads first' $res }
+    $rows += New-SearchRow 'subsplease' $s.Page $s.Show '' ((T 'series') + ' [EN]') $extra $link @($s.Show)
+  }
+  return $rows
+}
+
+function Get-XmlText($node, [string]$path, $ns) {
+  $n = $node.SelectSingleNode($path, $ns)
+  if ($n) { return $n.InnerText.Trim() }
+  return ''
+}
+
+# Nyaa's RSS -> its items: Title, Url (the .torrent), View (its page), Seeders, Size, Trusted.
+function Read-NyaaRss([string]$text) {
+  $x = New-Object System.Xml.XmlDocument
+  $x.XmlResolver = $null
+  $x.LoadXml($text)
+  $ns = New-Object System.Xml.XmlNamespaceManager($x.NameTable)
+  $ns.AddNamespace('nyaa', 'https://nyaa.si/xmlns/nyaa')
+  $out = New-Object System.Collections.ArrayList
+  foreach ($it in $x.SelectNodes('/rss/channel/item')) {
+    $seed = 0
+    [void][int]::TryParse((Get-XmlText $it 'nyaa:seeders' $ns), [ref]$seed)
+    $url = Get-XmlText $it 'link' $ns
+    $view = Get-XmlText $it 'guid' $ns
+    if ($view -notmatch '^(?i)https?://') { $view = $url }
+    # (Asked for trusted uploads only (f=2); one marked otherwise anyway is left out.)
+    if ((Get-XmlText $it 'nyaa:trusted' $ns) -eq 'No') { continue }
+    [void]$out.Add([pscustomobject]@{ Title = (Get-XmlText $it 'title' $ns); Url = $url; View = $view; Seeders = $seed
+        Size = (Get-XmlText $it 'nyaa:size' $ns); Trusted = ((Get-XmlText $it 'nyaa:trusted' $ns) -eq 'Yes') })
+  }
+  return $out.ToArray()
+}
+
+# Nyaa items -> Groups (a group's episodes of a show at one size: Group, Show, Res, Badge, Seeders, List of Number, Url,
+# Title, Seeders) and Other (everything else, one row each). One release per episode: AVC before HEVC / AV1 (lighter
+# to decode), then the most seeders.
+function Get-NyaaGroups($items) {
+  $groups = [ordered]@{}
+  $other = New-Object System.Collections.ArrayList
+  foreach ($r in @($items)) {
+    $grp = $null
+    $m = [regex]::Match($r.Title, $script:NyaaSpRx)
+    if ($m.Success) { $grp = 'SubsPlease' }
+    else { $m = [regex]::Match($r.Title, $script:NyaaEraiRx); if ($m.Success) { $grp = 'Erai-raws' } }
+    if (-not $grp) { [void]$other.Add($r); continue }
+    $show = $m.Groups['show'].Value
+    $res = [int]$m.Groups['res'].Value
+    $key = "$grp|$show|$res"
+    if (-not $groups.Contains($key)) { $groups[$key] = [pscustomobject]@{ Group = $grp; Show = $show; Res = $res; Badge = (Get-ReleaseBadge $r.Title); Seeders = 0; Eps = @{}; List = @() } }
+    $gr = $groups[$key]
+    $num = Get-EpisodeNumberText $m.Groups['ep'].Value
+    $hevc = ($r.Title -match '(?i)HEVC|x265|AV1')
+    $old = $gr.Eps[$num]
+    if (-not $old -or ($old.Hevc -and -not $hevc) -or ($old.Hevc -eq $hevc -and $r.Seeders -gt $old.Seeders)) {
+      $gr.Eps[$num] = [pscustomobject]@{ Number = $num; Url = $r.Url; Title = $r.Title; Seeders = $r.Seeders; Hevc = $hevc }
+    }
+    if ($r.Title -match '(?i)multi-?sub') { $gr.Badge = Get-ReleaseBadge $r.Title }
+  }
+  foreach ($gr in $groups.Values) {
+    $gr.List = @($gr.Eps.Values | Sort-Object { Get-EpisodeSortKey $_.Number })
+    $gr.Seeders = [int](($gr.List | Measure-Object Seeders -Maximum).Maximum)
+  }
+  return [pscustomobject]@{ Groups = @($groups.Values); Other = $other.ToArray() }
+}
+
+function Get-NyaaGroupLink($gr) {
+  $q = "$($gr.Group) $($gr.Show) $($gr.Res)p"
+  return ('https://nyaa.si/?f=2&c=1_2&q=' + [Uri]::EscapeDataString($q) + '&grp=' + [Uri]::EscapeDataString($gr.Group) +
+    '&show=' + [Uri]::EscapeDataString($gr.Show) + '&res=' + $gr.Res)
+}
+
+# Rows: SubsPlease's and Erai-raws' episodes grouped (the size we send first, then the most seeders), then the other
+# releases (batches, other groups) one by one.
+function ConvertFrom-NyaaRss([string]$text) {
+  $cap = Get-QualityCap
+  $gs = Get-NyaaGroups @(Read-NyaaRss $text)
+  $rows = @()
+  $sorted = @($gs.Groups | Sort-Object @{ Expression = { if ($_.Group -eq 'SubsPlease') { 0 } else { 1 } } }, @{ Expression = { [Math]::Abs($_.Res - $cap) } }, @{ Expression = { $_.Seeders }; Descending = $true })
+  foreach ($gr in $sorted) {
+    $link = Get-NyaaGroupLink $gr
+    $script:EnSearchCache[$link] = [pscustomobject]@{ At = (Get-Date); Eps = @($gr.List) }
+    $extra = T '{0} ep. - {1}p - {2} - {3} seeders' $gr.List.Count $gr.Res $gr.Badge $gr.Seeders
+    $rows += New-SearchRow 'nyaa' $link "[$($gr.Group)] $($gr.Show)" '' ((T 'series') + ' [EN]') $extra $link @($gr.Show)
+  }
+  foreach ($r in @($gs.Other | Sort-Object Seeders -Descending)) {
+    $kind = T 'torrent'
+    if ($r.Title -match $script:NyaaBatchRx) { $kind = T 'batch' }
+    $rows += New-SearchRow 'nyaa' $r.View $r.Title '' ($kind + ' [EN]') (T '{0} - {1} - {2} seeders' $r.Size (Get-ReleaseBadge $r.Title) $r.Seeders) $r.View @($r.Title)
+  }
+  return $rows
+}
+
+function Get-EnCachedEps([string]$u) {
+  $c = $script:EnSearchCache[$u]
+  if ($c -and ((Get-Date) - $c.At).TotalMinutes -lt 10) { return , @($c.Eps) }
+  return , $null
+}
+
+# The [EN] rows are torrents: none when torrents are off; a window that may ask asks about rqbit first (the window
+# that streams can't ask, so it would refuse them all later).
+function Assert-EnTorrents([string]$u) {
+  if ((Get-TorrentsSetting) -eq 'off') { Say (T '  Torrents are off ("Torrents": "off" in config.json): {0}' (Get-ShortText $u 70)) 'Yellow'; return $false }
+  if ((Test-CanAsk) -and -not (Get-PinnedTool 'rqbit' $true)) { throw (T 'torrents need rqbit, which isn''t set up') }
+  return $true
+}
+
+# A SubsPlease show -> which episodes (asked, handed over, or all), one torrent each.
+function Expand-SubsPlease([string]$u) {
+  if (-not (Assert-EnTorrents $u)) { return @() }
+  $page = [regex]::Match($u, '(?i)/shows/([^/?#]+)').Groups[1].Value
+  $name = Get-UrlParam $u 'name'
+  $eps = Get-EnCachedEps $u
+  if ($null -eq $eps) {
+    if (-not $name) { $name = $page -replace '-', ' ' }
+    $r = Invoke-Web ('https://subsplease.org/api/?f=search&tz=UTC&s=' + [Uri]::EscapeDataString($name)) -Headers @{ 'Accept' = 'application/json' } -TimeoutSec 15
+    if (-not (Test-SearchAnswer 'subsplease' ([pscustomobject]@{ Status = $r.Status; Text = $r.Text; Error = $null }))) { throw (T 'SubsPlease isn''t answering (HTTP {0})' $r.Status) }
+    $shows = Get-SubsPleaseShows $r.Text (Get-QualityCap)
+    if (-not $shows.Contains($page)) { throw (T 'SubsPlease doesn''t list this show any more') }
+    $eps = @($shows[$page].Eps)
+    if (-not $name) { $name = $shows[$page].Show }
+    $script:EnSearchCache[$u] = [pscustomobject]@{ At = (Get-Date); Eps = $eps }
+  }
+  $single = @($eps | Where-Object { -not $_.Batch } | Sort-Object { Get-EpisodeSortKey $_.Number })
+  if ($single.Count -eq 0) {
+    # Only a batch (a finished season): one torrent with every episode.
+    $b = @($eps | Where-Object { $_.Batch }) | Select-Object -First 1
+    if (-not $b) { return @() }
+    return @(Expand-Torrent $b.Magnet)
+  }
+  $pick = @(Select-SiteEpisodes $single 0 (Test-CanAsk))
+  $items = @()
+  foreach ($e in $pick) {
+    $g = New-TorrentGroup $e.Magnet 'magnet'
+    $g.Name = $e.Label
+    $items += New-TorrentItem $g $null
+  }
+  return $items
+}
+
+# A Nyaa group row -> which episodes, one .torrent each.
+function Expand-NyaaGroup([string]$u) {
+  if (-not (Assert-EnTorrents $u)) { return @() }
+  $eps = Get-EnCachedEps $u
+  if ($null -eq $eps) {
+    $q = Get-UrlParam $u 'q'; $grp = Get-UrlParam $u 'grp'; $show = Get-UrlParam $u 'show'; $res = Get-UrlParam $u 'res'
+    $r = Invoke-Web ('https://nyaa.si/?page=rss&q=' + [Uri]::EscapeDataString($q) + '&c=1_2&f=2') -TimeoutSec 15
+    if (-not (Test-SearchAnswer 'nyaa' ([pscustomobject]@{ Status = $r.Status; Text = $r.Text; Error = $null }))) { throw (T 'Nyaa isn''t answering (HTTP {0})' $r.Status) }
+    $gs = Get-NyaaGroups @(Read-NyaaRss $r.Text)
+    $gr = @($gs.Groups | Where-Object { $_.Group -eq $grp -and $_.Show -eq $show -and [string]$_.Res -eq $res }) | Select-Object -First 1
+    if (-not $gr) { throw (T 'Nyaa doesn''t list these episodes any more') }
+    $eps = @($gr.List)
+    $script:EnSearchCache[$u] = [pscustomobject]@{ At = (Get-Date); Eps = $eps }
+  }
+  if (@($eps).Count -eq 0) { return @() }
+  $pick = @(Select-SiteEpisodes @($eps) 0 (Test-CanAsk))
+  $items = @()
+  foreach ($e in $pick) {
+    $g = New-TorrentGroup $e.Url 'url'
+    $g.Name = $e.Title -replace '(?i)\.(mkv|mp4)$', ''
+    $items += New-TorrentItem $g $null
+  }
+  return $items
 }
 
 # One result as a line of the list: Title (Year) - kind - extra [source]
@@ -5784,6 +6063,14 @@ function Invoke-ContentSearch([string]$query, [switch]$AskPlayer) {
   catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
   if ($items.Count -eq 0) { return @() }
   if ($AskPlayer) { Read-HandoverPlayer $items }
+  if (@($items | Where-Object { $_.Kind -ne 'torrent' }).Count -eq 0) {
+    # Torrents ([EN] rows): their own links (magnets, .torrent files) with the episodes, so the streaming window
+    # doesn't look the site up again (a wait while a video plays). Several links: an array.
+    $gs = New-Object System.Collections.ArrayList
+    foreach ($it in $items) { if (-not $gs.Contains($it.Torrent.G)) { [void]$gs.Add($it.Torrent.G) } }
+    $script:LastSearchLink = @($gs | ForEach-Object { $g = $_; Get-TorrentHandover @($items | Where-Object { $_.Torrent.G -eq $g }) $g.Link })
+    return $items
+  }
   $script:LastSearchLink = $row.Link
   $choice = Get-SiteChoiceText $items
   if ($choice) { $script:LastSearchLink += '#vrclm=' + $choice }
