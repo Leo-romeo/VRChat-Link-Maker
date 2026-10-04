@@ -1249,7 +1249,8 @@ function Get-TrackLabel($t, [bool]$short = $false) {
   return $s
 }
 
-function Test-Signs($t) { return ($t.Forced -or ("$($t.Title)" -match '(?i)sign|song|forced|karaoke')) }
+# Signs / songs only (not the whole dialogue): also Russian titles ("Nadpisi", "Znaki"; .NET regex escapes keep this file ASCII).
+function Test-Signs($t) { return ($t.Forced -or ("$($t.Title)" -match ('(?i)sign|song|forced|karaoke|\u043d\u0430\u0434\u043f\u0438\u0441|\u0437\u043d\u0430\u043a\u0438'))) }
 function Test-English([string]$lang) { return ($lang -match '^(?i)(en|eng)$') }
 
 function Get-DefaultAudioPos($audio) {
@@ -1714,6 +1715,7 @@ function Stop-ProcessTree($proc) {
 function Remove-ItemFiles($item) {
   if ($item -and $item.Kind -eq 'torrent' -and $item.Torrent -and -not $item.Torrent.Released) {
     $item.Torrent.Released = $true
+    try { Remove-TorrentEpisodeFile $item } catch {}
     try { Remove-TorrentRef $item.Torrent.G } catch {}
   }
   if ($item -and $item.JobDir) {
@@ -2591,12 +2593,15 @@ function Start-TorrentEngine {
     $alive = $false
     try { $alive = -not $script:Rqbit.Proc.HasExited } catch {}
     if ($alive) { return $script:Rqbit }
-    Stop-TorrentEngine
+    if ($script:Rqbit.Ready) { Remove-DeadTorrentEngine $script:Rqbit } else { Stop-TorrentEngine }
   }
+  # (It ended by itself three times already: not again in this run.)
+  if ($script:DeadRqbits.Count -ge 3) { throw (T 'rqbit stopped ({0})' (T 'three times')) }
   $exe = Get-PinnedTool 'rqbit' (Test-CanAsk)
   if (-not $exe) { throw (T 'torrents need rqbit, which isn''t set up') }
   $script:RqbitStarts++
   $dir = PathJoin $script:TempRoot "torrent-$PID"
+  if ($script:DeadRqbits.Count -gt 0) { $dir += '-' + $script:RqbitStarts }
   try { if ([System.IO.Directory]::Exists($dir)) { [System.IO.Directory]::Delete($dir, $true) } } catch {}
   $dl = PathJoin $dir 'dl'
   [void][System.IO.Directory]::CreateDirectory($dl)
@@ -2641,7 +2646,13 @@ function Start-TorrentEngine {
 function Test-TorrentEngine {
   $e = $script:Rqbit
   if (-not $e) { return $false }
-  if ($e.Ready) { return $true }
+  if ($e.Ready) {
+    $dead = $false
+    try { $dead = [bool]($e.Proc -and $e.Proc.HasExited) } catch {}
+    if (-not $dead) { return $true }
+    Remove-DeadTorrentEngine $e
+    return $false
+  }
   $dead = $true
   try { $dead = $e.Proc.HasExited } catch {}
   if ($dead) {
@@ -2678,6 +2689,31 @@ function Get-TorrentEngine {
   return $null
 }
 
+# rqbit ended by itself after it was ready (a crash, an antivirus): what it was downloading is lost (those episodes
+# fail), the episodes it finished still play (its folder stays, locked, until this tool ends: Remove-DeadTorrentEngines),
+# and the next torrent starts it again (in a folder of its own).
+$script:DeadRqbits = New-Object System.Collections.ArrayList
+function Remove-DeadTorrentEngine($e) {
+  if ($script:Rqbit -eq $e) { $script:Rqbit = $null }
+  if ($script:DeadRqbits.Contains($e)) { return }
+  [void]$script:DeadRqbits.Add($e)
+  $why = ''
+  try { if ($e.Err.Wait(500)) { $why = Get-LastLines ("$($e.Out.Result)`n$($e.Err.Result)") 1 } } catch {}
+  if (-not $why) { $why = '?' }
+  $msg = T 'rqbit stopped ({0})' (Get-ShortText $why 100)
+  foreach ($g in @($e.Torrents.Values)) { if (-not $g.Error) { $g.Error = $msg } }
+  Say $msg 'Yellow'
+}
+
+function Remove-DeadTorrentEngines {
+  foreach ($e in @($script:DeadRqbits)) {
+    if ($e.Lock) { try { $e.Lock.Dispose() } catch {} }
+    try { [System.IO.Directory]::Delete($e.Dir, $true) } catch {}
+    if ([System.IO.Directory]::Exists($e.Dir)) { [void]$script:PendingDirs.Add($e.Dir) }
+  }
+  $script:DeadRqbits.Clear()
+}
+
 # Stops rqbit and deletes everything it downloaded (when this tool ends).
 function Stop-TorrentEngine {
   $e = $script:Rqbit
@@ -2697,7 +2733,7 @@ function Stop-TorrentEngine {
 # BodyUrl: a .torrent still to fetch), its files once known, its id in rqbit once added, the files it downloads now.
 function New-TorrentGroup([string]$link, [string]$kind) {
   $g = [pscustomobject]@{
-    Link = $link; Kind = $kind; Body = $null; BodyUrl = $null; Hash = $null; Name = ''; Files = $null; Id = $null; OutDir = $null
+    Link = $link; Kind = $kind; Body = $null; BodyUrl = $null; Hash = $null; Name = ''; Files = $null; Id = $null; OutDir = $null; Engine = $null
     Want = (New-Object System.Collections.Generic.List[int]); Job = $null; Error = $null; Refs = 0; Paused = $false; RetryAt = [datetime]::MinValue
   }
   if ($kind -eq 'magnet') { $g.Body = $link; $g.Hash = Get-TorrentHash $link; $g.Name = Get-MagnetName $link }
@@ -2719,7 +2755,7 @@ function New-TorrentGroup([string]$link, [string]$kind) {
 
 function New-TorrentItem($g, [string]$number) {
   $it = New-QueueItem 'torrent' $g.Link
-  $it.Torrent = [pscustomobject]@{ G = $g; Number = $number; Idx = -1; Bytes = [long]0; Rel = $null; Released = $false }
+  $it.Torrent = [pscustomobject]@{ G = $g; Number = $number; Idx = -1; Bytes = [long]0; Rel = $null; Subs = @(); Released = $false }
   $name = $g.Name
   if (-not $name -and $g.Hash) { $name = T 'torrent {0}' $g.Hash.Substring(0, 8) }
   if (-not $name) { $name = Get-ShortText $g.Link 70 }
@@ -2739,37 +2775,59 @@ function Get-FileEpisodeNumber([string]$name) {
   return $null
 }
 
-# A torrent's video files, in natural order, each with .Idx (rqbit's file id), .Name, .Rel, .Length and .Number
-# (from the file names; by position when they don't tell or repeat).
+# A torrent's video files, in natural order, each with .Idx (rqbit's file id), .Name, .Rel, .Length, .Number (from the
+# file names; the ones without a number after them; by position when numbers repeat) and .Subs (its subtitle files:
+# named like it, anywhere in the torrent; a torrent with one video: all of them). Audio-only files (an external dub
+# track, a soundtrack) are no episodes.
+$script:AudioOnlyExts = @('.mka', '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.opus', '.wav', '.wma')
 function Get-TorrentEpisodes($files) {
   $list = New-Object System.Collections.ArrayList
+  $subs = New-Object System.Collections.ArrayList
   $i = 0
   foreach ($f in @($files)) {
     $comp = @(Get-JsonVal $f 'components' | ForEach-Object { [string]$_ })
     if ($comp.Count -eq 0) { $comp = @([string](Get-JsonVal $f 'name')) }
     $n = $comp[$comp.Count - 1]
-    if ($script:MediaExts -contains [System.IO.Path]::GetExtension($n).ToLowerInvariant()) {
-      [void]$list.Add([pscustomobject]@{ Idx = $i; Name = $n; Rel = ($comp -join '\'); Length = [long](Get-JsonVal $f 'length'); Number = $null })
-    }
+    $x = [System.IO.Path]::GetExtension($n).ToLowerInvariant()
+    $o = [pscustomobject]@{ Idx = $i; Name = $n; Rel = ($comp -join '\'); Length = [long](Get-JsonVal $f 'length'); Number = $null; Subs = @() }
+    if ($script:MediaExts -contains $x -and $script:AudioOnlyExts -notcontains $x) { [void]$list.Add($o) }
+    elseif ($script:SubExts -contains $x) { [void]$subs.Add($o) }
     $i++
   }
   $sorted = @($list | Sort-Object { Get-NaturalKey $_.Rel })
   $seen = @{}
   $byName = $true
+  $max = 0.0
   foreach ($ep in $sorted) {
     $n = Get-FileEpisodeNumber $ep.Name
-    if (-not $n -or $seen.ContainsKey($n)) { $byName = $false; break }
+    if (-not $n) { continue }
+    if ($seen.ContainsKey($n)) { $byName = $false; break }
     $seen[$n] = $true
     $ep.Number = $n
+    $max = [Math]::Max($max, [Math]::Floor([double]::Parse($n, $script:Inv)))
   }
-  if (-not $byName) { for ($k = 0; $k -lt $sorted.Count; $k++) { $sorted[$k].Number = [string]($k + 1) } }
+  if ($byName) {
+    $num = @($sorted | Where-Object { $_.Number })
+    $none = @($sorted | Where-Object { -not $_.Number })
+    for ($k = 0; $k -lt $none.Count; $k++) { $none[$k].Number = [string]([int]$max + $k + 1) }
+    $sorted = @($num) + @($none)
+  } else { for ($k = 0; $k -lt $sorted.Count; $k++) { $sorted[$k].Number = [string]($k + 1) } }
+  foreach ($ep in $sorted) {
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($ep.Name) + '.'
+    $ep.Subs = @($subs | Where-Object { $_.Name.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase) })
+  }
+  if ($sorted.Count -eq 1 -and $sorted[0].Subs.Count -eq 0) { $sorted[0].Subs = @($subs | Select-Object -First 20) }
   return $sorted
 }
+
+# rqbit's ids of an episode's files: the video and its subtitle files.
+function Get-TorrentItemFiles($it) { return @(@($it.Torrent.Idx) + @($it.Torrent.Subs | ForEach-Object { $_.Idx })) }
 
 function Set-TorrentItemFile($it, $ep) {
   $it.Torrent.Idx = $ep.Idx
   $it.Torrent.Bytes = $ep.Length
   $it.Torrent.Rel = $ep.Rel
+  $it.Torrent.Subs = @($ep.Subs)
   $it.Torrent.Number = $ep.Number
   $it.Name = [System.IO.Path]::GetFileNameWithoutExtension($ep.Name)
 }
@@ -2840,7 +2898,18 @@ function Complete-TorrentJob($g) {
   if (-not $g.Name) { $g.Name = [string](Get-JsonVal $d 'name') }
   $id = Get-JsonVal $a 'id'
   if ($null -ne $id) {
+    $old = $null
+    if ($script:Rqbit) { $old = $script:Rqbit.Torrents[[string]$id] }
+    if ($old -and $old -ne $g) {
+      # The same torrent queued again (another link to it, a later hand-over): rqbit has it once, so its episodes
+      # become episodes of the group that has it (one list of files to download, deleted after the last one).
+      foreach ($q in @($script:Queue)) { if ($q.Kind -eq 'torrent' -and $q.Torrent -and $q.Torrent.G -eq $g) { $q.Torrent.G = $old } }
+      $old.Refs += [Math]::Max(0, $g.Refs)
+      $g.Refs = 0
+      return
+    }
     $g.Id = [string]$id
+    $g.Engine = $script:Rqbit
     $g.OutDir = [string](Get-JsonVal $d 'output_folder')
     if (-not $g.OutDir) { $g.OutDir = [string](Get-JsonVal $a 'output_folder') }
     if ($script:Rqbit) { $script:Rqbit.Torrents[$g.Id] = $g }
@@ -2985,6 +3054,7 @@ function Step-TorrentPrep($item) {
       $g.Error = T 'no one is sharing this torrent right now (no file list after {0} s)' $sec
     } else { Complete-TorrentJob $g }
     if ($g.Error) { throw $g.Error }
+    $g = $t.G   # (another group if this torrent was queued already)
   }
   $magnet = ($g.Body -is [string])
   if (-not $g.Files) {
@@ -2997,15 +3067,16 @@ function Step-TorrentPrep($item) {
   if ($t.Idx -lt 0) { Resolve-TorrentItem $item }
   if (-not $g.Id) {
     Assert-TorrentSpace $t.Bytes
-    $q = '/torrents?overwrite=true&only_files=' + $t.Idx + '&sub_folder=' + $g.Hash
+    $mine = @(Get-TorrentItemFiles $item)
+    $q = '/torrents?overwrite=true&only_files=' + ($mine -join ',') + '&sub_folder=' + $g.Hash
     if ($magnet) { $q += '&timeout_ms=90000' }
-    Start-TorrentJob $g $q 90 @($t.Idx)
+    Start-TorrentJob $g $q 90 $mine
     return
   }
   # (Just added, rqbit still checks what is on disk: it takes no changes until then.)
   if ((Get-Date) -lt $g.RetryAt) { return }
   # Only the files being downloaded now (rqbit takes them in order); finished ones stay on disk until played.
-  $want = @($t.Idx) + @($script:Queue | Where-Object { $_ -ne $item -and $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' } | ForEach-Object { $_.Torrent.Idx })
+  $want = @(Get-TorrentItemFiles $item) + @($script:Queue | Where-Object { $_ -ne $item -and $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' } | ForEach-Object { Get-TorrentItemFiles $_ })
   $want = @($want | Sort-Object -Unique)
   if (($want -join ',') -ne (@($g.Want | Sort-Object -Unique) -join ',')) {
     if (-not $g.Want.Contains($t.Idx)) { Assert-TorrentSpace $t.Bytes }
@@ -3022,7 +3093,7 @@ function Step-TorrentPrep($item) {
     $g.Paused = $false
   }
   $now = Get-Date
-  $item.Dl = [pscustomobject]@{ Started = $now; NextPoll = $now; LastPoll = $now; LastBytes = [long]-1; MovedAt = $now; Done = [long]0; Speed = 0.0; Peers = 0; Eta = -1.0; WokeAt = $null; Kicked = $false }
+  $item.Dl = [pscustomobject]@{ Started = $now; NextPoll = $now; LastPoll = $now; LastBytes = [long]-1; MovedAt = $now; Done = [long]0; Speed = 0.0; Peers = 0; Eta = -1.0; WokeAt = $null; Kicked = $false; Fails = 0; VidDoneAt = $null; Fp = @() }
   $item.DlKind = 'torrent'
   $item.State = 'downloading'
   Update-TorrentDownload $item
@@ -3039,13 +3110,25 @@ function Update-TorrentDownload($item) {
   if (($now - $dl.LastPoll).TotalSeconds -gt 30) { $dl.WokeAt = $now; $dl.MovedAt = $now; $dl.Kicked = $false }
   $dl.LastPoll = $now
   $dl.NextPoll = $now.AddSeconds(2)
-  $r = $null
-  try { $r = Invoke-Rqbit 'GET' "/torrents/$($g.Id)/stats/v1" $null '' 3 } catch { return }
-  if ($r.Status -ne 200) { return }
+  # rqbit ended (a crash, an antivirus): this download is lost (no call to a port nobody listens on: ~2 s each).
+  if ($g.Engine -and $g.Engine -eq $script:Rqbit) { [void](Test-TorrentEngine) }
+  if ($g.Error) { throw $g.Error }
+  if (-not $script:Rqbit -or ($g.Engine -and $g.Engine -ne $script:Rqbit)) { throw (T 'rqbit isn''t running') }
+  # (A few failed looks in a row: rqbit doesn't answer, or no longer has this torrent.)
+  $r = $null; $why = $null
+  try { $r = Invoke-Rqbit 'GET' "/torrents/$($g.Id)/stats/v1" $null '' 3 } catch { $why = T 'rqbit didn''t answer' }
+  if (-not $why -and $r.Status -ne 200) { $why = T 'rqbit: {0}' (Get-RqbitError $r.Text) }
   $j = $null
-  try { $j = ConvertFrom-JsonDict $r.Text } catch { return }
+  if (-not $why) { try { $j = ConvertFrom-JsonDict $r.Text } catch { $why = T 'rqbit: {0}' (T 'unexpected answer') } }
+  if ($why) {
+    $dl.Fails++
+    if ($dl.Fails -ge 3) { throw $why }
+    return
+  }
+  $dl.Fails = 0
   if ([string](Get-JsonVal $j 'state') -eq 'error') { throw (T 'rqbit: {0}' (Get-ShortText ([string](Get-JsonVal $j 'error')) 120)) }
   $fp = @(Get-JsonVal $j 'file_progress')
+  $dl.Fp = $fp
   $done = [long]0
   if ($t.Idx -lt $fp.Count) { $done = [long]$fp[$t.Idx] }
   $speed = 0.0; $peers = 0; $eta = -1.0
@@ -3061,13 +3144,23 @@ function Update-TorrentDownload($item) {
   if ($eta -lt 0 -and $speed -gt 0) { $eta = ($t.Bytes - $done) / $speed }
   $dl.Done = $done; $dl.Speed = $speed; $dl.Peers = $peers; $dl.Eta = $eta
   if ($done -ne $dl.LastBytes) { $dl.LastBytes = $done; $dl.MovedAt = $now }
-  if ($t.Bytes -gt 0 -and $done -ge $t.Bytes) { Complete-TorrentDownload $item; return }
+  if ($t.Bytes -gt 0 -and $done -ge $t.Bytes) {
+    # The video is complete; its subtitle files (small) are waited for up to a minute more.
+    $subsLeft = @($t.Subs | Where-Object { $_.Idx -ge $fp.Count -or [long]$fp[$_.Idx] -lt $_.Length }).Count
+    if (-not $dl.VidDoneAt) { $dl.VidDoneAt = $now }
+    if ($subsLeft -eq 0 -or ($now - $dl.VidDoneAt).TotalSeconds -ge 60) { Complete-TorrentDownload $item }
+    return
+  }
   # Nothing came for a minute after the PC woke up: pause + start makes rqbit reconnect and ask the trackers again.
   if ($dl.WokeAt -and -not $dl.Kicked -and ($now - $dl.WokeAt).TotalSeconds -ge 60 -and $dl.MovedAt -le $dl.WokeAt) {
     $dl.Kicked = $true
     try { [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/pause" $null '' 3); [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/start" $null '' 3) } catch {}
   }
-  if (($now - $dl.MovedAt).TotalSeconds -ge 300 -and $peers -eq 0) { throw (T 'stalled: nobody shared it for {0} minutes' 5) }
+  # No progress: 5 minutes with nobody to download from, 15 with people who don't have the missing parts (S S on the
+  # waiting screen gives it up sooner).
+  $idle = ($now - $dl.MovedAt).TotalSeconds
+  if ($idle -ge 300 -and $peers -eq 0) { throw (T 'stalled: nobody shared it for {0} minutes' 5) }
+  if ($idle -ge 900) { throw (T 'stalled: the people sharing it had nothing new for {0} minutes' 15) }
 }
 
 function Complete-TorrentDownload($item) {
@@ -3080,13 +3173,24 @@ function Complete-TorrentDownload($item) {
     $p = $null
     $leaf = [System.IO.Path]::GetFileName($t.Rel)
     try {
-      foreach ($f in [System.IO.Directory]::GetFiles($script:Rqbit.DlDir, $leaf, [System.IO.SearchOption]::AllDirectories)) {
+      $root = $script:Rqbit.DlDir
+      if ($g.Engine) { $root = $g.Engine.DlDir }
+      foreach ($f in [System.IO.Directory]::GetFiles($root, $leaf, [System.IO.SearchOption]::AllDirectories)) {
         if ((New-Object System.IO.FileInfo($f)).Length -eq $t.Bytes) { $p = $f; break }
       }
     } catch {}
   }
   if (-not $p) { throw (T 'the downloaded file isn''t there') }
   $item.Path = $p
+  # Its subtitle files that came complete.
+  $fp = @()
+  if ($item.Dl) { $fp = @($item.Dl.Fp) }
+  foreach ($s in @($t.Subs)) {
+    if (-not $g.OutDir -or $s.Idx -ge $fp.Count -or [long]$fp[$s.Idx] -lt $s.Length) { continue }
+    $sp = $null
+    try { $sp = [System.IO.Path]::GetFullPath((PathJoin $g.OutDir $s.Rel)) } catch {}
+    if ($sp -and [System.IO.File]::Exists($sp)) { $item.ExtraSubs = @($item.ExtraSubs) + @(New-ExternalSubTrack $sp) }
+  }
   # Complete: no more uploading (unless "Torrents": "seed", or another episode of it still downloads).
   $busy = @($script:Queue | Where-Object { $_ -ne $item -and $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' }).Count -gt 0
   if ((Get-TorrentsSetting) -ne 'seed' -and -not $busy -and -not $g.Paused) {
@@ -3095,17 +3199,54 @@ function Complete-TorrentDownload($item) {
   $item.State = 'probe'
 }
 
+# An episode of a torrent whose other episodes are still queued (a batch): its own file goes now; the rest of the
+# torrent goes after the last one (Remove-TorrentRef). Not while seeding ("Torrents": "seed").
+function Remove-TorrentEpisodeFile($item) {
+  $t = $item.Torrent
+  $g = $t.G
+  if ($g.Refs -le 1 -or -not $item.Path -or -not $g.OutDir -or (Get-TorrentsSetting) -eq 'seed') { return }
+  if (-not ([string]$item.Path).StartsWith($g.OutDir, [System.StringComparison]::OrdinalIgnoreCase)) { return }
+  if (@($script:Queue | Where-Object { $_ -ne $item -and $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and -not $_.Torrent.Released -and $_.Torrent.Idx -eq $t.Idx }).Count -gt 0) { return }
+  try { [System.IO.File]::Delete($item.Path) } catch {}
+}
+
+$script:TorrentDropped = New-Object System.Collections.ArrayList
 # An episode played (or was skipped / dropped): when none of its torrent's episodes is left, rqbit deletes the files.
 function Remove-TorrentRef($g) {
   $g.Refs--
   if ($g.Refs -gt 0) { return }
-  Stop-TorrentJob $g
+  # An add still waiting for rqbit's answer can't be called back: once rqbit answers, that torrent is deleted
+  # (Clear-DroppedTorrents), so it neither downloads nor uploads for nobody.
+  if ($g.Job -and -not $script:TorrentDropped.Contains($g)) { [void]$script:TorrentDropped.Add($g) }
   $e = $script:Rqbit
-  if ($g.Id -and $e -and $e.Ready) {
+  if ($g.Id -and $e -and $e.Ready -and (-not $g.Engine -or $g.Engine -eq $e)) {
     try { [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/delete" $null '' 5) } catch {}
     [void]$e.Torrents.Remove($g.Id)
+  } elseif ($g.Id -and $g.Engine -and $g.Engine -ne $e -and $g.OutDir -and $g.OutDir.StartsWith($g.Engine.DlDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    # (rqbit ended meanwhile: its files go from here.)
+    try { [System.IO.Directory]::Delete($g.OutDir, $true) } catch {}
   }
   $g.Id = $null
+}
+
+# Released torrents whose add was still on its way (see Remove-TorrentRef): deleted in rqbit once it answered.
+function Clear-DroppedTorrents {
+  for ($i = $script:TorrentDropped.Count - 1; $i -ge 0; $i--) {
+    $g = $script:TorrentDropped[$i]
+    if ($g.Job -and -not $g.Job.H.IsCompleted) {
+      if (((Get-Date) - $g.Job.Started).TotalSeconds -lt $g.Job.Sec + 30) { continue }
+      Stop-TorrentJob $g
+    } elseif ($g.Job) {
+      Complete-TorrentJob $g
+      $e = $script:Rqbit
+      if ($g.Id -and $e -and $e.Ready -and $g.Engine -eq $e) {
+        try { [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/delete" $null '' 5) } catch {}
+        [void]$e.Torrents.Remove($g.Id)
+      }
+      $g.Id = $null
+    }
+    $script:TorrentDropped.RemoveAt($i)
+  }
 }
 
 function Format-Bytes([double]$b) {
@@ -3144,20 +3285,20 @@ function Get-ScreenNoteText {
   return ''
 }
 
-# The waiting screen reads its extra line from this file (ffmpeg's drawtext, every frame). The file is replaced in one
-# step, never deleted or half-written: a read that failed would stop the waiting screen.
+# The waiting screen reads its extra line from this file (ffmpeg's drawtext, every frame). It is rewritten in place,
+# sharing it with that reader, and never deleted or replaced: a read that failed (the file renamed away for a moment
+# made ffmpeg's open fail with "Permission denied") would stop the waiting screen.
 function Get-NoteFile { return (PathJoin $script:SlateDir "next-$PID.txt") }
 function Write-ScreenNote([string]$text) {
   if (-not $script:SlateDir) { return }
   if (-not $text) { $text = ' ' }
   if ($text -eq $script:NoteText) { return }
-  $f = Get-NoteFile
-  $tmp = $f + '.tmp'
+  $b = $script:Utf8NoBom.GetBytes($text)
   try {
-    [System.IO.File]::WriteAllText($tmp, $text, $script:Utf8NoBom)
-    if ([System.IO.File]::Exists($f)) { [System.IO.File]::Replace($tmp, $f, [System.Management.Automation.Language.NullString]::Value) } else { [System.IO.File]::Move($tmp, $f) }
+    $fs = New-Object System.IO.FileStream((Get-NoteFile), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::Write, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    try { $fs.Write($b, 0, $b.Length); $fs.SetLength($b.Length) } finally { $fs.Dispose() }
     $script:NoteText = $text
-  } catch { try { [System.IO.File]::Delete($tmp) } catch {} }
+  } catch {}
 }
 
 # Called every 2 s while a screen or video plays: at most every 5 s.
@@ -3566,6 +3707,7 @@ function Wait-Prep($item) {
 
 # Gets the next videos ready in the background. Downloads run one at a time, in queue order.
 function Update-Prep {
+  if ($script:TorrentDropped.Count -gt 0) { Clear-DroppedTorrents }
   $last = [Math]::Min($script:Queue.Count - 1, $script:Idx + 2)
   for ($i = $script:Idx; $i -le $last; $i++) {
     $it = $script:Queue[$i]
@@ -4202,6 +4344,11 @@ function Resolve-Cmd($c, [string]$kind, [ref]$why) {
     'paused' { @('resume', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow') }
     'hold' { @('start', 'pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow') }
     default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest') }
+  }
+  # The waiting screen while a torrent episode downloads for its turn: S S gives that episode up.
+  if ($kind -eq 'waiting' -and $script:Idx -lt $script:Queue.Count) {
+    $nx = $script:Queue[$script:Idx]
+    if ($nx.Kind -eq 'torrent' -and @('new', 'torrent-meta', 'downloading') -contains $nx.State) { $fits = @($fits) + @('skip') }
   }
   if ($fits -contains $cmd) {
     if ($cmd -eq $c.Cmd) { return $c }
@@ -5538,6 +5685,11 @@ function Invoke-Queue {
       $r = Invoke-Source -Kind 'waiting' -UntilNextReady
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { break }
       if ($r.Outcome -eq 'stop') { Say (T '  Nothing is playing. Q Q ends the stream.') 'Gray'; continue }
+      if ($r.Outcome -eq 'skip') {
+        # (A torrent episode that was still downloading: given up.)
+        if ($cur -and $cur.State -ne 'ready' -and $cur.State -ne 'failed') { $cur.State = 'failed'; $cur.Error = T 'skipped before its download finished' }
+        continue
+      }
       if ($r.Outcome -eq 'resync') { Restart-RelayForResync 'waiting'; continue }
       # The Settings menus ask in this window: the waiting screen goes on meanwhile (a server drops viewers of a
       # stream that stops sending). A menu that changes the stream stops / restarts it itself.
@@ -6161,6 +6313,7 @@ function Stop-Everything {
   foreach ($bg in $script:BgProcs) { Stop-Proc $bg.Proc }
   # rqbit deletes what it downloaded, then ends (before the item folders go).
   try { Stop-TorrentEngine } catch {}
+  try { Remove-DeadTorrentEngines } catch {}
   Close-Relay
   Start-Sleep -Milliseconds 300
   try { [System.IO.File]::Delete((Get-RelayProgPath)) } catch {}

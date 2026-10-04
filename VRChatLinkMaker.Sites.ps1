@@ -5650,6 +5650,12 @@ function Find-SiteContent([string]$query) {
     # (Trusted uploads only; the size we send narrows the 75 newest down to one resolution.)
     @{ Url = 'https://nyaa.si/?page=rss&q=' + [Uri]::EscapeDataString("$q $(Get-QualityCap)p") + '&c=1_2&f=2'; TimeoutSec = $sec }
   )
+  # ("Torrents": "off": the English torrent sources aren't asked at all.)
+  if ((Get-TorrentsSetting) -eq 'off') {
+    $keep = @(for ($i = 0; $i -lt $srcs.Count; $i++) { if ($en -notcontains $srcs[$i]) { $i } })
+    $reqs = @($keep | ForEach-Object { $reqs[$_] })
+    $srcs = @($keep | ForEach-Object { $srcs[$_] })
+  }
   $answers = @(Invoke-WebParallel $reqs)
   # AniLiberty / AnimeVost not answering at that address: all their other addresses at once, in one more round (as
   # Invoke-MirrorApi would try them one after the other: the first one in its order that answers is taken).
@@ -5736,6 +5742,7 @@ function Find-SiteContent([string]$query) {
   # A few from each, then fill up with whatever is left (WPARTY's first, Dream Cast's last). The own-voice-over rows go
   # last too: Enter should take the show with every voice-over (picked by DubPriority), not "Overlord 4" from Dream Cast.
   $order = @($srcs | Where-Object { $apart -notcontains $_ }) + @($apart | Where-Object { $_ -ne 'dreamcast' -and $en -notcontains $_ }) + @('dreamcast') + $en
+  $order = @($order | Where-Object { $srcs -contains $_ })
   $take = @{}
   $n = 0
   foreach ($s in $srcs) { $take[$s] = [Math]::Min($kept[$s].Count, $script:SearchQuota[$s]); $n += $take[$s] }
@@ -5878,6 +5885,8 @@ function Read-NyaaRss([string]$text) {
     $url = Get-XmlText $it 'link' $ns
     $view = Get-XmlText $it 'guid' $ns
     if ($view -notmatch '^(?i)https?://') { $view = $url }
+    # (Asked for trusted uploads only (f=2); one marked otherwise anyway is left out.)
+    if ((Get-XmlText $it 'nyaa:trusted' $ns) -eq 'No') { continue }
     [void]$out.Add([pscustomobject]@{ Title = (Get-XmlText $it 'title' $ns); Url = $url; View = $view; Seeders = $seed
         Size = (Get-XmlText $it 'nyaa:size' $ns); Trusted = ((Get-XmlText $it 'nyaa:trusted' $ns) -eq 'Yes') })
   }
@@ -5949,8 +5958,17 @@ function Get-EnCachedEps([string]$u) {
   return , $null
 }
 
+# The [EN] rows are torrents: none when torrents are off; a window that may ask asks about rqbit first (the window
+# that streams can't ask, so it would refuse them all later).
+function Assert-EnTorrents([string]$u) {
+  if ((Get-TorrentsSetting) -eq 'off') { Say (T '  Torrents are off ("Torrents": "off" in config.json): {0}' (Get-ShortText $u 70)) 'Yellow'; return $false }
+  if ((Test-CanAsk) -and -not (Get-PinnedTool 'rqbit' $true)) { throw (T 'torrents need rqbit, which isn''t set up') }
+  return $true
+}
+
 # A SubsPlease show -> which episodes (asked, handed over, or all), one torrent each.
 function Expand-SubsPlease([string]$u) {
+  if (-not (Assert-EnTorrents $u)) { return @() }
   $page = [regex]::Match($u, '(?i)/shows/([^/?#]+)').Groups[1].Value
   $name = Get-UrlParam $u 'name'
   $eps = Get-EnCachedEps $u
@@ -5983,6 +6001,7 @@ function Expand-SubsPlease([string]$u) {
 
 # A Nyaa group row -> which episodes, one .torrent each.
 function Expand-NyaaGroup([string]$u) {
+  if (-not (Assert-EnTorrents $u)) { return @() }
   $eps = Get-EnCachedEps $u
   if ($null -eq $eps) {
     $q = Get-UrlParam $u 'q'; $grp = Get-UrlParam $u 'grp'; $show = Get-UrlParam $u 'show'; $res = Get-UrlParam $u 'res'
@@ -6038,6 +6057,14 @@ function Invoke-ContentSearch([string]$query, [switch]$AskPlayer) {
   catch { Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
   if ($items.Count -eq 0) { return @() }
   if ($AskPlayer) { Read-HandoverPlayer $items }
+  if (@($items | Where-Object { $_.Kind -ne 'torrent' }).Count -eq 0) {
+    # Torrents ([EN] rows): their own links (magnets, .torrent files) with the episodes, so the streaming window
+    # doesn't look the site up again (a wait while a video plays). Several links: an array.
+    $gs = New-Object System.Collections.ArrayList
+    foreach ($it in $items) { if (-not $gs.Contains($it.Torrent.G)) { [void]$gs.Add($it.Torrent.G) } }
+    $script:LastSearchLink = @($gs | ForEach-Object { $g = $_; Get-TorrentHandover @($items | Where-Object { $_.Torrent.G -eq $g }) $g.Link })
+    return $items
+  }
   $script:LastSearchLink = $row.Link
   $choice = Get-SiteChoiceText $items
   if ($choice) { $script:LastSearchLink += '#vrclm=' + $choice }

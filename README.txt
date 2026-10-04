@@ -119,15 +119,23 @@ subtitles and fonts included). Meanwhile the waiting screen shows viewers how
 far the download got ("Downloading the next episode: 45% of 700 MB, about
 1 min").
 
-- Only download what you are allowed to. The tool ships no trackers and no
-  lists; what you download is your own responsibility.
+- Only download what you are allowed to. The search only shows what Nyaa
+  (trusted uploads) and SubsPlease list; what you download is your own
+  responsibility.
 - The first time, it asks to download rqbit, a small free torrent program
   (12.7 MB, Apache-2.0, from github.com/ikatson/rqbit) into the bin\rqbit
   folder. Nothing is installed. Its checksum is verified.
 - While an episode downloads it also uploads to other people (that's how
   torrents work), capped at 32 KB/s. When the episode is complete, it stops
-  uploading.
-- Episodes are deleted after they have played (and when the tool closes).
+  uploading (unless another episode of the same torrent still downloads).
+- Episodes are deleted after they have played. What is left goes when the
+  tool closes (or, if its window was closed with X, the next time the tool
+  starts).
+- Subtitle files that come with a video in the torrent (named like it) are
+  downloaded with it and can be picked like a video's own subtitles.
+- S S on the waiting screen gives up an episode that is still downloading.
+  An episode that gets nothing new for 5 minutes (nobody shares it) or 15
+  minutes (the people sharing it lack the missing parts) is skipped.
 - Windows may ask whether rqbit may use the network: Cancel is fine, it works
   either way.
 - A magnet link or a bare hash first needs the file list from the people
@@ -510,7 +518,8 @@ All of these are optional.
   YummyAppToken  empty (the default). YummyAnime works without one today; if
               it starts asking for an app token, make one on its site
               (yummyani.me/dev/applications) and put it here.
-  Torrents    "on" (the default), "off" (torrent links are ignored) or
+  Torrents    "on" (the default), "off" (torrent links are ignored and
+              SubsPlease / Nyaa aren't searched) or
               "seed" (keeps uploading after an episode is complete).
   TorrentUploadKBps    32. The upload cap while an episode downloads (at
               least 8).

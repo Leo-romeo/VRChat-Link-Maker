@@ -820,5 +820,8 @@
   "SubsPlease isn't answering (HTTP {0})": "SubsPlease не отвечает (HTTP {0})",
   "SubsPlease doesn't list this show any more": "этого сериала на SubsPlease больше нет",
   "Nyaa isn't answering (HTTP {0})": "Nyaa не отвечает (HTTP {0})",
-  "Nyaa doesn't list these episodes any more": "этих серий на Nyaa больше нет"
+  "Nyaa doesn't list these episodes any more": "этих серий на Nyaa больше нет",
+  "stalled: the people sharing it had nothing new for {0} minutes": "скачивание встало: у раздающих нет недостающих частей уже {0} мин",
+  "three times": "уже три раза",
+  "skipped before its download finished": "пропущено, пока скачивалось"
 }
