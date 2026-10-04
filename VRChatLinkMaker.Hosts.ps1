@@ -32,6 +32,12 @@ $script:HostYesN = '[' + [char]0x043D + [char]0x041D + ']'
 
 function Test-HostFn([string]$name) { return [bool](Get-Command $name -CommandType Function -ErrorAction SilentlyContinue) }
 
+# Console navigation (the main script's flows): the host menu's questions run as one flow, so Esc goes back. Before a
+# step that can't be undone (config saved, a code imported, setup files written, DuckDNS told) Lock-HostStep makes sure
+# no Back crosses it; a flow re-running its earlier answers (Test-HostReplaying) skips the slow server checks.
+function Lock-HostStep { if (Test-HostFn 'Lock-NavStep') { Lock-NavStep } }
+function Test-HostReplaying { return ((Test-HostFn 'Test-NavReplaying') -and (Test-NavReplaying)) }
+
 # A short wait that keeps the control window answering (the main script's Wait-Pump), else a plain sleep.
 function Wait-HostPump([int]$ms) {
   if (Test-HostFn 'Wait-Pump') { Wait-Pump ($ms / 1000.0) } else { Start-Sleep -Milliseconds $ms }
@@ -539,8 +545,24 @@ function Test-AnswerYes([string]$ans) {
   return $false
 }
 
-function Read-HostLine([string]$prompt) {
-  $a = Read-Host $prompt
+# A line of text (trimmed). Asked through Invoke-Ask: inside a flow Esc goes back and your earlier text comes back
+# pre-filled (-Secret: shown as *, never pre-filled; Right arrow = what you typed before; -Private: shown as typed, but
+# never pre-filled and *** in the path line, e.g. an address, a token or a link with a stream key). -Key: the step's
+# name; -Esc: what Esc gives on a one-off question.
+function Read-HostLine {
+  [CmdletBinding(PositionalBinding = $false)]
+  param([Parameter(Position = 0)][string]$prompt, [string]$Key = '', [switch]$Secret, [switch]$Private, [object]$Esc = $null)
+  if (-not (Test-HostFn 'Invoke-Ask')) {
+    $a = Read-Host $prompt
+    if ($null -eq $a) { return '' }
+    return "$a".Trim()
+  }
+  $q = New-NavAsk 'text' '' $Key
+  $q.Prompt = $prompt
+  $q.Secret = [bool]$Secret
+  $q.Private = [bool]$Private
+  if ($PSBoundParameters.ContainsKey('Esc')) { $q.HasEsc = $true; $q.EscValue = [string]$Esc }
+  $a = Invoke-Ask $q
   if ($null -eq $a) { return '' }
   return "$a".Trim()
 }
@@ -555,8 +577,8 @@ function Set-SelfHostNameInteractive($s) {
   $cur = "$(Get-Prop $s 'HostName')"
   $n = ''
   while ($true) {
-    if ($cur) { $ans = Read-HostLine (T 'Name (just Enter = keep {0}, "auto" = your internet address)' $cur) }
-    else { $ans = Read-HostLine (T 'Name (e.g. myname.duckdns.org; just Enter = automatic: your internet address)') }
+    if ($cur) { $ans = Read-HostLine (T 'Name (just Enter = keep {0}, "auto" = your internet address)' $cur) -Key 'pc-name' }
+    else { $ans = Read-HostLine (T 'Name (e.g. myname.duckdns.org; just Enter = automatic: your internet address)') -Key 'pc-name' }
     if (-not $ans) { return }
     if ($ans -match '^(?i)(auto|automatic|-)$') { $s.HostName = ''; return }
     if ($ans -notmatch '[.:]') { $ans = $ans + '.duckdns.org' }
@@ -570,8 +592,9 @@ function Set-SelfHostNameInteractive($s) {
     return
   }
   $old = "$(Get-Prop $s 'DuckDnsToken')"
-  if ($old) { $t = Read-HostLine (T 'DuckDNS token (just Enter = keep the saved one)') }
-  else { $t = Read-HostLine (T 'DuckDNS token (just Enter = skip)') }
+  # (The token is a password: never in the path line, nor typed in again for you.)
+  if ($old) { $t = Read-HostLine (T 'DuckDNS token (just Enter = keep the saved one)') -Key 'pc-token' -Private }
+  else { $t = Read-HostLine (T 'DuckDNS token (just Enter = skip)') -Key 'pc-token' -Private }
   if ($t) {
     if ($t -notmatch '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$') {
       Say (T '   That doesn''t look like a DuckDNS token (like a1b2c3d4-...), but it is saved anyway.') 'Yellow'
@@ -581,6 +604,7 @@ function Set-SelfHostNameInteractive($s) {
   if (-not "$(Get-Prop $s 'DuckDnsToken')") {
     Say (T '  Without the token this tool can''t keep the name pointing at your PC - it has to be kept up to date some other way.') 'Yellow'
   } elseif (Test-HostFn 'Update-DuckDns') {
+    Lock-HostStep   # (DuckDNS is told the new name now: no Back past this)
     $r = $null
     try { $r = Update-DuckDns $s } catch { $r = $_.Exception.Message }
     if ($r) { Say ('  ' + $r) 'DarkGray' }
@@ -927,7 +951,7 @@ function Test-VpsReady($p) {
   if ($problem) {
     Say $problem 'Yellow'
     if (-not $canAsk) { Say (T '  This time it streams through Topaz Chat.') 'Yellow'; return $false }
-    $pick = Read-Choice (T 'Stream to the VPS anyway?') @((T 'No - stream through Topaz Chat this time'), (T 'Yes - try the VPS anyway'), (T 'Choose another host')) 0 $false
+    $pick = Read-Choice (T 'Stream to the VPS anyway?') @((T 'No - stream through Topaz Chat this time'), (T 'Yes - try the VPS anyway'), (T 'Choose another host')) 0 $false -Esc 0
     if ($pick -eq 1) { return $true }
     if ($pick -eq 2) { return 'menu' }
     return $false
@@ -935,7 +959,7 @@ function Test-VpsReady($p) {
   if ($r.State -eq 'live') {
     Say (T '  Someone is streaming on this VPS link right now (another PC with the same connection code?). Streaming from here takes the stream over.') 'Yellow'
     if (-not $canAsk) { Say (T '  This time it streams through Topaz Chat.') 'Yellow'; return $false }
-    $pick = Read-Choice (T 'Take the stream over?') @((T 'No - stream through Topaz Chat this time'), (T 'Yes - take it over'), (T 'Choose another host')) 0 $false
+    $pick = Read-Choice (T 'Take the stream over?') @((T 'No - stream through Topaz Chat this time'), (T 'Yes - take it over'), (T 'Choose another host')) 0 $false -Esc 0
     if ($pick -eq 1) { return $true }
     if ($pick -eq 2) { return 'menu' }
     return $false
@@ -1021,10 +1045,12 @@ function Invoke-VpsCodeImport($v, [string]$text) {
       elseif ($lost.Count -gt 0) { Say (T '  This code replaces this PC''s VPS settings. These streams are only known here and would be dropped: {0}.' ($lost -join ', ')) 'Yellow' }
       else { Say (T '  This code replaces this PC''s VPS settings (this PC then uses the link in the code).') 'Yellow' }
       Say (T '  (The settings so far are kept in config.json as "VpsBefore".)') 'DarkGray'
-      if (-not (Test-AnswerYes (Read-HostLine (T 'Use the code anyway? [y/N]')))) { return $false }
+      if (-not (Read-YesNoUi (T 'Use the code anyway? [y/N]') $false -Esc $false -Key 'vps-code-anyway')) { return $false }
+      Lock-HostStep
       Save-VpsBefore $v
     }
   }
+  Lock-HostStep   # (taken over and saved: no Back past this)
   Import-VpsConnectCode $v $k
   Save-VpsConfig
   if ($k.Manage) { Show-VpsBundle $v -Quiet }
@@ -1084,7 +1110,11 @@ function Add-VpsStream($v) {
   $i = 2
   while ($taken -contains (T 'Stream {0}' $i)) { $i++ }
   $def = T 'Stream {0}' $i
-  $name = ConvertTo-VpsStreamName (Read-HostLine (T 'A name for it, e.g. who streams with it (just Enter = "{0}")' $def)) $def
+  # (Its own little flow: Esc at the name = don't add a stream.)
+  $nr = Invoke-NavFlow -Name 'vps-add' -Origin 'menu' -Body { Read-HostLine (T 'A name for it, e.g. who streams with it (just Enter = "{0}")' $def) -Key 'vps-add-name' }
+  if ($nr.Nav) { return }
+  $name = ConvertTo-VpsStreamName ([string](@($nr.Value) | Select-Object -Last 1)) $def
+  Lock-HostStep
   # (Two streams with one name couldn't be told apart in the menus.)
   $base = $name; $i = 2
   while ($taken -contains $name) {
@@ -1115,7 +1145,7 @@ function Select-VpsCode($v, $list) {
     else { $opts += $e.Name }
   }
   $opts += (T 'The whole server - for another PC of yours that should manage it too (it also gets this PC''s link)')
-  $i = Read-Choice (T 'The code for which stream?') $opts -1 $true
+  $i = Read-Choice (T 'The code for which stream?') $opts -1 $true -Esc -1
   if ($i -lt 0) { return }
   if ($i -ge $list.Count) {
     Say (T '  The code for the whole server (it holds every stream''s password):') 'White'
@@ -1130,10 +1160,19 @@ function Select-VpsCode($v, $list) {
 function Remove-VpsStreamInteractive($v, $list) {
   $others = @($list | Where-Object { -not $_.Own })
   if ($others.Count -eq 0) { return }
-  $i = Read-Choice (T 'Remove which stream?') @($others | ForEach-Object { $_.Name }) -1 $true
-  if ($i -lt 0) { return }
-  $gone = $others[$i]
-  if (-not (Test-AnswerYes (Read-HostLine (T 'Remove "{0}"? Its link stops working once install.sh is pasted on the server again. [y/N]' $gone.Name)))) { return }
+  # (The pick and its confirm are their own little flow: Esc at the confirm = back to the pick, Esc at the pick = none.)
+  $names = @($others | ForEach-Object { $_.Name })
+  $rr = Invoke-NavFlow -Name 'vps-remove' -Origin 'menu' -Body {
+    $i = Read-Choice (T 'Remove which stream?') $names -1 $true -Key 'vps-remove' -Values $names
+    if ($i -lt 0) { return }
+    if (-not (Read-YesNoUi (T 'Remove "{0}"? Its link stops working once install.sh is pasted on the server again. [y/N]' $others[$i].Name) $false -Esc $false -Key 'vps-remove-yes')) { return }
+    $i
+  }
+  if ($rr.Nav) { return }
+  $pick = @($rr.Value | Where-Object { $_ -is [int] })
+  if ($pick.Count -eq 0) { return }
+  $gone = $others[$pick[-1]]
+  Lock-HostStep
   $chg = $false
   Set-VpsStreamList $v @(@(Get-Prop $v 'Streams') | Where-Object { $null -ne $_ -and "$($_.Token)" -cne $gone.Token }) ([ref]$chg)
   Save-VpsConfig
@@ -1143,7 +1182,7 @@ function Remove-VpsStreamInteractive($v, $list) {
 
 # New passwords for every stream (the links stay): every code given out stops working once install.sh is pasted again.
 function Reset-VpsAllPasswords($v) {
-  if (-not (Test-AnswerYes (Read-HostLine (T 'New passwords for every stream? Every code given out stops working once install.sh is pasted on the server again; the links stay the same. [y/N]')))) { return }
+  if (-not (Read-YesNoUi (T 'New passwords for every stream? Every code given out stops working once install.sh is pasted on the server again; the links stay the same. [y/N]') $false -Esc $false)) { return }
   $chg = $false
   Set-HostField $v 'PublishPass' (New-HostSecret 24) ([ref]$chg)
   Set-HostField $v 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
@@ -1160,6 +1199,8 @@ function Reset-VpsAllPasswords($v) {
 
 function Invoke-VpsStreamsMenu($v) {
   if (-not (Test-HostFn 'Read-Choice')) { return }
+  # (Reached after the setup files were written: its questions are one-off, Esc here = Done.)
+  Lock-HostStep
   while ($true) {
     $list = @(Get-VpsStreams $v)
     $states = @(Get-VpsStreamStates $v $list)
@@ -1168,7 +1209,7 @@ function Invoke-VpsStreamsMenu($v) {
     for ($i = 0; $i -lt $list.Count; $i++) { Say ('   - ' + (Format-VpsStreamLine $list[$i] $states[$i])) 'Gray' }
     $opts = @((T 'Done'), (T 'Add a stream for another PC'), (T 'Show a connection code'), (T 'New passwords for every stream (takes back every code given out)'))
     if ($list.Count -gt 1) { $opts += (T 'Remove a stream') }
-    $pick = Read-Choice (T 'Anything else for the VPS?') $opts 0 $false
+    $pick = Read-Choice (T 'Anything else for the VPS?') $opts 0 $false -Esc 0
     if ($pick -eq 1) { Add-VpsStream $v }
     elseif ($pick -eq 2) { Select-VpsCode $v $list }
     elseif ($pick -eq 3) { Reset-VpsAllPasswords $v }
@@ -1188,9 +1229,9 @@ function Set-VpsInteractive($v) {
     $name = ConvertTo-VpsStreamName (Get-Prop $v 'Name')
     if ($name) { Say (T '  This PC streams on "{0}" on the VPS {1} (from a connection code); the server is managed on another PC.' $name $v.Address) 'White' }
     else { Say (T '  This PC streams on the VPS {0} (from a connection code); the server is managed on another PC.' $v.Address) 'White' }
-    Show-VpsDiagnosis $false
+    if (-not (Test-HostReplaying)) { Show-VpsDiagnosis $false }   # (a Back re-runs this: the check is shown already)
     while ($true) {
-      $ans = Read-HostLine (T 'Paste a new connection code, or type an address to set up a server of your own (just Enter = keep it like this)')
+      $ans = Read-HostLine (T 'Paste a new connection code, or type an address to set up a server of your own (just Enter = keep it like this)') -Key 'vps-address' -Private
       if (-not $ans) { return [bool]"$(Get-Prop $v 'Address')" }
       if (Test-VpsCodeText $ans) {
         if (Invoke-VpsCodeImport $v $ans) { return $true }
@@ -1200,7 +1241,8 @@ function Set-VpsInteractive($v) {
       if ($n -and $n -eq (ConvertTo-HostAddress "$(Get-Prop $v 'Address')")) { return $true }   # (the same server: nothing changes)
       if ($n) {
         Say (T '  That sets up a server of your own at {0}: this PC stops using the connection code. Its settings are kept in config.json as "VpsBefore".' $n) 'Yellow'
-        if (-not (Test-AnswerYes (Read-HostLine (T 'Set up a server of your own? [y/N]')))) { continue }
+        if (-not (Read-YesNoUi (T 'Set up a server of your own? [y/N]') $false -Esc $false -Key 'vps-own')) { continue }
+        Lock-HostStep
         Save-VpsBefore $v
         # A server of its own: new passwords (the old ones belong to the other server's stream).
         Reset-VpsOwnSecrets $v
@@ -1214,8 +1256,8 @@ function Set-VpsInteractive($v) {
     Say (T '  Got a connection code from the PC that manages a server? Paste it here instead of the address.') 'Gray'
     $cur = "$(Get-Prop $v 'Address')"
     while ($true) {
-      if ($cur) { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = keep the saved address)') }
-      else { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = I don''t have one yet)') }
+      if ($cur) { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = keep the saved address)') -Key 'vps-address' -Private }
+      else { $ans = Read-HostLine (T 'The VPS''s address, or a connection code (just Enter = I don''t have one yet)') -Key 'vps-address' -Private }
       if (-not $ans) { break }
       if (Test-VpsCodeText $ans) {
         if (Invoke-VpsCodeImport $v $ans) { return $true }
@@ -1232,6 +1274,7 @@ function Set-VpsInteractive($v) {
       Say (T '   That isn''t an IP address or a name like vps.example.com - try again.') 'Yellow'
     }
   }
+  Lock-HostStep   # (the setup files are written now: no Back past this)
   Show-VpsBundle $v
   if (-not "$(Get-Prop $v 'Address')") {
     Say (T '  Once the server runs, choose "My VPS" here again and type its address.') 'Cyan'
@@ -1261,11 +1304,13 @@ function Set-CustomInteractive($c) {
   foreach ($a in $ask) {
     while ($true) {
       $d = $cur[$a.K]
-      # (The address to send to holds the stream key: it is never printed.)
-      if ($d -and $a.K -eq 'IngestUrl') { $ans = Read-HostLine (T '{0} (just Enter = keep the saved link)' $a.Q) }
-      elseif ($d) { $ans = Read-HostLine (T '{0} (just Enter = {1})' $a.Q $d) }
-      elseif ($a.Need) { $ans = Read-HostLine (T '{0} (just Enter = cancel)' $a.Q) }
-      else { $ans = Read-HostLine (T '{0} (just Enter = none)' $a.Q) }
+      # (The address to send to holds the stream key: it is never printed, nor shown in the path line.)
+      $sec = ($a.K -eq 'IngestUrl')
+      $key = 'custom-' + $a.K
+      if ($d -and $sec) { $ans = Read-HostLine (T '{0} (just Enter = keep the saved link)' $a.Q) -Key $key -Private }
+      elseif ($d) { $ans = Read-HostLine (T '{0} (just Enter = {1})' $a.Q $d) -Key $key -Private:$sec }
+      elseif ($a.Need) { $ans = Read-HostLine (T '{0} (just Enter = cancel)' $a.Q) -Key $key -Private:$sec }
+      else { $ans = Read-HostLine (T '{0} (just Enter = none)' $a.Q) -Key $key -Private:$sec }
       if (-not $ans) {
         if ($d -or -not $a.Need) { break }
         return $false
@@ -1280,10 +1325,12 @@ function Set-CustomInteractive($c) {
   return $true
 }
 
-# The host menu. Saves config.json. Returns $true when the host or its links changed (the stream must restart).
+# The host menu. Saves config.json (only when something changed). Returns $true when the host or its links changed (the
+# stream must restart). The main script runs it as a flow (Invoke-HostChoice): Esc at the first question leaves it.
 function Select-Host {
   if (-not $script:Interactive) { return $false }
   $c = $script:Cfg
+  $was = $c | ConvertTo-Json -Depth 8 -Compress
   [void](Initialize-HostConfig)
   $cfgP = Get-HostProfile
   $cfgId = $cfgP.Id
@@ -1320,7 +1367,10 @@ function Select-Host {
     Sync-HostServerName $c $id ([ref]$chg)
   }
   [void](Initialize-HostConfig)
-  try { Save-Config $c } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red' }
+  if (($c | ConvertTo-Json -Depth 8 -Compress) -cne $was) {
+    Lock-HostStep
+    try { Save-Config $c } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red' }
+  }
   $after = Get-HostProfile
   $changed = ($after.Id -ne $before.Id -or $after.IngestUrl -ne $before.IngestUrl -or $after.PcUrl -ne $before.PcUrl -or $after.QuestUrl -ne $before.QuestUrl)
   if ($ok) { Say (T '  Streaming via: {0}' $after.Name) 'Green' }
@@ -1346,7 +1396,8 @@ function Reset-StreamLink {
   }
   if (-not $script:Interactive) { return $false }
   Say (T '  A new link replaces the old one: the old link stops working (worlds and friends who have it need the new one).') 'Yellow'
-  if (-not (Test-AnswerYes (Read-HostLine (T 'Make a new link? [y/N]')))) { Say (T '  The link stays as it is.') 'DarkGray'; return $false }
+  if (-not (Read-YesNoUi (T 'Make a new link? [y/N]') $false -Esc $false -Key 'newlink')) { Say (T '  The link stays as it is.') 'DarkGray'; return $false }
+  Lock-HostStep
   $chg = $false
   switch ($p.Id) {
     'topaz' {
@@ -1617,8 +1668,7 @@ function Get-MediaMtxExe([bool]$canAsk) {
   }
   if (-not $canAsk) { return $null }
   Say (T 'Streaming from your own PC or server needs MediaMTX, a free stream server (one program, nothing is installed).') 'Cyan'
-  $ans = Read-Host (T 'Download MediaMTX (28 MB) from github.com/bluenviron/mediamtx? [Y/n]')
-  if (Test-AnswerNo $ans) { return $null }
+  if (-not (Read-YesNoUi (T 'Download MediaMTX (28 MB) from github.com/bluenviron/mediamtx? [Y/n]') $true -Esc $false)) { return $null }
   $zip = PathJoin $script:TempRoot 'mediamtx-download.zip'
   try {
     if (-not [System.IO.Directory]::Exists($script:TempRoot)) { [void][System.IO.Directory]::CreateDirectory($script:TempRoot) }
@@ -3425,12 +3475,6 @@ function Save-HostKbps($p, [int]$kbps) {
 
 function Get-Floor50([double]$x) { return [int]([Math]::Floor($x / 50.0) * 50) }
 
-# The answer to "Start the speed test?": just Enter = yes, but = no while viewers would lose the picture ($strict).
-function Test-SpeedTestYes([string]$ans, [bool]$strict) {
-  if ($strict) { return (Test-AnswerYes $ans) }
-  return (-not (Test-AnswerNo $ans))
-}
-
 # The speed test (a menu item). Topaz: a throwaway stream key; vps / custom: the profile's own ingest address;
 # pc: an upload test (viewers pull from this PC, so the upload speed is the limit). -> Kbps (recommended), Saved, Result.
 # -Target / -TargetFormat / -TestKbps override where and how hard it pushes (tests use a local MediaMTX).
@@ -3453,7 +3497,7 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   if ($p.Id -eq 'pc' -and -not $Target) {
     Say (T 'Speed test for streaming from this PC: every viewer pulls the stream from your internet line, so what counts is your upload speed.') 'Cyan'
     Say (T 'It sends {0} MB of random test data to speed.cloudflare.com.' $UploadMB) 'Gray'
-    if ($ask -and -not (Test-SpeedTestYes (Read-Host $q) $ViewersWatch)) { return $out }
+    if ($ask -and -not (Read-YesNoUi $q (-not $ViewersWatch) -Esc $false)) { return $out }
     if ($BeforeRun) { & $BeforeRun }
     $u = Measure-UploadSpeed ([long]$UploadMB * 1MB)
     $out.Result = $u
@@ -3474,7 +3518,7 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
     Say (T 'Viewers far away may get less than this.') 'DarkGray'
     $out.Kbps = $vals[1]
     if ($ask -and -not $NoSave) {
-      $i = Read-Choice (T 'Use which bitrate for this PC? (0 = keep the current one)') $opts 1 $true
+      $i = Read-Choice (T 'Use which bitrate for this PC? (0 = keep the current one)') $opts 1 $true -Esc -1
       if ($i -ge 0) {
         $k = [Math]::Max($vals[$i], $minK)
         $out.Kbps = $k
@@ -3508,7 +3552,7 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   }
   Say (T 'Speed test: sends a test picture at {0} kbps to {1} for about {2} s and measures how much gets through.' $kbps $where $Seconds) 'Cyan'
   if ($p.Id -eq 'custom' -and -not $Target) { Say (T 'This uses your own stream address: if it is a public channel (e.g. Twitch), people may see the test picture.') 'Yellow' }
-  if ($ask -and -not (Test-SpeedTestYes (Read-Host $q) $ViewersWatch)) { return $out }
+  if ($ask -and -not (Read-YesNoUi $q (-not $ViewersWatch) -Esc $false)) { return $out }
   if ($BeforeRun) { & $BeforeRun }
   $r = Measure-PushSpeed $url $fmt $kbps $Seconds
   $out.Result = $r
@@ -3532,7 +3576,7 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   $out.Kbps = $rec
   Say (T 'Recommended video bitrate: {0} kbps (80% of what got through, at most {1}).' $rec $maxK) 'Cyan'
   if ($ask -and -not $NoSave) {
-    if (-not (Test-AnswerNo (Read-Host (T 'Save {0} kbps for {1}? [Y/n]' $rec $p.Name)))) {
+    if (Read-YesNoUi (T 'Save {0} kbps for {1}? [Y/n]' $rec $p.Name) $true -Esc $false) {
       $out.Saved = Save-HostKbps $p $rec
       if ($out.Saved) { Say (T 'Saved: {0} kbps (used from the next video).' $rec) 'Green' }
     }
