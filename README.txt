@@ -177,9 +177,21 @@ At the top:
   The input box    type a title, paste a link or a file path and press Enter
                    (or Add): it works like typing it into the console. Files...
                    and Folder... pick videos. You can also drop files, a folder
-                   or a link anywhere on the window, or press Ctrl+V. While the
-                   console asks its first questions the box is off: answer in
-                   the console for now.
+                   or a link anywhere on the window, or press Ctrl+V. On the
+                   start screen the box answers its first question (what to
+                   stream).
+  Questions        every question the console asks shows here too, under the
+                   input box: buttons or a list to pick from, Yes / No, or a
+                   box to type in (a password shows as dots), with < Back,
+                   Forward > and Cancel where the console has them. Answer
+                   either here or in the console: the first answer counts.
+                   Enter = OK, Esc = what Esc does in the console, Alt+Left =
+                   back, Alt+Right = forward, 1-9 pick an option. When the
+                   window is behind another one (VRChat), its taskbar button
+                   flashes and a short sound plays; it never takes the focus.
+                   Questions about the next video while viewers wait (which
+                   audio / subtitles, which player) take the suggested answer
+                   after 60 seconds (AskTimeoutSec); the strip counts down.
   A yellow or red strip shows the latest warning for about 15 seconds (click it
   to hide it; every message stays in Messages below).
 
@@ -198,15 +210,15 @@ Below that: a live preview of what's being streamed, a seek bar, and buttons:
   Settings         the same list as M in the console: where to stream, picture
                    size and language to pick from a list, the upload speed
                    test, a new link, "ask again". They work while nothing
-                   plays. What needs typing (a VPS code, your own server's
-                   links, a DuckDNS name) is asked in the console window.
-                   Also Open log.txt and End stream.
+                   plays; their questions show in the window and the console.
+                   Also Open log.txt and End stream (it works while a question
+                   waits too).
   Clock on the stream   shows the video time in a corner of the picture, so
                    you can compare who is behind
   Always on top
 
-Space and the arrow keys work in it too (not while you type in a box). Don't
-want it? Set "ControlWindow": false in config.json.
+Space and the arrow keys work in it too (not while you type in a box or a
+question is open). Don't want it? Set "ControlWindow": false in config.json.
 
 
 CONTROL IT FROM THE WORLD'S VIDEO PLAYER
@@ -488,6 +500,10 @@ All of these are optional.
               (not recommended: the picture may not come).
   Clock       false. true shows the video time in a corner of the picture.
   ControlWindow       true (the default) opens the control window.
+  AskTimeoutSec       60. A question about the next video asked while viewers
+              wait (audio / subtitles, which player, installing yt-dlp) takes
+              the suggested answer after this many seconds. 0 = wait forever.
+              Questions on the start screen and in Settings always wait.
   WorldPlayerControl  true (the default) lets the world's video player pause /
               continue / skip (see above). false turns that off.
   Host        "topaz" (the default), "pc", "vps" or "custom". H sets it.

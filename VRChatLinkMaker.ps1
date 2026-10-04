@@ -144,6 +144,7 @@ function Get-ConsoleWidth {
 }
 
 function Clear-StatusLine {
+  try { if ($script:UiBus.Status) { $script:UiBus.Status = $null } } catch {}
   if ($script:StatusShown) {
     $w = Get-ConsoleWidth
     Write-Host ("`r" + (' ' * $w) + "`r") -NoNewline
@@ -163,6 +164,14 @@ function Say([string]$text, [string]$color = '') {
 # The control window's message pane gets every Say line: the window drains the queue, and the ring refills a reopened window.
 $script:UiLog = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 $script:UiLogRing = New-Object 'System.Collections.Generic.List[object]'
+# The bus between this thread and the control window: made once, so it outlives the window (a language change or F2
+# opens a new window on the same bus: no click, question or answer is lost). Log = the message lines (above); Cmds =
+# the window's clicks ({Cmd; Arg}); Ask = the question open now (a copy for the window, see Publish-UiAsk) or $null;
+# Answers = the window's answers ({Id; Nav; Text; Pick; Yes; Files}); Status = the console's status line
+# ({Text; At}, while it shows one); QuitReq = End stream was clicked (Test-UiQuit).
+$script:UiBus = [hashtable]::Synchronized(@{
+    Log = $script:UiLog; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Ask = $null
+    Answers = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Status = $null; QuitReq = $false })
 function Add-UiLogLine([string]$text, [string]$color) {
   try {
     $e = @($text, $color)
@@ -211,7 +220,10 @@ function Join-StatusKeys([string]$s, [string]$more) {
   return ($main.Substring(0, $room).TrimEnd() + '...' + $tail)
 }
 
-function Show-Status([string]$text) {
+# -NoWindow: a status the control window gets in its own way (Update-Panel); others (a download's %, the speed test)
+# show in the window's status line too while they are fresh.
+function Show-Status([string]$text, [switch]$NoWindow) {
+  if (-not $NoWindow) { try { $script:UiBus.Status = @{ Text = $text.Trim(); At = [DateTime]::UtcNow } } catch {} }
   if (-not $script:HasConsole) { return }
   if (Test-ScrolledUp) { return }
   $w = Get-ConsoleWidth
@@ -476,9 +488,24 @@ namespace VRCLinkMaker {
     }
     public string Text { get { lock (gate) { return text; } } }
   }
-  // (The control window: the grey hint text in its input box, EM_SETCUEBANNER.)
+  // (The control window: the grey hint text in its input box, EM_SETCUEBANNER; a question flashes its taskbar button
+  // until the window comes to the front, never taking the focus: Flash / StopFlash; is the console in front?)
   public static class Win {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
+    [StructLayout(LayoutKind.Sequential)] struct FlashInfo { public uint Size; public IntPtr Hwnd; public uint Flags; public uint Count; public uint Timeout; }
+    [DllImport("user32.dll")] static extern bool FlashWindowEx(ref FlashInfo f);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    static bool DoFlash(IntPtr h, uint flags) {
+      FlashInfo f = new FlashInfo();
+      f.Size = (uint)Marshal.SizeOf(typeof(FlashInfo));
+      f.Hwnd = h;
+      f.Flags = flags;
+      return FlashWindowEx(ref f);
+    }
+    public static bool Flash(IntPtr h) { return DoFlash(h, 3 | 12); }   // FLASHW_ALL | FLASHW_TIMERNOFG
+    public static bool StopFlash(IntPtr h) { return DoFlash(h, 0); }
+    public static bool ConsoleInFront() { IntPtr c = GetConsoleWindow(); return c != IntPtr.Zero && c == GetForegroundWindow(); }
   }
 }
 '@
@@ -1755,22 +1782,50 @@ function Read-Entries([string]$Prefill = '') {
     if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
     if ($add) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
     $line = ''
-    while ($keys) {
-      $r = Read-AskLine '>' $Prefill -Nav
-      $Prefill = ''
-      if ($r.Nav -eq 'back') {
-        # (Esc never ends the stream: Q + Enter does. A second window just closes.)
-        if ($add) { return @($script:QuitMark) }
-        Show-NavHint (T '  Q + Enter = end the stream.')
-        continue
+    $picked = $null
+    # (The control window's input box answers this question too: a line, or files picked / dropped there.)
+    $la = $null
+    if ($keys) {
+      $script:NavAskSeq++
+      $la = @{ Id = 'm' + $script:NavAskSeq; Kind = 'line'; Title = (T 'What do you want to stream?'); Deadline = $null }
+      $b = $script:UiBus
+      if ($b) { $x = $null; while ($b.Answers.TryDequeue([ref]$x)) {}; $b.Ask = $la }
+    }
+    try {
+      while ($keys) {
+        $r = Read-AskLine '>' $Prefill -Nav -Ask $la
+        $Prefill = ''
+        if ($r.From -and $null -ne $r.From.Files) { $picked = @($r.From.Files); break }
+        if ($r.Nav -eq 'back') {
+          # (Esc never ends the stream: Q + Enter does. A second window just closes.)
+          if ($add) { return @($script:QuitMark) }
+          Show-NavHint (T '  Q + Enter = end the stream.')
+          continue
+        }
+        if ($r.Nav -eq 'forward') { Show-NavHint (T '  (Nothing to go forward to.)'); continue }
+        if ($r.Nav) { continue }
+        $line = [string]$r.Text
+        break
       }
-      if ($r.Nav -eq 'forward') { Show-NavHint (T '  (Nothing to go forward to.)'); continue }
-      if ($r.Nav) { continue }
-      $line = [string]$r.Text
-      break
+    } finally { if ($la) { Clear-UiAsk $la.Id } }
+    if ($null -ne $picked) {
+      if ($picked.Count -gt 0) { return $picked }
+      continue
     }
     if (-not $keys) { $line = [string](Read-Host '>') }
     $script:EntryLine = $line
+    # Several lines at once (a list of links pasted or dropped in the control window): each a link or a path; of the
+    # titles among them only the first one is searched for.
+    $lns = @(@($line -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($lns.Count -gt 1) {
+      $script:EntryLine = ''
+      $out = @()
+      $titles = @()
+      foreach ($ln in $lns) { if (Test-IsTitle $ln) { $titles += $ln } else { $out += @(Split-EntryLine $ln) } }
+      if ($titles.Count -gt 1) { Say (T '  Only the first title is searched for ({0}); {1} more skipped.' $titles[0] ($titles.Count - 1)) 'Yellow' }
+      if ($titles.Count -gt 0) { $out += $titles[0] }
+      return $out
+    }
     if (-not $line.Trim()) {
       $files = @(Show-FilePicker)
       if ($files.Count -gt 0 -or -not $keys) { return $files }
@@ -3269,19 +3324,18 @@ function Wait-RelayRetry([bool]$video = $true) {
 }
 
 # Sleeps, but keeps handing the control window its state meanwhile (the window itself runs on its own thread).
+# End stream in the window ends the tool from here too (Test-UiQuit).
 function Wait-Pump([double]$seconds) {
   $until = (Get-Date).AddSeconds($seconds)
-  while ((Get-Date) -lt $until) { Invoke-PanelPump; Start-Sleep -Milliseconds 50 }
+  while ((Get-Date) -lt $until) { Invoke-PanelPump; Test-UiQuit; Start-Sleep -Milliseconds 50 }
 }
 
-# -Asking: a question waits for its answer here (Read-NavKey): the window's input row is off meanwhile (a line typed
-# there would only run after the question, as a new line); the next Update-Panel turns it on again.
-function Invoke-PanelPump([switch]$Asking) {
+# While this thread waits (a question, a pause) the window gets its state from here.
+function Invoke-PanelPump {
   if (-not $script:PanelShown) { return }
   try {
     # (While a question waits nothing else updates the window: on / off and the link follow here.)
     $s = $script:PanelState
-    if ($Asking -and $s -and -not $s['Asking']) { $s = $s.Clone(); $s.Asking = $true; $script:PanelState = $s }
     if ($s -and ($s.Mode -eq 'waiting' -or $s.Mode -eq 'off')) {
       $mode = 'off'
       if (Test-RelayAlive) { $mode = 'waiting' }
@@ -3304,6 +3358,20 @@ function Stop-ByCtrlC {
   $script:StopAll = $true
   Add-Cmd (New-Cmd 'quit')
   throw (New-Object System.OperationCanceledException (T 'Stopped (Ctrl+C).'))
+}
+
+# End stream clicked in the control window (bus.QuitReq) while this thread waits or asks: the same clean end as Ctrl+C
+# (every catch that passes Ctrl+C on passes this on too). Outside questions and waits Receive-Commands takes it.
+$script:QuitFromWindow = $false
+function Test-UiQuit {
+  $b = $script:UiBus
+  if ($null -eq $b -or -not $b.QuitReq) { return }
+  $b.QuitReq = $false
+  $script:QuitFromWindow = $true
+  $script:CtrlCQuit = $true
+  $script:StopAll = $true
+  Add-Cmd (New-Cmd 'quit' $null 'panel')
+  throw (New-Object System.OperationCanceledException (T 'Ended from the control window.'))
 }
 
 # ------------------------------------------------------------------ the key reader
@@ -3349,7 +3417,7 @@ function Test-NavKeyWaiting {
 function Read-NavKey {
   if ($script:NavKeyAhead.Count -gt 0) { $k = $script:NavKeyAhead[0]; $script:NavKeyAhead.RemoveAt(0); return $k }
   if ($script:KeySource) { return (& $script:KeySource 'read') }
-  while (-not [Console]::KeyAvailable) { Invoke-PanelPump -Asking; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
+  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
   return [Console]::ReadKey($true)
 }
 
@@ -3418,10 +3486,14 @@ function Clear-NavRepeat {
   } catch {}
 }
 
-# Reads one answer line -> @{ Nav = '' | 'back' | 'forward' | 'home'; Text }. -Prefill: text already typed (editable).
-# -Secret: the typed characters show as '*'.
-function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav, [switch]$Secret) {
-  $out = @{ Nav = ''; Text = '' }
+# Reads one answer line -> @{ Nav = '' | 'back' | 'forward' | 'home'; Text; From }. -Prefill: text already typed
+# (editable). -Secret: the typed characters show as '*'. -Ask: the question as the control window has it (Publish-UiAsk):
+# its answer there counts too, the first one wins (From = that answer, see Wait-AskInput; the typing here is dropped),
+# and with a Deadline the time limit too (From.Timeout).
+function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav, [switch]$Secret, $Ask = $null) {
+  $out = @{ Nav = ''; Text = ''; From = $null }
+  $wait = ($null -ne $Ask -and (($script:PanelShown -and $null -ne $script:UiBus) -or $Ask.Deadline))
+  $got = $null
   # Before the control window opens, Ctrl+C at a question works as usual (it ends the tool), also while the stream
   # reads keys itself. With the control window open it arrives here as a key: a clean stop.
   $ctrlKey = $false
@@ -3437,6 +3509,10 @@ function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav,
     $clearedAt = [datetime]::MinValue
     while ($true) {
       $k = $null
+      if ($wait) {
+        $got = Wait-AskInput $Ask
+        if ($got) { break }
+      }
       try { $k = Read-NavKey }
       catch [System.IO.EndOfStreamException] { throw }
       catch { break }
@@ -3482,11 +3558,136 @@ function Read-AskLine([string]$Prompt = '', [string]$Prefill = '', [switch]$Nav,
         if ($Secret) { Write-AskEcho ('*' * $chunk.Length) } else { Write-AskEcho $chunk.ToString() }
       }
     }
-    Write-Host ''
-    $out.Text = $sb.ToString()
-    if ($out.Nav) { $out.Text = ''; Clear-NavRepeat }
+    if ($got) {
+      # (Answered in the window, or no answer in time: what was typed here goes.)
+      if ($sb.Length -gt 0) { Remove-AskEcho $sb.Length }
+      if ($got.Timeout) { Write-Host (T '(no answer)') -ForegroundColor DarkGray } else { Write-Host (T '(answered in the window)') -ForegroundColor DarkGray }
+      $out.Nav = [string]$got.Nav
+      $out.Text = [string]$got.Text
+      $out.From = $got
+    } else {
+      Write-Host ''
+      $out.Text = $sb.ToString()
+      if ($out.Nav) { $out.Text = ''; Clear-NavRepeat }
+    }
   } finally { if ($ctrlKey) { Set-CtrlCAsKey $true } }
   return $out
+}
+
+# Until a key waits in the console: the control window's answer to $Ask (by its Id; answers to older questions are
+# dropped), End stream in the window (Test-UiQuit), or the Ask's time limit -> that answer
+# (@{ Window = $true; Nav; Text; Pick; Yes; Files; Prefilled }, or @{ Timeout = $true }), $null = a key waits.
+# Meanwhile the window gets its state and the router keeps this PC's port forwards (Update-AskLeases).
+function Wait-AskInput($Ask) {
+  $win = ($script:PanelShown -and $null -ne $script:UiBus)
+  while (-not (Test-NavKeyWaiting)) {
+    if ($win) {
+      $w = Receive-UiAnswer ([string]$Ask.Id)
+      if ($w) { return $w }
+    }
+    Test-UiQuit
+    if ($Ask.Deadline -and [DateTime]::UtcNow -ge [DateTime]$Ask.Deadline) { return @{ Timeout = $true; Nav = ''; Text = '' } }
+    Invoke-PanelPump
+    Update-NavKeyUp
+    Update-AskLeases
+    Start-Sleep -Milliseconds 40
+  }
+  return $null
+}
+
+# The window's answer to the question with this Id, or $null. Answers to other (older) questions are dropped.
+function Receive-UiAnswer([string]$id) {
+  $b = $script:UiBus
+  if ($null -eq $b -or $null -eq $b.Answers) { return $null }
+  $x = $null
+  while ($b.Answers.TryDequeue([ref]$x)) {
+    try {
+      if ($null -eq $x -or [string]$x['Id'] -cne $id) { continue }
+      $nav = [string]$x['Nav']
+      if (@('', 'back', 'forward', 'home') -notcontains $nav) { continue }
+      $files = $null
+      if ($null -ne $x['Files']) { $files = [string[]]@(@($x['Files']) | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() }) }
+      return @{ Window = $true; Nav = $nav; Text = [string]$x['Text']; Pick = $x['Pick']; Yes = $x['Yes']; Files = $files; Prefilled = [bool]$x['Prefilled'] }
+    } catch {}
+  }
+  return $null
+}
+
+# The router's lease on this PC's port forwards (This PC) is renewed from a long question too (a look at most every 2 s).
+$script:AskLeaseAt = [DateTime]::MinValue
+function Update-AskLeases {
+  $now = [DateTime]::UtcNow
+  if ($now -lt $script:AskLeaseAt) { return }
+  $script:AskLeaseAt = $now.AddSeconds(2)
+  try { Update-UpnpLeases } catch {}
+}
+
+# The question the control window shows (bus.Ask), a copy of the Ask: Id, Kind, Title (a yes / no question without
+# its "[Y/n]"), Options / AllowNone / NoneLabel (choice), Default (what Enter gives: an index, a bool), Prev (your
+# earlier answer: index / bool; never a text), Crumb, BackMode ('back' | 'leave' | 'esc' | 'saved' | ''), CanBack,
+# BackLabel, CanHome (Cancel leaves the task), EscLabel (what Esc gives on a one-off question), CanForward, Secret,
+# Prefill (a text: your earlier one, never a secret; episodes: the suggested range; All = every episode) and Deadline
+# (UTC, or $null). Answers still waiting from before are dropped. Returns the copy (Read-AskLine waits on it).
+function Publish-UiAsk($a, [bool]$canHome = $false) {
+  $kind = [string]$a.Kind
+  $title = [string]$a.Title
+  if (-not $title) { $title = [string]$a.Prompt }
+  if ($kind -eq 'yesno') { $title = $title -replace '\s*\[[^\[\]]{1,8}/[^\[\]]{1,8}\]\s*:?\s*$', '' }
+  $v = @{ Id = [string]$a.Id; Kind = $kind; Title = $title.Trim(); Options = [string[]]@(); AllowNone = $false; NoneLabel = ''; Default = $null
+    Prev = $null; Crumb = ([string]$a.Crumb).Trim(); BackMode = [string]$a.BackMode; CanBack = [bool]$a.CanBack; BackLabel = [string]$a.BackLabel
+    CanHome = $canHome; EscLabel = ''; CanForward = [bool]$a.CanForward; Secret = [bool]$a.Secret; Prefill = ''; All = ''; Deadline = $a.Deadline }
+  if ($a.BackMode -eq 'esc') { try { $v.EscLabel = [string](Get-AskEscValue $a).Label } catch {} }
+  if ($kind -eq 'choice') {
+    $v.Options = [string[]]@(@($a.Options) | ForEach-Object { [string]$_ })
+    $v.AllowNone = [bool]$a.AllowNone
+    if ($a.AllowNone) {
+      $l = T '   0) None'
+      if ($a.NoneLabel) { $l = [string]$a.NoneLabel }
+      $v.NoneLabel = ($l -replace '^\s*0\)\s*', '').Trim()
+    }
+    $v.Default = [int]$a.Default
+    if ($a.Prev) {
+      $v.Prev = [int]$a.Prev.Result
+      if (-not $a.EnterDefault) { $v.Default = [int]$a.Prev.Result }
+    }
+  } elseif ($kind -eq 'yesno') {
+    $v.Default = [bool]$a.DefaultYes
+    if ($a.Prev) { $v.Prev = [bool]$a.Prev.Result; $v.Default = [bool]$a.Prev.Result }
+  } elseif ($kind -eq 'text') {
+    if ($a.Prev -and -not $a.Secret -and -not $a.Private) { $v.Prefill = [string]$a.Prev.Stored }
+  } elseif ($kind -eq 'episodes') {
+    $l = @($a.List)
+    if ($l.Count -gt 0) {
+      $last = [string]$l[$l.Count - 1].Number
+      $dp = [int]$a.DefPos
+      if ($dp -lt 0 -or $dp -ge $l.Count) { $dp = 0 }
+      $v.All = ([string]$l[0].Number) + '-' + $last
+      $v.Prefill = ([string]$l[$dp].Number) + '-' + $last
+    }
+    if ($a.Prev -and [string]$a.Prev.Stored) { $v.Prefill = [string]$a.Prev.Stored }
+  }
+  $b = $script:UiBus
+  if ($b) {
+    $x = $null
+    while ($b.Answers.TryDequeue([ref]$x)) {}
+    $b.Ask = $v
+  }
+  return $v
+}
+
+# The question with this Id ended (answered, Back, Ctrl+C, End stream): the window's strip closes.
+function Clear-UiAsk([string]$id) {
+  $b = $script:UiBus
+  try { if ($b -and $b.Ask -and [string]$b.Ask.Id -ceq $id) { $b.Ask = $null } } catch {}
+}
+
+# A question from the waiting screen's preparation while the stream is on the air (Select-Tracks, the player, a yt-dlp
+# install asked meanwhile: $script:PrepAsk) takes its suggested answer after "AskTimeoutSec" (config.json; 60, 0 = never)
+# seconds: whoever is in VR isn't kept waiting. Startup and menu questions wait as long as it takes. -> seconds, 0 = none.
+$script:PrepAsk = $false
+function Get-AskTimeout {
+  if (-not $script:PrepAsk -or -not (Test-RelayAlive)) { return 0 }
+  return [int](Get-NumSetting 'AskTimeoutSec' 60 0 86400)
 }
 
 # Read-Host everywhere in the tool (also in Sites / Hosts / Update): the key reader above when there is a console, so
@@ -3775,14 +3976,17 @@ function Get-AskPrompt($a) {
   return [string]$a.Prompt
 }
 
-# One reply: the console's key reader, or (no console) the plain line reader, where a typed '<' / '>' means Back /
-# Forward. Later the control window's answers come in here too.
+# One reply: the console's key reader (where the control window's answer counts too: Window, with Pick / Yes), or (no
+# console) the plain line reader, where a typed '<' / '>' means Back / Forward. Timeout: no answer in time (= Enter).
 function Read-AskReply($a) {
   $prompt = Get-AskPrompt $a
   if ($script:HasConsole -or $script:KeySource) {
     $pre = ''
     if ($a.Kind -eq 'text' -and $a.Prev -and -not $a.Secret -and -not $a.Private) { $pre = [string]$a.Prev.Stored }
-    $r = Read-AskLine $prompt $pre -Nav:([bool]$a.NavOn) -Secret:([bool]$a.Secret)
+    $r = Read-AskLine $prompt $pre -Nav:([bool]$a.NavOn) -Secret:([bool]$a.Secret) -Ask $a.View
+    $g = $r.From
+    if ($g -and $g.Timeout) { return @{ Nav = ''; Text = ''; Typed = $false; Prefilled = $false; Timeout = $true } }
+    if ($g) { return @{ Nav = $r.Nav; Text = $r.Text; Typed = $false; Prefilled = [bool]$g.Prefilled; Window = $true; Pick = $g.Pick; Yes = $g.Yes } }
     return @{ Nav = $r.Nav; Text = $r.Text; Typed = $false; Prefilled = [bool]$pre }
   }
   $t = Read-Host $prompt
@@ -3794,6 +3998,14 @@ function Read-AskReply($a) {
 # episode and yes/no questions where Back means something, and before the yes/no testers ("nazad" starts with "n").
 function Resolve-AskReply($a, $reply) {
   if ($reply.Nav) { return @{ Act = [string]$reply.Nav } }
+  # (The window says which one: an option's index, -1 = "0) None"; yes / no explicitly. Its texts come as typed.)
+  if ($reply.Window -and $a.Kind -eq 'choice' -and $null -ne $reply.Pick) {
+    $i = -2
+    try { $i = [int]$reply.Pick } catch {}
+    if (($i -ge 0 -and $i -lt @($a.Options).Count) -or ($i -eq -1 -and ($a.AllowNone -or $a.Default -eq -1))) { return (Get-AskValue $a $i) }
+    return @{ Act = 'again'; Msg = '' }
+  }
+  if ($reply.Window -and $a.Kind -eq 'yesno' -and $null -ne $reply.Yes) { return (Get-AskValue $a ([bool]$reply.Yes)) }
   $t = [string]$reply.Text
   $tt = $t.Trim()
   if ($reply.Typed -and $a.NavOn) {
@@ -3891,9 +4103,36 @@ function Invoke-Ask($a) {
   $a.Crumb = ''
   if ($step -and $n -gt 0) { $a.Crumb = Get-NavCrumb $f $n }
   Show-AskBody $a
+  $limit = Get-AskTimeout
+  $a.Deadline = $null
+  if ($limit -gt 0) {
+    $a.Deadline = [DateTime]::UtcNow.AddSeconds($limit)
+    Show-NavHint (T '  (No answer in {0} s = the suggested answer.)' $limit)
+  }
+  # (The control window shows it too, until it ends in any way: answered here or there, Back, Ctrl+C, End stream. Should
+  # that copy fail, the console still asks: the window just doesn't show it.)
+  try { $a.View = Publish-UiAsk $a ($step -and -not $sealed -and -not $f.Own) }
+  catch { $a.View = @{ Id = ''; Deadline = $a.Deadline }; Write-LogLine ('  (control window: the question could not be shown: ' + $_.Exception.Message + ')') }
+  try {
+    $res = Read-AskAnswer $a $step $sealed $f $rej $limit
+  } finally { Clear-UiAsk $a.Id }
+  if ($step) { Add-NavTape $f $a $res }
+  return $res.Result
+}
+
+# Invoke-Ask's reading part: replies until one is an answer (Back / Home throw, see Invoke-Ask).
+function Read-AskAnswer($a, [bool]$step, [bool]$sealed, $f, [bool]$rej, [int]$limit) {
   $res = $null
   while ($true) {
-    $res = Resolve-AskReply $a (Read-AskReply $a)
+    $reply = Read-AskReply $a
+    $res = Resolve-AskReply $a $reply
+    if ($res.Act -eq 'value' -and $reply.Timeout) {
+      $lab = [string]$res.Label
+      if ($a.Secret -or $a.Private) { $lab = '***' }
+      Say (T 'No answer in {0} s - used: {1}' $limit $lab) 'Yellow'
+    } elseif ($res.Act -eq 'value' -and $reply.Window -and ($a.Kind -eq 'choice' -or $a.Kind -eq 'yesno')) {
+      Write-LogLine ('  > ' + [string]$res.Label + ' ' + (T '(answered in the window)'))
+    }
     if ($res.Act -eq 'again') { if ($res.Msg) { Say $res.Msg 'Yellow' }; continue }
     if ($res.Act -eq 'forward') {
       if (-not $a.Prev) { Show-NavHint (T '  (Nothing to go forward to.)'); continue }
@@ -3924,8 +4163,7 @@ function Invoke-Ask($a) {
     }
     break
   }
-  if ($step) { Add-NavTape $f $a $res }
-  return $res.Result
+  return $res
 }
 
 function Copy-NavValue($v) {
@@ -4263,6 +4501,8 @@ function Get-QueuedSeek {
 function Receive-Commands([string]$kind) {
   Add-Cmd (Read-KeyCommand $kind)
   try { Update-UpnpLeases } catch {}   # (also while waiting for input, not only while a video plays)
+  # End stream in the control window (the 'quit' it posts too may have gone with the start questions' clicks).
+  try { if ($script:UiBus -and $script:UiBus.QuitReq) { $script:UiBus.QuitReq = $false; Add-Cmd (New-Cmd 'quit' $null 'panel') } } catch {}
   if ($script:PanelShown) {
     for ($i = 0; $i -lt 20; $i++) {
       $p = $null
@@ -4290,6 +4530,10 @@ function Receive-Commands([string]$kind) {
           if ($fs.Count -gt 0) { Invoke-AddEntries $fs $kind }
         }
         { $_ -in @('qplay', 'qup', 'qdown', 'qremove', 'qclear') } { Invoke-QueueCommand $p.Cmd $p.Arg $kind }
+        'quit' {
+          try { $script:UiBus.QuitReq = $false } catch {}
+          Add-Cmd (New-Cmd 'quit' $p.Arg 'panel')
+        }
         default { Add-Cmd (New-Cmd $p.Cmd $p.Arg 'panel') }
       }
     }
@@ -5375,7 +5619,8 @@ function Invoke-Source {
       if ($nx) {
         $idleSince = $now
         $script:PromptOk = $script:Interactive
-        try { Step-Prep $nx } finally { $script:PromptOk = $false }
+        $script:PrepAsk = $true
+        try { Step-Prep $nx } finally { $script:PromptOk = $false; $script:PrepAsk = $false }
         if ($nx.State -eq 'ready' -or $nx.State -eq 'failed') { $requested = 'ready'; Stop-Proc $proc; $quitSentAt = $now }
       } elseif (($now - $idleSince).TotalMinutes -ge $script:IdleMinutes) {
         $requested = 'timeout'; Stop-Proc $proc; $quitSentAt = $now
@@ -5436,7 +5681,7 @@ function Invoke-Source {
         }
       }
       $st = Get-StatusText $Kind $src $Media ($Start + $pos) $speed $Hold $holdAt
-      Show-Status (Join-StatusKeys $st (T '   M = menu'))
+      Show-Status (Join-StatusKeys $st (T '   M = menu')) -NoWindow
       $script:LastStatus = $st
     }
     if ($now -ge $nextPanel) {
@@ -5709,7 +5954,8 @@ function Invoke-Queue {
       $ask = $script:ChoosingMode -and $script:Interactive
       if ($ask -and (Test-RelayAlive)) { Start-Standby }
       $script:PromptOk = $ask
-      try { Step-Prep $cur } finally { $script:PromptOk = $false }
+      $script:PrepAsk = $true
+      try { Step-Prep $cur } finally { $script:PromptOk = $false; $script:PrepAsk = $false }
       $curDone = ($cur.State -eq 'ready' -or $cur.State -eq 'failed')
     }
     if (-not $curDone) {
@@ -6542,7 +6788,9 @@ try {
   Main
 } catch {
   Say ''
-  if ($script:CtrlCQuit) { Say (T 'Stopped (Ctrl+C).') 'Gray' }
+  if ($script:CtrlCQuit) {
+    if ($script:QuitFromWindow) { Say (T 'Ended from the control window.') 'Gray' } else { Say (T 'Stopped (Ctrl+C).') 'Gray' }
+  }
   else {
     Say (T 'Error: {0}' $_.Exception.Message) 'Red'
     if ($env:VRCLM_DEBUG) { Say ($_.ScriptStackTrace) 'DarkGray' }

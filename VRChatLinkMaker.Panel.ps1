@@ -13,7 +13,10 @@
 # The window runs on its own thread: a second runspace (STA) dot-sources this same file and runs the
 # window's message loop there, so it keeps responding while the main loop is busy (looking up the next
 # episode on a site, ffprobe, waiting for ffmpeg). The two threads share only $script:PanelSync, a
-# synchronized hashtable: State (what to show), Cmds (the clicks), Ready, Closed, ShowReq, CloseReq, Error.
+# synchronized hashtable: State (what to show), Cmds (the clicks), Ready, Closed, ShowReq, CloseReq, Error, and Bus:
+# the main script's $script:UiBus, made once, so it outlives every window (Log, Cmds, Ask, Answers, Status, QuitReq;
+# PanelSync.Cmds / .Log are the bus's own). A question open in the console (bus.Ask) shows in the window's question
+# strip too; its answer goes into bus.Answers, and the first answer (console or window) wins.
 # Nothing on the window's side may throw: every handler is wrapped, and an internal error only closes the
 # window (the reason goes to $script:PanelError and log.txt).
 # What the window posts (Cmds, {Cmd; Arg}): the stream's commands (toggle, seek, seekto, skip, stop, resync, quit),
@@ -42,7 +45,10 @@ function Add-PanelCommand([string]$cmd, $arg = $null) {
 function Read-PanelCommand {
   try {
     $c = $null
-    if ($script:PanelSync -and $script:PanelSync.Cmds.TryDequeue([ref]$c)) { return $c }
+    # (The window's Cmds are the bus's: clicks made just before a window closed are still there after it.)
+    $cq = $null
+    if ($script:PanelSync) { $cq = $script:PanelSync.Cmds } elseif ($script:UiBus) { $cq = $script:UiBus.Cmds }
+    if ($cq -and $cq.TryDequeue([ref]$c)) { return $c }
   } catch {}
   return $null
 }
@@ -88,6 +94,8 @@ function Get-PanelFocus {
 # Are Space / Left / Right the window's shortcuts right now? Not while typing in a text box or a drop-down;
 # in a list Left / Right scroll it (Space still pauses).
 function Test-PanelKeyOurs([System.Windows.Forms.Keys]$code) {
+  # (A question in the strip: Space / the arrows are the strip's own keys, see Invoke-PanelAskKey.)
+  try { if ($script:Panel.AskId) { return $false } } catch {}
   $K = [System.Windows.Forms.Keys]
   $fc = $null
   try { $fc = Get-PanelFocus } catch {}
@@ -201,6 +209,8 @@ function New-ControlPanel {
     StopArmedUntil = [DateTime]::MinValue; CopiedUntil = [DateTime]::MinValue; CopiedBtn = $null
     PrevCheck = [DateTime]::MinValue; PrevTime = [DateTime]::MinValue; PrevMissing = [DateTime]::MinValue
     InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; CueSet = $false; CueTries = 0; InputParked = $false; InRows = $false; Timer = $null
+    AskId = ''; AskSent = ''; AskSentAt = [DateTime]::MinValue; AskView = $null; AskFocus = $null; AskFocusPending = $false; AskFlashing = $false
+    AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -260,13 +270,14 @@ function New-ControlPanel {
   $root.ColumnCount = 1
   $root.Padding = New-Object System.Windows.Forms.Padding([int](8 * $k))
   [void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-  # Rows: 0 title, 1 link bar, 2 warnings banner, 3 input box, 4 preview, 5 seek bar, 6 transport, 7 status, 8 player,
-  # 9-10 up next, 11-12 messages, 13 buttons, 14 checkboxes. The preview takes what is left (it shrinks first on a small
-  # screen); up next and messages get a share of it, at least a few lines each (Update-PanelRows).
+  # Rows: 0 title, 1 link bar, 2 warnings banner, 3 input box, 4 question strip (only while a question is open), 5 preview,
+  # 6 seek bar, 7 transport, 8 status, 9 player, 10-11 up next, 12-13 messages, 14 buttons, 15 checkboxes. The preview
+  # takes what is left (it shrinks first on a small screen); up next and messages get a share of it, at least a few
+  # lines each (Update-PanelRows).
   $p.ListMin = [int]($fh * 2.5) + [int](4 * $k)
   $p.LogMin = [int]($fh * 3) + [int](4 * $k)
-  $rowSizes = @('Auto', 'Auto', 'Auto', 'Auto', 'P100', 'Auto', 'Auto', 'Auto', 'Auto', 'Auto', ('A' + [int]($fh * 5)), 'Auto', ('A' + [int]($fh * 6)), 'Auto', 'Auto')
-  $p.RowPreview = 4; $p.RowList = 10; $p.RowLog = 12
+  $rowSizes = @('Auto', 'Auto', 'Auto', 'Auto', 'Auto', 'P100', 'Auto', 'Auto', 'Auto', 'Auto', 'Auto', ('A' + [int]($fh * 5)), 'Auto', ('A' + [int]($fh * 6)), 'Auto', 'Auto')
+  $p.RowPreview = 5; $p.RowList = 11; $p.RowLog = 13
   $root.RowCount = $rowSizes.Count
   foreach ($r in $rowSizes) {
     if ($r -eq 'Auto') { [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
@@ -379,7 +390,10 @@ function New-ControlPanel {
   $p.InputRow = $in
   $root.Controls.Add($in, 0, 3)
 
-  # Row 4: the preview picture (what ffmpeg sends, refreshed about twice a second)
+  # Row 4: the question strip (New-PanelAskStrip), hidden while no question is open.
+  $root.Controls.Add((New-PanelAskStrip), 0, 4)
+
+  # Row 5: the preview picture (what ffmpeg sends, refreshed about twice a second)
   $pv = New-Object "$WF.PictureBox"
   $pv.Dock = [System.Windows.Forms.DockStyle]::Fill
   $pv.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
@@ -400,9 +414,9 @@ function New-ControlPanel {
     } catch {}
   })
   $p.Preview = $pv
-  $root.Controls.Add($pv, 0, 4)
+  $root.Controls.Add($pv, 0, 5)
 
-  # Row 5: position, seek bar, duration
+  # Row 6: position, seek bar, duration
   $tw = [System.Windows.Forms.TextRenderer]::MeasureText('00:00:00', $p.Font).Width + [int](6 * $k)
   $time = New-PanelGrid 3 ([int]($fh * 1.7))
   [void]$time.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, [single]$tw)))
@@ -454,9 +468,9 @@ function New-ControlPanel {
   $time.Controls.Add($p.Pos, 0, 0)
   $time.Controls.Add($bar, 1, 0)
   $time.Controls.Add($p.Dur, 2, 0)
-  $root.Controls.Add($time, 0, 5)
+  $root.Controls.Add($time, 0, 6)
 
-  # Row 6: transport buttons
+  # Row 7: transport buttons
   $rew = [string][char]0x23EA
   $fwd = [string][char]0x23E9
   $tr = New-PanelGrid 7 ([int]($fh * 2.5))
@@ -498,17 +512,17 @@ function New-ControlPanel {
   }
   $i = 0
   foreach ($b in @($p.Back30, $p.Back10, $p.Big, $p.Fwd10, $p.Fwd30, $p.Next, $p.Stop)) { $b.AutoEllipsis = $false; $tr.Controls.Add($b, $i, 0); $i++ }
-  $root.Controls.Add($tr, 0, 6)
+  $root.Controls.Add($tr, 0, 7)
 
-  # Rows 7-10: status, VRChat player, up next
+  # Rows 8-11: status, VRChat player, up next
   $p.Status = New-PanelLabel '' ($fh * 2 + 6) $null $null
   $p.Status.TextAlign = [System.Drawing.ContentAlignment]::TopLeft
   $p.Status.Margin = New-Object System.Windows.Forms.Padding(2, [int](6 * $k), 2, 1)
-  $root.Controls.Add($p.Status, 0, 7)
+  $root.Controls.Add($p.Status, 0, 8)
   # The VRChat player's state (what the stream carries is the chip right of the title).
   $p.Player = New-PanelLabel '' ($fh + 6) $null $c.Dim
-  $root.Controls.Add($p.Player, 0, 8)
-  $root.Controls.Add((New-PanelLabel (T 'Up next') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 9)
+  $root.Controls.Add($p.Player, 0, 9)
+  $root.Controls.Add((New-PanelLabel (T 'Up next') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 10)
   $lb = New-Object "$WF.ListBox"
   $lb.Dock = [System.Windows.Forms.DockStyle]::Fill
   $lb.IntegralHeight = $false
@@ -543,10 +557,10 @@ function New-ControlPanel {
   $qm.Add_Opening({ try { Update-PanelQueueMenu } catch { Write-PanelWarning $_ } })
   $lb.ContextMenuStrip = $qm
   $p.List = $lb
-  $root.Controls.Add($lb, 0, 10)
+  $root.Controls.Add($lb, 0, 11)
 
-  # Rows 11-12: messages (everything the console window shows; right-click copies)
-  $root.Controls.Add((New-PanelLabel (T 'Messages') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 11)
+  # Rows 12-13: messages (everything the console window shows; right-click copies)
+  $root.Controls.Add((New-PanelLabel (T 'Messages') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 12)
   $lg = New-Object "$WF.ListBox"
   $lg.Dock = [System.Windows.Forms.DockStyle]::Fill
   $lg.IntegralHeight = $false
@@ -614,16 +628,16 @@ function New-ControlPanel {
   })
   $lg.ContextMenuStrip = $lcm
   $p.Log = $lg
-  $root.Controls.Add($lg, 0, 12)
+  $root.Controls.Add($lg, 0, 13)
 
-  # Row 13: search / add in a second window, viewer preview, resync, settings
+  # Row 14: search / add in a second window, viewer preview, resync, settings
   $bot = New-PanelGrid 4 ([int]($fh * 2.7))
   $p.Add = New-PanelButton (T 'Add / search...') (T 'Add a video or a link, or search for one.') 'add' $null $null
   $p.Viewer = New-PanelButton (T 'Watch as viewers see it') (T 'Opens the real stream in a small player window, the way viewers get it (with their delay). Close it any time.') 'viewer' $null $null
   $p.Resync = New-PanelButton ([string][char]0x21BB + ' ' + (T 'Resync everyone')) (T 'Everyone''s player reconnects to the live picture, so all viewers are in sync again. The video waits for them.') 'resync' $null $p.Sym
   # Settings: the same list as M in the console (the main thread sends it, see Update-PanelMenu), then log.txt and
   # End stream. What changes the link or the picture works only while nothing plays.
-  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Where to stream, picture size, speed test, new link, language, log.txt and End stream. The stream settings work while nothing plays; questions that need typing appear in the console window.') '' $null $p.Sym
+  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Where to stream, picture size, speed test, new link, language, log.txt and End stream. The stream settings work while nothing plays; their questions show here and in the console window.') '' $null $p.Sym
   $menu = New-Object "$WF.ContextMenuStrip"
   $menu.ShowItemToolTips = $true
   $menu.Add_Opening({ try { Update-PanelMenu } catch { Write-PanelWarning $_ } })
@@ -635,9 +649,9 @@ function New-ControlPanel {
   foreach ($b in $bb) { $b.AutoEllipsis = $false }   # long translations wrap onto a second line
   $i = 0
   foreach ($b in $bb) { $bot.Controls.Add($b, $i, 0); $i++ }
-  $root.Controls.Add($bot, 0, 13)
+  $root.Controls.Add($bot, 0, 14)
 
-  # Row 14: checkboxes
+  # Row 15: checkboxes
   $flow = New-Object "$WF.FlowLayoutPanel"
   $flow.Dock = [System.Windows.Forms.DockStyle]::Fill
   $flow.Height = $fh + [int](12 * $k)
@@ -655,13 +669,14 @@ function New-ControlPanel {
   $p.OnTop.Add_CheckedChanged({ try { $script:Panel.Form.TopMost = $script:Panel.OnTop.Checked } catch {} })
   $flow.Controls.Add($p.Clock)
   $flow.Controls.Add($p.OnTop)
-  $root.Controls.Add($flow, 0, 14)
+  $root.Controls.Add($flow, 0, 15)
   if ($sb -and $sb.Top) { $p.OnTop.Checked = $true }
 
   $f.Controls.Add($root)
   $f.Add_KeyDown({
     param($sender, $e)
     try {
+      if (Invoke-PanelAskKey $e.KeyData) { $e.Handled = $true; $e.SuppressKeyPress = $true; return }
       if (Invoke-PanelPaste $e.KeyData) { $e.Handled = $true; $e.SuppressKeyPress = $true; return }
       if (Invoke-PanelKey $e.KeyData) { $e.Handled = $true; $e.SuppressKeyPress = $true }
     } catch {}
@@ -670,7 +685,9 @@ function New-ControlPanel {
     param($sender, $e)
     try { if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Space -and (Test-PanelKeyOurs $e.KeyCode)) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch {}
   })
-  $f.Add_Resize({ try { Update-PanelRows } catch {} })
+  $f.Add_Resize({ try { Update-PanelRows; Set-PanelAskWidths } catch {} })
+  # (A question that came while the window was behind: its answer box gets the focus once the window is in front.)
+  $f.Add_Activated({ try { $q = $script:Panel; if ($q.AskFocusPending) { $q.AskFocusPending = $false; Move-PanelAskFocus } } catch {} })
   $f.Add_FormClosing({ try { Save-PanelBounds } catch {} })
   $f.Add_FormClosed({ try { $script:Panel.Closed = $true; $script:PanelSync.Closed = $true; Remove-PanelImage } catch {} })
   Add-PanelKeyHook $f
@@ -732,7 +749,7 @@ function Receive-PanelDrop($data) {
   if (-not $script:Panel.InputOn) { return $false }
   $d = Get-PanelDropData $data
   if ($null -eq $d) { return $false }
-  if ($d.Kind -eq 'files') { Add-PanelCommand 'files' $d.Files } else { Add-PanelCommand 'line' $d.Text }
+  if ($d.Kind -eq 'files') { [void](Submit-PanelFiles $d.Files) } else { [void](Submit-PanelLine $d.Text) }
   return $true
 }
 
@@ -742,8 +759,24 @@ function Submit-PanelInput {
   if (-not $q.InputOn) { return }
   $t = [string]$q.Input.Text
   if (-not $t.Trim()) { return }
-  Add-PanelCommand 'line' $t.Trim()
+  [void](Submit-PanelLine $t.Trim())
   $q.Input.Clear()
+}
+
+# A typed / dropped line and picked / dropped files: the answer to the start screen's '>' while it waits (bus.Ask of
+# kind 'line'), else a command (Receive-Commands: as typed into the console while it streams).
+function Submit-PanelLine([string]$text) {
+  $a = Get-PanelAsk
+  if ($a -and [string]$a['Kind'] -eq 'line') { return (Send-PanelAnswer @{ Text = $text }) }
+  Add-PanelCommand 'line' $text
+  return $true
+}
+
+function Submit-PanelFiles([string[]]$files) {
+  $a = Get-PanelAsk
+  if ($a -and [string]$a['Kind'] -eq 'line') { return (Send-PanelAnswer @{ Files = [string[]]@($files) }) }
+  Add-PanelCommand 'files' $files
+  return $true
 }
 
 # Ctrl+V outside a text box: copied files are added, text goes into the input box (focused). Text of several lines
@@ -763,7 +796,7 @@ function Invoke-PanelPaste([System.Windows.Forms.Keys]$keyData) {
   if ($do -and -not $inBox -and $do.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { [void](Receive-PanelDrop $do); return $true }
   $txt = ''
   try { $txt = [string][System.Windows.Forms.Clipboard]::GetText() } catch {}
-  if ($txt.Trim() -match "[`r`n]") { Add-PanelCommand 'line' $txt.Trim(); return $true }
+  if ($txt.Trim() -match "[`r`n]") { [void](Submit-PanelLine $txt.Trim()); return $true }
   if ($inBox) { return $false }
   $q.Input.Focus() | Out-Null
   $q.Input.SelectionStart = $q.Input.TextLength
@@ -808,7 +841,7 @@ function Show-PanelFileDialog {
     Stop-PanelTimer
     try { if ($dlg.ShowDialog($q.Form) -eq [System.Windows.Forms.DialogResult]::OK) { $files = @($dlg.FileNames) } } finally { Start-PanelTimer }
   } finally { $dlg.Dispose() }
-  if ($files.Count -gt 0) { Add-PanelCommand 'files' ([string[]]$files) }
+  if ($files.Count -gt 0) { [void](Submit-PanelFiles ([string[]]$files)) }
 }
 
 function Show-PanelFolderDialog {
@@ -822,7 +855,7 @@ function Show-PanelFolderDialog {
     Stop-PanelTimer
     try { if ($dlg.ShowDialog($q.Form) -eq [System.Windows.Forms.DialogResult]::OK) { $dir = [string]$dlg.SelectedPath } } finally { Start-PanelTimer }
   } finally { $dlg.Dispose() }
-  if ($dir) { Add-PanelCommand 'files' ([string[]]@($dir)) }
+  if ($dir) { [void](Submit-PanelFiles ([string[]]@($dir))) }
 }
 
 # Copies a link and shows "Copied!" on its button for a moment.
@@ -872,7 +905,9 @@ function Update-PanelMenu {
   $prompt = ($s -and [bool]$s['Prompt'])
   $mode = ''
   if ($s) { $mode = [string]$s['Mode'] }
-  $waitOk = ($mode -eq 'waiting' -and -not $prompt)
+  # (Not while a question is open: the item would only run after it.)
+  $asking = Test-PanelAskOpen
+  $waitOk = ($mode -eq 'waiting' -and -not $prompt -and -not $asking)
   $tip = T 'Available while nothing plays (press Stop first).'
   $n = 0
   if ($s -and $null -ne $s['Menu']) {
@@ -912,8 +947,17 @@ function Update-PanelMenu {
   [void]$m.Items.Add($lo)
   [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
   $en = New-PanelMenuItem (T 'End stream...') 'quit'
-  $en.Enabled = ($s -and $mode -and $mode -ne 'off' -and -not $prompt)
-  $en.Add_Click({ try { if (Confirm-Panel (T 'End the stream now? Viewers lose the picture.')) { Add-PanelCommand 'quit' } } catch { Write-PanelWarning $_ } })
+  # (Also while a question waits, the start screen's '>' included: QuitReq ends the tool from there, see Test-UiQuit.)
+  $en.Enabled = [bool]($s -and (($mode -and $mode -ne 'off' -and -not $prompt) -or $null -ne (Get-PanelAsk)))
+  $en.Add_Click({
+    try {
+      if (Confirm-Panel (T 'End the stream now? Viewers lose the picture.')) {
+        $b = Get-PanelBus
+        if ($b) { $b.QuitReq = $true }
+        Add-PanelCommand 'quit'
+      }
+    } catch { Write-PanelWarning $_ }
+  })
   [void]$m.Items.Add($en)
 }
 
@@ -930,7 +974,7 @@ function Update-PanelQueueMenu {
   $q = $script:Panel
   $s = $null
   try { $s = $script:PanelSync.State } catch {}
-  $ok = ($null -ne $s -and -not [bool]$s['Prompt'] -and -not [bool]$s['Asking'])
+  $ok = ($null -ne $s -and -not [bool]$s['Prompt'] -and -not (Test-PanelAskOpen))
   $ids = @($q.ListIds)
   $ix = $q.List.SelectedIndex
   $has = ($ok -and (Get-PanelListId) -gt 0)
@@ -994,6 +1038,435 @@ function Save-PanelBounds {
   $b = $f.Bounds
   if ($f.WindowState -ne [System.Windows.Forms.FormWindowState]::Normal) { $b = $f.RestoreBounds }
   $script:PanelSync.Bounds = @{ X = $b.X; Y = $b.Y; W = $b.Width; H = $b.Height; Top = [bool]$q.OnTop.Checked }
+}
+
+# ------------------------------------------------------------------ questions (the strip under the input box)
+# The main thread's open question is bus.Ask (Publish-UiAsk in the main script): Id, Kind (choice | yesno | text |
+# episodes; 'line' = the start screen's '>', answered by the input box, no strip), Title, Options, Default, Prev, Crumb,
+# BackMode, CanBack, CanHome, CanForward, EscLabel, Secret, Prefill, All, Deadline. The console asks the same question at
+# the same time: the first answer wins and the other side closes (the strip hides when bus.Ask goes or changes).
+# An answer goes into bus.Answers: @{ Id; Nav = '' | 'back' | 'forward' | 'home'; Text; Pick (choice: the option's
+# index, -1 = "0) None"); Yes (yes / no, said explicitly); Files; Prefilled }.
+# Keys while the strip is open: Enter = OK, Esc = what Esc means for this question, Alt+Left = Back, Alt+Right =
+# Forward, digits 1-9 pick an option; Space and the arrows belong to the strip (Test-PanelKeyOurs).
+
+function Get-PanelBus { try { return $script:PanelSync.Bus } catch { return $null } }
+
+function Get-PanelAsk {
+  $b = Get-PanelBus
+  if ($null -eq $b) { return $null }
+  $a = $b.Ask
+  if ($a -is [System.Collections.IDictionary] -and [string]$a['Id']) { return $a }
+  return $null
+}
+
+# Is a question open that the strip shows (not the start screen's '>')?
+function Test-PanelAskOpen {
+  $a = Get-PanelAsk
+  return ($null -ne $a -and [string]$a['Kind'] -ne 'line')
+}
+
+function Test-PanelActive {
+  try { return ([System.Windows.Forms.Form]::ActiveForm -eq $script:Panel.Form) } catch { return $false }
+}
+
+# One answer per question (a double click sends one): the strip is locked until the question goes (or, if the main
+# thread didn't take it, for 2 s: Update-PanelAsk).
+function Send-PanelAnswer([hashtable]$ans) {
+  $q = $script:Panel
+  $b = Get-PanelBus
+  $a = Get-PanelAsk
+  if ($null -eq $b -or $null -eq $a) { return $false }
+  $id = [string]$a['Id']
+  if ($q.AskSent -ceq $id) { return $false }
+  $ans['Id'] = $id
+  if (-not $ans.ContainsKey('Nav')) { $ans['Nav'] = '' }
+  $q.AskSent = $id
+  $q.AskSentAt = [DateTime]::UtcNow
+  if ($q.AskId -ceq $id) {
+    # (The focus first leaves the strip for the read-only link box: disabling a focused control hands the focus on.)
+    if ($q.Ask.ContainsFocus) { $q.Form.ActiveControl = $q.LinkBox }
+    $q.Ask.Enabled = $false
+  }
+  $b.Answers.Enqueue($ans)
+  return $true
+}
+
+function Send-PanelAskNav([string]$nav) { [void](Send-PanelAnswer @{ Nav = $nav }) }
+
+# Enter / [OK]: the selected option, the default (highlighted) one, or the text in the box.
+function Submit-PanelAskOk {
+  $q = $script:Panel
+  $a = $q.AskView
+  if ($null -eq $a) { return }
+  switch ([string]$a['Kind']) {
+    'choice' {
+      $pick = [int]$a['Default']
+      if ($q.AskList -and $q.AskList.SelectedIndex -ge 0) { $pick = [int]@($q.AskPicks)[$q.AskList.SelectedIndex] }
+      [void](Send-PanelAnswer @{ Pick = $pick })
+    }
+    'yesno' { [void](Send-PanelAnswer @{ Yes = [bool]$a['Default'] }) }
+    default { if ($q.AskText) { [void](Send-PanelAnswer @{ Text = [string]$q.AskText.Text; Prefilled = $true }) } }
+  }
+}
+
+# A button of the strip: $wide = an option (a whole line, its text on the left), else sized by its text (Back, OK...).
+function New-PanelAskButton([string]$text, [bool]$wide) {
+  $q = $script:Panel
+  $k = $q.K
+  $b = New-PanelButton $text '' '' $null $null
+  $b.Dock = [System.Windows.Forms.DockStyle]::None
+  if ($wide) {
+    $b.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $b.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $b.Height = [int]($q.Font.Height * 1.9)
+    $b.Padding = New-Object System.Windows.Forms.Padding([int](6 * $k), 0, [int](6 * $k), 0)
+  } else {
+    $b.AutoSize = $true
+    $b.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $b.MinimumSize = New-Object System.Drawing.Size([int](84 * $k), [int]($q.Font.Height * 1.9))
+    $b.Padding = New-Object System.Windows.Forms.Padding([int](8 * $k), 0, [int](8 * $k), 0)
+  }
+  return $b
+}
+
+function Set-PanelAskDefault($b) {
+  $q = $script:Panel
+  $b.BackColor = (New-PanelColor 40 90 150)
+  $b.FlatAppearance.BorderColor = $q.Colors.Accent
+}
+
+function New-PanelAskStrip {
+  $p = $script:Panel
+  $c = $p.Colors
+  $k = $p.K
+  $WF = 'System.Windows.Forms'
+  $t = New-Object "$WF.TableLayoutPanel"
+  $t.ColumnCount = 2
+  $t.RowCount = 4
+  $t.AutoSize = $true
+  $t.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+  $t.Dock = [System.Windows.Forms.DockStyle]::Fill
+  $t.Margin = New-Object System.Windows.Forms.Padding(2, [int](3 * $k), 2, [int](3 * $k))
+  $t.Padding = New-Object System.Windows.Forms.Padding([int](8 * $k), [int](6 * $k), [int](8 * $k), [int](6 * $k))
+  $t.BackColor = (New-PanelColor 34 46 66)
+  [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+  [void]$t.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+  for ($i = 0; $i -lt 4; $i++) { [void]$t.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
+  $p.AskTitle = New-Object "$WF.Label"
+  $p.AskTitle.AutoSize = $true
+  $p.AskTitle.Font = $p.Bold
+  $p.AskTitle.UseMnemonic = $false
+  $p.AskTitle.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, [int](2 * $k))
+  $p.AskInfo = New-Object "$WF.Label"
+  $p.AskInfo.AutoSize = $true
+  $p.AskInfo.UseMnemonic = $false
+  $p.AskInfo.ForeColor = (New-PanelColor 232 200 90)
+  $p.AskInfo.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+  $p.AskInfo.Margin = New-Object System.Windows.Forms.Padding([int](8 * $k), [int](2 * $k), 0, 0)
+  $p.AskCrumb = New-Object "$WF.Label"
+  $p.AskCrumb.AutoSize = $true
+  $p.AskCrumb.UseMnemonic = $false
+  $p.AskCrumb.ForeColor = $c.Dim
+  $p.AskCrumb.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, [int](3 * $k))
+  $p.AskBody = New-Object "$WF.TableLayoutPanel"
+  $p.AskBody.ColumnCount = 1
+  $p.AskBody.AutoSize = $true
+  $p.AskBody.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+  $p.AskBody.Dock = [System.Windows.Forms.DockStyle]::Fill
+  $p.AskBody.Margin = New-Object System.Windows.Forms.Padding(0)
+  [void]$p.AskBody.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+  $p.AskBar = New-Object "$WF.FlowLayoutPanel"
+  $p.AskBar.AutoSize = $true
+  $p.AskBar.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+  $p.AskBar.Dock = [System.Windows.Forms.DockStyle]::Fill
+  $p.AskBar.WrapContents = $true
+  $p.AskBar.Margin = New-Object System.Windows.Forms.Padding(0, [int](4 * $k), 0, 0)
+  $t.Controls.Add($p.AskTitle, 0, 0)
+  $t.Controls.Add($p.AskInfo, 1, 0)
+  $t.Controls.Add($p.AskCrumb, 0, 1)
+  $t.SetColumnSpan($p.AskCrumb, 2)
+  $t.Controls.Add($p.AskBody, 0, 2)
+  $t.SetColumnSpan($p.AskBody, 2)
+  $t.Controls.Add($p.AskBar, 0, 3)
+  $t.SetColumnSpan($p.AskBar, 2)
+  $t.Visible = $false
+  $p.Ask = $t
+  return $t
+}
+
+# Long titles and paths wrap inside the strip (labels grow downwards up to the strip's width).
+function Set-PanelAskWidths {
+  $q = $script:Panel
+  if ($null -eq $q -or $null -eq $q.Ask -or $null -eq $q.Root) { return }
+  $w = $q.Root.ClientSize.Width - $q.Root.Padding.Horizontal - $q.Ask.Margin.Horizontal - $q.Ask.Padding.Horizontal - 4
+  if ($w -lt 100) { return }
+  $iw = 0
+  if ($q.AskInfo.Text) { $iw = $q.AskInfo.PreferredSize.Width + $q.AskInfo.Margin.Horizontal }
+  $q.AskTitle.MaximumSize = New-Object System.Drawing.Size([Math]::Max(80, $w - $iw), 0)
+  $q.AskCrumb.MaximumSize = New-Object System.Drawing.Size($w, 0)
+}
+
+function Clear-PanelAskControls {
+  $q = $script:Panel
+  $old = @($q.AskBody.Controls) + @($q.AskBar.Controls)
+  $q.AskBody.Controls.Clear()
+  $q.AskBar.Controls.Clear()
+  $q.AskBody.RowStyles.Clear()
+  $q.AskBody.RowCount = 0
+  foreach ($x in $old) { try { $x.Dispose() } catch {} }
+  $q.AskList = $null
+  $q.AskPicks = @()
+  $q.AskText = $null
+  $q.AskFocus = $null
+}
+
+# What the strip says right of its title: the countdown (a question that takes its suggested answer by itself), else
+# what Esc does.
+function Get-PanelAskInfo($a) {
+  if ($null -eq $a) { return '' }
+  $dl = $a['Deadline']
+  if ($dl -is [DateTime]) {
+    $left = [int][Math]::Ceiling(($dl - [DateTime]::UtcNow).TotalSeconds)
+    return (T 'Using the default in {0} s' ([Math]::Max(0, $left)))
+  }
+  switch ([string]$a['BackMode']) {
+    'back' { return (T '  (Esc = back)').Trim() }
+    'leave' { return (T '  (Esc = cancel)').Trim() }
+    'esc' { if ([string]$a['EscLabel']) { return (T '(Esc = {0})' ([string]$a['EscLabel'])) } }
+  }
+  return ''
+}
+
+# Draws the question $a in the strip (once per question Id).
+function Show-PanelAsk($a) {
+  $q = $script:Panel
+  $k = $q.K
+  $WF = 'System.Windows.Forms'
+  $q.AskView = $a
+  $q.AskId = [string]$a['Id']
+  $q.AskSent = ''
+  $focus = $null
+  $q.Ask.SuspendLayout()
+  try {
+    Clear-PanelAskControls
+    $q.Ask.Enabled = $true
+    $title = [string]$a['Title']
+    $q.AskTitle.Text = $title
+    $q.Tips.SetToolTip($q.AskTitle, $title)
+    $crumb = [string]$a['Crumb']
+    $q.AskCrumb.Text = $crumb
+    $q.AskCrumb.Visible = [bool]$crumb
+    $q.AskInfoText = Get-PanelAskInfo $a
+    $q.AskInfo.Text = $q.AskInfoText
+    $ok = $false
+    switch ([string]$a['Kind']) {
+      'choice' {
+        $opts = @($a['Options'])
+        $rows = @()
+        if ([bool]$a['AllowNone']) { $rows += @{ Pick = -1; Text = '0) ' + [string]$a['NoneLabel'] } }
+        for ($i = 0; $i -lt $opts.Count; $i++) { $rows += @{ Pick = $i; Text = ('{0}) {1}' -f ($i + 1), [string]$opts[$i]) } }
+        $prev = $a['Prev']
+        foreach ($r in $rows) { if ($null -ne $prev -and [int]$prev -eq [int]$r.Pick) { $r.Text += (T '   <- your answer') } }
+        $def = [int]$a['Default']
+        if ($rows.Count -le 6) {
+          foreach ($r in $rows) {
+            $b = New-PanelAskButton $r.Text $true
+            $b.Tag = [int]$r.Pick
+            $q.Tips.SetToolTip($b, $r.Text)
+            $b.Add_Click({ try { [void](Send-PanelAnswer @{ Pick = [int]$this.Tag }) } catch { Write-PanelWarning $_ } })
+            if ([int]$r.Pick -eq $def) { Set-PanelAskDefault $b; $focus = $b }
+            $q.AskBody.Controls.Add($b)
+          }
+          if (-not $focus -and $q.AskBody.Controls.Count -gt 0) { $focus = $q.AskBody.Controls[0] }
+        } else {
+          $lb = New-Object "$WF.ListBox"
+          $lb.IntegralHeight = $false
+          $lb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+          $lb.BackColor = $q.Colors.Box
+          $lb.ForeColor = $q.Colors.Text
+          $lb.Dock = [System.Windows.Forms.DockStyle]::Fill
+          $lb.Margin = New-Object System.Windows.Forms.Padding(0)
+          $lb.HorizontalScrollbar = $true
+          $lb.Height = [Math]::Min(8, $rows.Count) * $lb.ItemHeight + 4
+          foreach ($r in $rows) { [void]$lb.Items.Add($r.Text) }
+          $q.AskPicks = @($rows | ForEach-Object { [int]$_.Pick })
+          $ix = [array]::IndexOf([int[]]$q.AskPicks, $def)
+          if ($ix -ge 0) { $lb.SelectedIndex = $ix }
+          $lb.Add_DoubleClick({ try { if ($this.SelectedIndex -ge 0) { Submit-PanelAskOk } } catch { Write-PanelWarning $_ } })
+          $q.AskList = $lb
+          $q.AskBody.Controls.Add($lb)
+          $focus = $lb
+          $ok = $true
+        }
+      }
+      'yesno' {
+        $fl = New-Object "$WF.FlowLayoutPanel"
+        $fl.AutoSize = $true
+        $fl.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+        $fl.WrapContents = $false
+        $fl.Margin = New-Object System.Windows.Forms.Padding(0)
+        foreach ($yes in @($true, $false)) {
+          $txt = T 'No'
+          if ($yes) { $txt = T 'Yes' }
+          if ($null -ne $a['Prev'] -and [bool]$a['Prev'] -eq $yes) { $txt += (T '   <- your answer') }
+          $b = New-PanelAskButton $txt $false
+          $b.Tag = $yes
+          $b.Add_Click({ try { [void](Send-PanelAnswer @{ Yes = [bool]$this.Tag }) } catch { Write-PanelWarning $_ } })
+          if ([bool]$a['Default'] -eq $yes) { Set-PanelAskDefault $b; $focus = $b }
+          $fl.Controls.Add($b)
+        }
+        $q.AskBody.Controls.Add($fl)
+      }
+      default {
+        # text / episodes: a box (a secret one shows dots), episodes with [All]
+        $g = New-PanelGrid 2 ([int]($q.Font.Height * 2.1))
+        $g.Dock = [System.Windows.Forms.DockStyle]::Fill
+        [void]$g.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+        $tb = New-Object "$WF.TextBox"
+        $tb.BackColor = $q.Colors.Box
+        $tb.ForeColor = $q.Colors.Text
+        $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        $tb.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+        $tb.Margin = New-Object System.Windows.Forms.Padding(0, 1, 2, 1)
+        if ([bool]$a['Secret']) { $tb.UseSystemPasswordChar = $true }
+        else { $tb.Text = [string]$a['Prefill'] }
+        $g.Controls.Add($tb, 0, 0)
+        if ([string]$a['Kind'] -eq 'episodes' -and [string]$a['All']) {
+          $all = New-PanelAskButton (T 'All') $false
+          $q.Tips.SetToolTip($all, [string]$a['All'])
+          $all.Add_Click({ try { $q2 = $script:Panel; [void](Send-PanelAnswer @{ Text = [string]$q2.AskView['All']; Prefilled = $true }) } catch { Write-PanelWarning $_ } })
+          [void]$g.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+          $g.ColumnCount = 2
+          $g.Controls.Add($all, 1, 0)
+        } else { $g.ColumnCount = 1 }
+        $q.AskText = $tb
+        $q.AskBody.Controls.Add($g)
+        $focus = $tb
+        $ok = $true
+      }
+    }
+    # Back / Forward / Cancel, then OK where the answer isn't a button.
+    $bm = [string]$a['BackMode']
+    if ($bm -eq 'back') {
+      $b = New-PanelAskButton (T '< Back') $false
+      $q.Tips.SetToolTip($b, (T 'Back to the question before (Esc, Alt+Left)'))
+      $b.Add_Click({ try { Send-PanelAskNav 'back' } catch { Write-PanelWarning $_ } })
+      $q.AskBar.Controls.Add($b)
+    }
+    if ([bool]$a['CanForward']) {
+      $b = New-PanelAskButton (T 'Forward >') $false
+      $q.Tips.SetToolTip($b, (T 'Your earlier answer again (Alt+Right)'))
+      $b.Add_Click({ try { Send-PanelAskNav 'forward' } catch { Write-PanelWarning $_ } })
+      $q.AskBar.Controls.Add($b)
+    }
+    if ([bool]$a['CanHome'] -or $bm -eq 'leave') {
+      $b = New-PanelAskButton (T 'Cancel') $false
+      $q.Tips.SetToolTip($b, (T 'Leave these questions; nothing is added or changed'))
+      $nav = 'home'
+      if (-not [bool]$a['CanHome']) { $nav = 'back' }
+      $b.Tag = $nav
+      $b.Add_Click({ try { Send-PanelAskNav ([string]$this.Tag) } catch { Write-PanelWarning $_ } })
+      $q.AskBar.Controls.Add($b)
+    }
+    if ($ok) {
+      $b = New-PanelAskButton (T 'OK') $false
+      Set-PanelAskDefault $b
+      $b.Add_Click({ try { Submit-PanelAskOk } catch { Write-PanelWarning $_ } })
+      $q.AskBar.Controls.Add($b)
+    }
+    $q.AskBar.Visible = ($q.AskBar.Controls.Count -gt 0)
+  } finally { $q.Ask.ResumeLayout($true) }
+  $q.AskFocus = $focus
+  Set-PanelAskWidths
+  if (-not $q.Ask.Visible) { $q.Ask.Visible = $true; Update-PanelRows }
+  # Its answer box gets the focus inside this window only: never taking it from another program (VRChat).
+  if (Test-PanelActive) { Move-PanelAskFocus } else { $q.AskFocusPending = $true; Invoke-PanelAttention }
+}
+
+function Move-PanelAskFocus {
+  $q = $script:Panel
+  $c = $q.AskFocus
+  if ($null -eq $c -or $c.IsDisposed -or -not $q.AskId) { return }
+  $q.Form.ActiveControl = $c
+  if ($c -is [System.Windows.Forms.TextBox]) { $c.SelectionStart = $c.TextLength }
+}
+
+# A question while the window isn't in front: its taskbar button flashes until it is (FlashWindowEx through the
+# tool's helper DLL) and one short sound plays. Not while the console window is in front (the question shows there).
+function Invoke-PanelAttention {
+  $q = $script:Panel
+  $win = [bool]('VRCLinkMaker.Win' -as [type])
+  try { if ($win -and [VRCLinkMaker.Win]::ConsoleInFront()) { return } } catch {}
+  if ($win) { try { $q.AskFlashing = [bool][VRCLinkMaker.Win]::Flash($q.Form.Handle) } catch {} }
+  try { [System.Media.SystemSounds]::Asterisk.Play() } catch {}
+}
+
+function Hide-PanelAsk {
+  $q = $script:Panel
+  $q.AskId = ''
+  $q.AskView = $null
+  $q.AskFocusPending = $false
+  if ($q.AskFlashing) {
+    $q.AskFlashing = $false
+    try { [void][VRCLinkMaker.Win]::StopFlash($q.Form.Handle) } catch {}
+  }
+  # (The focus leaves for the read-only link box: not for a transport button, where Enter / Space would act.)
+  if ($q.Ask.ContainsFocus) { $q.Form.ActiveControl = $q.LinkBox }
+  if ($q.Ask.Visible) { $q.Ask.Visible = $false; Update-PanelRows }
+  Clear-PanelAskControls
+}
+
+# Every tick: shows a new question, hides one that ended, and counts down.
+function Update-PanelAsk {
+  $q = $script:Panel
+  if ($null -eq $q.Ask) { return }
+  $a = Get-PanelAsk
+  $id = ''
+  if ($a -and [string]$a['Kind'] -ne 'line') { $id = [string]$a['Id'] }
+  if ($id -cne $q.AskId) {
+    if ($id) { Show-PanelAsk $a } else { Hide-PanelAsk }
+  }
+  # (An answer the main thread didn't take - it asks again with the same question: the strip is free again.)
+  if ($q.AskSent -and ([DateTime]::UtcNow - $q.AskSentAt).TotalSeconds -gt 2) {
+    $live = ($a -and [string]$a['Id'] -ceq $q.AskSent)
+    $q.AskSent = ''
+    if ($live -and $q.AskId) { $q.Ask.Enabled = $true }
+  }
+  if ($q.AskId) {
+    $txt = Get-PanelAskInfo $q.AskView
+    if ($txt -cne $q.AskInfoText) { $q.AskInfoText = $txt; $q.AskInfo.Text = $txt }
+  }
+}
+
+# The strip's keys (see above). $true = the key was the strip's.
+function Invoke-PanelAskKey([System.Windows.Forms.Keys]$keyData) {
+  $q = $script:Panel
+  if ($null -eq $q -or -not $q.AskId -or -not $q.Ask.Enabled) { return $false }
+  $a = $q.AskView
+  $K = [System.Windows.Forms.Keys]
+  $code = $keyData -band $K::KeyCode
+  $mods = $keyData -band $K::Modifiers
+  $bm = [string]$a['BackMode']
+  if ($mods -eq $K::Alt -and $code -eq $K::Left) { if ($bm -eq 'back' -or $bm -eq 'leave') { Send-PanelAskNav 'back' }; return $true }
+  if ($mods -eq $K::Alt -and $code -eq $K::Right) { if ([bool]$a['CanForward']) { Send-PanelAskNav 'forward' }; return $true }
+  if ($mods -ne $K::None) { return $false }
+  if ($code -eq $K::Escape) { if ($bm -eq 'back' -or $bm -eq 'leave' -or $bm -eq 'esc') { Send-PanelAskNav 'back' }; return $true }
+  if ($code -eq $K::Enter) { Submit-PanelAskOk; return $true }
+  $fc = $null
+  try { $fc = Get-PanelFocus } catch {}
+  if ([string]$a['Kind'] -eq 'choice' -and -not ($fc -is [System.Windows.Forms.TextBoxBase])) {
+    $d = -1
+    if ($code -ge $K::D0 -and $code -le $K::D9) { $d = [int]$code - [int]$K::D0 }
+    elseif ($code -ge $K::NumPad0 -and $code -le $K::NumPad9) { $d = [int]$code - [int]$K::NumPad0 }
+    if ($d -ge 1 -and $d -le @($a['Options']).Count) { [void](Send-PanelAnswer @{ Pick = ($d - 1) }); return $true }
+    if ($d -eq 0) {
+      if ([bool]$a['AllowNone']) { [void](Send-PanelAnswer @{ Pick = -1 }) }
+      elseif ($bm -eq 'back' -or $bm -eq 'leave') { Send-PanelAskNav 'back' }
+      return $true
+    }
+  }
+  return $false
 }
 
 # ------------------------------------------------------------------ pieces the update uses
@@ -1195,10 +1668,17 @@ function Open-ControlPanel {
       $drop = $null
       if ($null -ne $script:UiLog) { while ($script:UiLog.TryDequeue([ref]$drop)) {} }
     } catch {}
+    # The bus outlives the window (the main script makes it at load; Panel.ps1 on its own makes one here, kept as well).
+    $bus = $script:UiBus
+    if ($null -eq $bus) {
+      $bus = [hashtable]::Synchronized(@{ Log = $script:UiLog; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Ask = $null
+          Answers = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Status = $null; QuitReq = $false })
+      $script:UiBus = $bus
+    }
     $sync = [hashtable]::Synchronized(@{
-      State = $null; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]')
+      State = $null; Cmds = $bus.Cmds; Bus = $bus
       Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
-      Log = $script:UiLog; Backlog = $backlog; LogPath = $logPath
+      Log = $bus.Log; Backlog = $backlog; LogPath = $logPath
       StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts
     })
     $self = $script:PanelSelf
@@ -1289,6 +1769,7 @@ function Invoke-PanelTick {
     return
   }
   # (Each on its own: an error in one doesn't skip the other.)
+  try { Update-PanelAsk } catch { Write-PanelWarning $_ }
   try { Update-PanelView $sync.State } catch { Write-PanelWarning $_ }
   if ($q.Closed) { return }
   try { Update-PanelLog $sync } catch { Write-PanelWarning $_ }
@@ -1379,8 +1860,9 @@ function Remove-PanelResources {
 # 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]) and UpcomingIds (int[], the
 # queue items' Ids, same order), Link, QuestLink ('' = none), Clock (bool), CanSeek (bool), Quality / QualityLow /
 # QualityTip (the chip right of the title), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu),
-# Prompt (bool: start questions in the tool's window, Next / Stop / Resync / Settings / the input row off).
-# Asking (bool: a question waits in the tool's window: the input row and the Up next menu off).
+# Prompt (bool: the start screen and its questions, nothing plays yet: Next / Stop / Resync and the Settings items off;
+# the input row answers the start screen's '>' only). An open question (bus.Ask, the strip) turns the input row and the
+# Up next menu off.
 function Update-PanelView($s) {
   try {
     $hasState = ($null -ne $s)
@@ -1433,9 +1915,14 @@ function Update-PanelView($s) {
       $q.LinkBar.ColumnStyles[3].Width = [single]$w
     }
     if ($q.CopiedUntil -ne [DateTime]::MinValue -and $now -ge $q.CopiedUntil) { Reset-PanelCopied }
-    # The input row: off while the start questions or any other question waits in the console (Asking; the window's
-    # answers come later): a line typed here meanwhile would only run after the question, as a new line.
-    $inputOn = ($hasState -and -not [bool]$s['Prompt'] -and -not [bool]$s['Asking'])
+    # The input row: it answers the start screen's '>' (a question of kind 'line') and adds while something streams;
+    # off while another question is open (the strip is where that one is answered) and on the start screen while its
+    # questions are busy (a line typed then would only be lost).
+    $ask = Get-PanelAsk
+    $lineAsk = ($null -ne $ask -and [string]$ask['Kind'] -eq 'line')
+    $stripAsk = ($null -ne $ask -and -not $lineAsk)
+    $inputOn = ($hasState -and -not $stripAsk -and ($lineAsk -or -not [bool]$s['Prompt']))
+    if ($lineAsk -and $q.AskSent -ceq [string]$ask['Id']) { $inputOn = $false }
     $q.InputOn = $inputOn
     # (The focus first leaves the row for the read-only link box, which owns no transport keys: disabling a focused
     # control would hand the focus to the next one, the Next button, and a later Enter / Space would skip / pause.
@@ -1452,15 +1939,24 @@ function Update-PanelView($s) {
       try { $fc = Get-PanelFocus } catch {}
       if ($fc -eq $q.LinkBox) { $q.Form.ActiveControl = $q.Input }
     }
-    if ($script:PanelLast['inputtip'] -ne $inputOn) {
-      $script:PanelLast['inputtip'] = $inputOn
+    $tipKey = [string]$inputOn + [string]$stripAsk
+    if ($script:PanelLast['inputtip'] -cne $tipKey) {
+      $script:PanelLast['inputtip'] = $tipKey
       $t = ''
-      if (-not $inputOn) { $t = T 'Answer in the console window for now.' }
+      if ($stripAsk) { $t = T 'Answer the question above first.' }
+      elseif (-not $inputOn) { $t = T 'Busy with the last step: the box works again in a moment.' }
       $q.Tips.SetToolTip($q.InputRow, $t)
     }
     if (-not $q.CueSet -and $q.CueTries -lt 50) { $q.CueTries++; Set-PanelCue }
 
     $st = [string]$s['Status']
+    # (The console's own status line while nothing plays - a download's %, the speed test - while it is fresh.)
+    if ($mode -ne 'content' -and $mode -ne 'paused' -and $mode -ne 'hold') {
+      try {
+        $bs = (Get-PanelBus).Status
+        if ($bs -and [string]$bs['Text'] -and ($now - [DateTime]$bs['At']).TotalSeconds -lt 3) { $st = [string]$bs['Text'] }
+      } catch {}
+    }
     if ($script:PanelLast['status'] -cne $st) { $q.Tips.SetToolTip($q.Status, $st) }
     Set-PanelProp 'status' $q.Status 'Text' $st
     $pl = [string]$s['Player']
@@ -1477,8 +1973,9 @@ function Update-PanelView($s) {
       if ($s['Quality']) { $tip = [string]$s['Quality'] + "`r`n" + $tip }
       $q.Tips.SetToolTip($q.Quality, $tip.Trim())
     }
-    # (Settings: its stream items work only while nothing plays, see Update-PanelMenu; log.txt and End stream always.)
-    Set-PanelProp 'more' $q.More 'Enabled' $cmdOn
+    # (Settings: its stream items work only while nothing plays, see Update-PanelMenu; log.txt and End stream always,
+    # End stream also while a question waits.)
+    Set-PanelProp 'more' $q.More 'Enabled' ([bool]($cmdOn -or ($hasState -and $null -ne $ask)))
     $q.CmdOn = $cmdOn
 
     $up = @()
