@@ -1830,6 +1830,23 @@ function Complete-HlsStream($stream) {
   return $stream
 }
 
+# Complete-HlsStream in a runspace of its own (its playlists can take up to 20 s each to load). Poll .H.IsCompleted;
+# .Ps.EndInvoke(.H) then gives the stream, or nothing when it didn't work out.
+function Start-HlsPickBg($hls) {
+  $defs = @(foreach ($n in @('Invoke-Web', 'Get-M3u8Attr', 'Get-AbsUrl', 'New-Stream', 'Complete-HlsStream')) {
+      "function $n {`n" + (Get-Item "function:$n").ScriptBlock.ToString() + "`n}" }) -join "`n"
+  $ps = [powershell]::Create()
+  [void]$ps.AddScript({
+      param($defs, $ua, $outH, $url, $headers)
+      $script:WebUA = $ua; $script:WebCookies = New-Object System.Net.CookieContainer
+      $script:OutH = $outH; $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
+      function T { return [string]$args[0] }
+      . ([scriptblock]::Create($defs))
+      try { return (Complete-HlsStream (New-Stream $url 'hls' $headers)) } catch { return $null }
+    }).AddArgument($defs).AddArgument($script:WebUA).AddArgument($script:OutH).AddArgument($hls.Url).AddArgument($hls.Headers)
+  return [pscustomobject]@{ Ps = $ps; H = $ps.BeginInvoke(); Started = Get-Date }
+}
+
 $script:HlsOpts = $null
 function Get-StreamInputArgs($stream) {
   if ($null -eq $script:HlsOpts) {
@@ -2306,11 +2323,10 @@ function Get-UrlMediaExt([string]$u) {
 }
 
 # A link that was to be played as it is goes to yt-dlp after all (it can't be read as it is, or it needs the whole
-# file), when yt-dlp is installed (no question about installing it here). $true = its download started.
+# file), when yt-dlp is installed (or gets installed now). $true = its download started.
 function Switch-UrlToDownload($item) {
   if ($item.Kind -ne 'url' -or $item.NoDirect -or $item.Source -notmatch '^(?i)https?://') { return $false }
-  $yt = $script:YtDlp
-  if (-not $yt) { $yt = Find-Exe 'yt-dlp'; $script:YtDlp = $yt }
+  $yt = Get-YtDlp   # (asks to install it only when a question can be asked here)
   if (-not $yt) { return $false }
   $item.NoDirect = $true
   $item.IsDirectUrl = $false; $item.IsLive = $false; $item.Info = $null; $item.Path = $null
@@ -2479,9 +2495,23 @@ function Step-Prep($item) {
         if (-not $hls -and $ext -eq 'm3u8') { $hls = New-Stream $item.Source 'hls' @{} }
         if ($hls -and $hls.Kind -eq 'hls' -and -not $hls.PSObject.Properties['Checked']) {
           $st = $null
-          try { $st = Complete-HlsStream (New-Stream $hls.Url 'hls' $hls.Headers) } catch {}
-          if ($st -and $st.Program -ge 0 -and (Switch-UrlToDownload $item)) { return }   # (its sound can't be picked out)
-          if ($st -and $st.Program -lt 0) { $hls = $st }
+          $pk = $null
+          if ($item.PSObject.Properties['PickBg']) { $pk = $item.PickBg }
+          if ($pk -or (Test-RelayAlive)) {
+            # While the stream is on, the playlists load in the background, so the window keeps answering meanwhile.
+            if (-not $pk) { $item | Add-Member -Force -NotePropertyName PickBg -NotePropertyValue (Start-HlsPickBg $hls); return }
+            if (-not $pk.H.IsCompleted -and ((Get-Date) - $pk.Started).TotalSeconds -lt 60) { return }
+            $item.PickBg = $null
+            if ($pk.H.IsCompleted) {
+              try { $res = @($pk.Ps.EndInvoke($pk.H)); if ($res.Count -gt 0) { $st = $res[0] } } catch {}
+              try { $pk.Ps.Dispose() } catch {}
+            } else { try { [void]$pk.Ps.BeginStop($null, $null) } catch {} }
+          } else {
+            try { $st = Complete-HlsStream (New-Stream $hls.Url 'hls' $hls.Headers) } catch {}
+          }
+          # Only a quality that carries its own sound is taken. Else the master playlist plays as it is: ffmpeg reads
+          # all of it, and the group's default sound is chosen (a separate sound playlist could be another language).
+          if ($st -and $st.Program -lt 0 -and -not $st.AudioUrl) { $hls = $st }
           $hls | Add-Member -Force -NotePropertyName Checked -NotePropertyValue $true
           $item.Stream = $hls
         }
@@ -2551,9 +2581,11 @@ function Step-Prep($item) {
       }
       if (-not $item.Info.Video -and $item.Info.Audio.Count -eq 0) { throw (T 'no video or audio found in it') }
       # A link to a live stream (an HLS playlist that keeps growing has no length): it plays from where the stream
-      # is now, and can't be skipped back or forward. (Only HLS: another file without a length is still a file.)
+      # is now, and can't be skipped back or forward. (Only HLS, an MPEG-TS link (IPTV) and rtmp/rtsp/srt/udp: another
+      # file without a length is still a file.)
       $isHls = ((Get-UrlMediaExt $item.Source) -eq 'm3u8') -or ($item.Stream -and $item.Stream.Kind -eq 'hls')
-      $item.IsLive = ($item.Kind -eq 'url' -and $item.IsDirectUrl -and $isHls -and $item.Info.Duration -le 0)
+      $liveForm = $isHls -or ((Get-UrlMediaExt $item.Source) -eq 'ts') -or ($item.Source -notmatch '^(?i)https?://')
+      $item.IsLive = ($item.Kind -eq 'url' -and $item.IsDirectUrl -and $liveForm -and $item.Info.Duration -le 0)
       # Subtitles written as text inside the file can only be drawn in from a downloaded copy: yt-dlp downloads it.
       if ($item.Kind -eq 'url' -and $item.IsDirectUrl -and -not $item.IsLive -and $script:CanSubs -and
         @($item.Info.Subs | Where-Object { $_.Kind -eq 'text' }).Count -gt 0 -and (Switch-UrlToDownload $item)) { return }
@@ -2603,6 +2635,9 @@ function Update-Prep {
     $it = $script:Queue[$i]
     if ($i -gt $script:Idx) { Step-Prep $it }
     if ($it.State -eq 'downloading' -or ($i -eq $script:Idx -and $it.State -eq 'new')) { break }
+    # (A link still looked at in the background may turn into a download: the ones after it wait, to keep the order.)
+    $bgBusy = ($it.PSObject.Properties['PickBg'] -and $it.PickBg) -or ($it.PSObject.Properties['ProbeBg'] -and $it.ProbeBg)
+    if ($bgBusy -and ($it.State -eq 'new' -or $it.State -eq 'probe')) { break }
   }
 }
 
@@ -4409,7 +4444,8 @@ function Clear-QueueForStop {
   if ($script:Idx -lt $script:Queue.Count) {
     for ($i = $script:Idx; $i -lt $script:Queue.Count; $i++) {
       $it = $script:Queue[$i]
-      if ($it.Dl) { Stop-Proc $it.Dl.Proc }
+      # (A download still running stops as a whole tree: yt-dlp's own ffmpeg too.)
+      if ($it.Dl -and $it.Dl.Proc) { try { if (-not $it.Dl.Proc.HasExited) { Stop-ProcessTree $it.Dl.Proc } } catch {} }
       Remove-ItemFiles $it
     }
   }
@@ -4678,8 +4714,11 @@ function Invoke-Queue {
     $r = Invoke-Source -Kind 'content' -Media $cur -Start $cur.ResumeAt
     if ($r.Elapsed -gt 60) { $script:RelayFails = 0 }
     if (($r.Position - $cur.ResumeAt) -gt 2) { $script:EncoderProven = $true }
-    # A web stream that ends well before the episode does was cut off, not finished.
-    if ($r.Outcome -eq 'done' -and $cur.Kind -eq 'site' -and $cur.IsDirectUrl -and $cur.Info.Duration -gt 60 -and $r.Position -lt $cur.Info.Duration - 20) { $r.Outcome = 'failed' }
+    # A web stream that ends well before the episode does was cut off, not finished (also a link played as it is).
+    if ($r.Outcome -eq 'done' -and ($cur.Kind -eq 'site' -or ($cur.Kind -eq 'url' -and -not $cur.IsLive)) -and $cur.IsDirectUrl -and
+      $cur.Info.Duration -gt 60 -and $r.Position -lt $cur.Info.Duration - 20) { $r.Outcome = 'failed' }
+    # (A link whose server failed it at once is the server's doing, not the encoder's.)
+    $inputErr = ($cur.Kind -eq 'url' -and $cur.IsDirectUrl -and "$($r.Error)" -match '(?i)HTTP error|Server returned|Input/output error|I/O error|Connection (refused|reset|timed out)|Failed to resolve|Error opening input|Invalid data found')
     $fromLink = ($r.Cmd -and $r.Cmd.From -eq 'link')
     if ($r.Outcome -eq 'done' -or $r.Outcome -eq 'skip' -or $r.Outcome -eq 'playnow') {
       Remove-ItemFiles $cur
@@ -4762,7 +4801,7 @@ function Invoke-Queue {
       }
       continue
     }
-    if (-not $script:EncoderProven -and $r.Elapsed -lt 20 -and ($r.Position - $cur.ResumeAt) -lt 1 -and $script:VEnc -ne 'libx264' -and $cur.Attempts -lt 3) {
+    if (-not $script:EncoderProven -and -not $inputErr -and $r.Elapsed -lt 20 -and ($r.Position - $cur.ResumeAt) -lt 1 -and $script:VEnc -ne 'libx264' -and $cur.Attempts -lt 3) {
       $resync = $false
       if ($script:VEnc -eq 'h264_nvenc' -and $script:NvTier -gt 1) {
         $script:NvTier--
@@ -5168,8 +5207,9 @@ function Stop-Everything {
   if (Get-Command Stop-ViewerPreview -CommandType Function -ErrorAction SilentlyContinue) { try { Stop-ViewerPreview } catch {} }
   if ($script:PanelShown) { try { Close-ControlPanel } catch {} }
   $script:PanelShown = $false
+  # Downloads first, as whole trees (yt-dlp's own ffmpeg would go on recording once yt-dlp is gone).
+  foreach ($it in $script:Queue) { if ($it.Dl -and $it.Dl.Proc) { try { if (-not $it.Dl.Proc.HasExited) { Stop-ProcessTree $it.Dl.Proc } } catch {} } }
   foreach ($bg in $script:BgProcs) { Stop-Proc $bg.Proc }
-  foreach ($it in $script:Queue) { if ($it.Dl) { Stop-Proc $it.Dl.Proc } }
   Close-Relay
   Start-Sleep -Milliseconds 300
   try { [System.IO.File]::Delete((Get-RelayProgPath)) } catch {}
