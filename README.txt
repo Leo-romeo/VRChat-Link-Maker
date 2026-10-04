@@ -434,7 +434,12 @@ All of these are optional.
               "cpu" forces the processor.
   CpuTune     "animation" (the default) tunes CPU encoding for anime; set it
               to "" for live-action shows.
-  StreamFps   one frame rate for the whole session. "auto" = 23.976.
+  StreamFps   not set (the default): each connection runs at the frame
+              rate of its first video (23.976, 25, 29.97...); later videos
+              are converted to it. A number (or "auto" = 23.976) fixes one
+              frame rate for the whole session.
+  MaxFps      30. Videos above it go out at half rate (50 -> 25);
+              set 60 to allow 50/60 fps (needs more upload).
   StartDelaySeconds   3. Extra wait for the other viewers' players before a
               video starts.
   ViewerDelaySeconds  5. How far behind the world's player shows the stream

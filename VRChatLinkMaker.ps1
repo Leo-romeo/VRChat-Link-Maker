@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.4.1'
+$script:Version = '1.4.2'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -79,6 +79,7 @@ $script:PanelShown = $false
 $script:ChoosingMode = $true          # nothing has streamed yet (or it was stopped): questions are fine
 $script:PendingHold = $null
 $script:RelayFresh = $false
+$script:FpsLocked = $false            # a video started on this connection: its frame rate is fixed (Select-SessionFps)
 $script:RelayErr = $null
 $script:LastStatus = ''
 $script:ControlsShown = $false
@@ -935,11 +936,13 @@ function Clear-OldTemp {
 
 # ------------------------------------------------------------------ encoders
 function Test-Encoder([string]$enc) {
-  # Same settings as the real stream, so an old graphics driver fails here instead of mid-stream.
+  # Same settings as the real stream at the most a session can ask of it (1080p at the highest frame rate it may run
+  # at, with that level), so an old graphics card / driver fails here instead of mid-stream.
   $pix = 'yuv420p'
   if ($enc -eq 'h264_qsv') { $pix = 'nv12' }
-  $argv = @('-hide_banner', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=1280x720:r=24:d=1', '-vf', "format=$pix")
-  $argv += Get-VideoEncArgs $enc 1700 24
+  $fps = Get-TopStreamFps
+  $argv = @('-hide_banner', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', "color=c=black:s=1920x1080:r=$(Format-Num $fps):d=1", '-vf', "format=$pix")
+  $argv += Get-VideoEncArgs $enc 1700 $fps -Width 1920 -Height 1080
   $argv += @('-f', 'null', '-')
   $r = Invoke-Capture $script:FFmpeg $argv
   return ($r.ExitCode -eq 0)
@@ -972,9 +975,12 @@ function Get-EncoderName([string]$enc) {
 # bitrate), and a header that changes while viewers are connected can freeze VRChat's player.
 # A keyframe every second: VRChat's players need one to show a picture after joining or a resync.
 # -ForTest (the upload speed test) and "EncoderArgs": "classic" in config.json: constant bitrate, as before.
-function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForTest) {
+function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForTest, [int]$Width = 0, [int]$Height = 0) {
   $g = [int][Math]::Round($fps)
   if ($g -lt 12) { $g = 24 }
+  if ($Width -le 0) { $Width = $script:OutW }
+  if ($Height -le 0) { $Height = $script:OutH }
+  $lvl = Get-H264Level $Width $Height $fps
   $classic = $ForTest -or (Test-ClassicEncoder)
   $cap = $kbps
   if (-not $classic -and $script:RateCapKbps -ge $kbps) { $cap = [int]$script:RateCapKbps }
@@ -993,17 +999,18 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
     if ($script:NvTier -le 1) { $preset = 'p5' }
     $rc = @('-rc', 'vbr', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf)
     if ($classic) { $rc = @('-rc', 'cbr', '-b:v', $b, '-maxrate', $b, '-bufsize', $buf) }
-    $a = @('-c:v', 'h264_nvenc', '-preset', $preset, '-tune', 'hq', '-profile:v', 'high', '-level:v', '4.1') + $rc + @('-bf', '0', '-g', "$g", '-no-scenecut', '1')
+    $a = @('-c:v', 'h264_nvenc', '-preset', $preset, '-tune', 'hq', '-profile:v', 'high', '-level:v', $lvl) + $rc + @('-bf', '0', '-g', "$g", '-no-scenecut', '1')
     if ($script:NvTier -ge 3) { $a += @('-multipass', 'fullres') }
     if ($script:NvTier -ge 2) { $a += @('-temporal-aq', '1') }
     return $a + $col
   }
   if ($venc -eq 'h264_amf') {
-    return @('-c:v', 'h264_amf', '-usage', 'transcoding', '-quality', 'quality', '-profile:v', 'high', '-rc', 'vbr_peak', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
+    return @('-c:v', 'h264_amf', '-usage', 'transcoding', '-quality', 'quality', '-profile:v', 'high', '-level', $lvl, '-rc', 'vbr_peak', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
       '-bf', '0', '-g', "$g") + $col
   }
   if ($venc -eq 'h264_qsv') {
-    return @('-c:v', 'h264_qsv', '-preset', 'medium', '-profile:v', 'high', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf, '-bf', '0', '-g', "$g") + $col
+    # (Quick Sync takes the level as a number: 41 = 4.1.)
+    return @('-c:v', 'h264_qsv', '-preset', 'medium', '-profile:v', 'high', '-level', ($lvl -replace '\.', ''), '-b:v', $b, '-maxrate', $m, '-bufsize', $buf, '-bf', '0', '-g', "$g") + $col
   }
   $preset = "$($script:Cfg.CpuPreset)"
   if ($script:CpuPreset) { $preset = $script:CpuPreset }
@@ -1012,8 +1019,22 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
   $tune = Get-Prop $script:Cfg 'CpuTune'
   if ($null -eq $tune) { $tune = 'animation' }
   if ("$tune".Trim()) { $a += @('-tune', "$tune".Trim()) }
-  return $a + @('-profile:v', 'high', '-level:v', '4.1', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
+  return $a + @('-profile:v', 'high', '-level:v', $lvl, '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
     '-bf', '0', '-g', "$g", '-keyint_min', "$g", '-sc_threshold', '0') + $col
+}
+
+# The H.264 level written into the header: 4.1 carries up to 1080p at 30 fps (every usual session), 4.2 1080p at
+# 60 fps. Other sizes / rates get the lowest level whose limits (macroblocks per frame and per second, H.264 table A-1)
+# they fit, never below 4.1.
+function Get-H264Level([int]$w, [int]$h, [double]$fps) {
+  if ($w -le 0 -or $h -le 0) { $w = 1920; $h = 1080 }
+  if ($w -le 1920 -and $h -le 1080 -and $fps -le 30.5) { return '4.1' }
+  $fs = [Math]::Ceiling($w / 16.0) * [Math]::Ceiling($h / 16.0)
+  $mbps = $fs * [Math]::Max(1.0, $fps)
+  foreach ($l in @(@('4.1', 8192, 245760), @('4.2', 8704, 522240), @('5.0', 22080, 589824), @('5.1', 36864, 983040), @('5.2', 36864, 2073600))) {
+    if ($fs -le $l[1] -and $mbps -le $l[2]) { return $l[0] }
+  }
+  return '5.2'
 }
 
 # ------------------------------------------------------------------ media info + track choice
@@ -1120,7 +1141,7 @@ function ConvertFrom-ProbeOutput($r) {
       $info.Video = [pscustomobject]@{
         Index = $idx; Codec = $codec; Width = (ConvertTo-IntSafe $s['width']); Height = (ConvertTo-IntSafe $s['height'])
         Sar = $sar; Fps = $fps; FpsStr = $fpsStr; Interlaced = (@('tt', 'bb', 'tb', 'bt') -contains $fo)
-        ColorSpace = "$($s['color_space'])"; ColorRange = "$($s['color_range'])"; PixFmt = "$($s['pix_fmt'])"
+        ColorSpace = "$($s['color_space'])"; ColorRange = "$($s['color_range'])"; PixFmt = "$($s['pix_fmt'])"; ColorTransfer = "$($s['color_transfer'])"
       }
       if ($info.BitRate -le 0) { $info.BitRate = ConvertTo-IntSafe $s['tags.variant_bitrate'] }
     } elseif ($type -eq 'audio') {
@@ -1145,6 +1166,12 @@ function ConvertFrom-ProbeOutput($r) {
   $info.Subs = $subs.ToArray()
   $info.Fonts = $fonts.ToArray()
   return $info
+}
+
+# HDR (PQ / HLG): the stream is plain HD (BT.709) and nothing maps the brightness down, so the colours look pale.
+function Test-HdrVideo($v) {
+  if (-not $v -or -not $v.PSObject.Properties['ColorTransfer']) { return $false }
+  return ("$($v.ColorTransfer)" -match '^(?i)(smpte2084|arib-std-b67)$')
 }
 
 function New-ExternalSubTrack([string]$f) {
@@ -1321,8 +1348,62 @@ function Set-FpsPlan($item) {
   $item.OutFps = $script:StreamFpsNum
   $item.FpsNote = $null
   if ($v -and $v.Fps -gt 0 -and [Math]::Abs($v.Fps - $script:StreamFpsNum) -gt 0.6 -and [Math]::Abs($v.Fps / 2 - $script:StreamFpsNum) -gt 0.6) {
-    $item.FpsNote = T 'this video is {0} fps, the stream runs at {1} fps ("StreamFps" in config.json)' (Format-Num ([Math]::Round($v.Fps, 3))) (Format-Num ([Math]::Round($script:StreamFpsNum, 3)))
+    $vf = Format-Num ([Math]::Round($v.Fps, 3))
+    $sf = Format-Num ([Math]::Round($script:StreamFpsNum, 3))
+    if ($script:FpsAuto) { $item.FpsNote = T 'this video is {0} fps, the stream runs at {1} fps (the first video on this connection set it)' $vf $sf }
+    else { $item.FpsNote = T 'this video is {0} fps, the stream runs at {1} fps ("StreamFps" in config.json)' $vf $sf }
   }
+}
+
+# Without "StreamFps" in config.json the frame rate follows the first video of each new connection (Select-SessionFps):
+# 23.976 / 24 / 25 / 29.97 / 30 as they are; faster videos at half their rate, unless "MaxFps" is 50 or more (then
+# at their own rate up to MaxFps); unknown -> 23.976. Other rates take the nearest of these.
+$script:FpsAuto = $false
+$script:FpsLow = @(@('24000/1001', (24000.0 / 1001.0)), @('24', 24.0), @('25', 25.0), @('30000/1001', (30000.0 / 1001.0)), @('30', 30.0))
+$script:FpsHigh = @(@('50', 50.0), @('60000/1001', (60000.0 / 1001.0)), @('60', 60.0))
+function Get-MaxFpsSetting { return (Get-NumSetting 'MaxFps' 30 10 60) }
+
+# The frame rate (@(text for ffmpeg, number)) a session that starts with $item runs at.
+function Get-SessionFpsFor($item) {
+  $f = 0.0
+  if ($item -and $item.Info -and $item.Info.Video) { $f = [double]$item.Info.Video.Fps }
+  if ($f -le 0) { return , $script:FpsLow[0] }
+  $lim = 30.5
+  $mx = Get-MaxFpsSetting
+  if ($mx -ge 50) { $lim = $mx + 0.5 }
+  while ($f -gt $lim) { $f = $f / 2.0 }
+  $set = $script:FpsLow
+  if ($f -gt 30.5) { $set = @($script:FpsHigh | Where-Object { $_[1] -le $lim }) }
+  $best = $set[0]
+  foreach ($c in $set) { if ([Math]::Abs($c[1] - $f) -lt [Math]::Abs($best[1] - $f)) { $best = $c } }
+  return , $best
+}
+
+# The highest frame rate this session may run at (what the encoder check at the start tries).
+function Get-TopStreamFps {
+  $f = [Math]::Max(30.0, $script:StreamFpsNum)
+  if ($script:FpsAuto -and (Get-MaxFpsSetting) -ge 50) { $f = [Math]::Max($f, (Get-MaxFpsSetting)) }
+  return $f
+}
+
+# Sets the stream's frame rate (only for a new connection: it is in the H.264 header). Above 40 fps a picture size
+# needs more bitrate (Get-FpsFactor), so size and bitrate are worked out again when that changes.
+function Set-StreamFps([string]$str, [double]$num) {
+  $before = Get-FpsFactor
+  $script:StreamFps = $str
+  $script:StreamFpsNum = $num
+  if ((Get-FpsFactor) -ne $before) { Update-StreamQuality }
+}
+
+# The first video on a new connection decides the frame rate of everything on it. $true = it changed.
+function Select-SessionFps($item) {
+  if (-not $script:FpsAuto -or -not $item -or -not $item.Info) { return $false }
+  $want = Get-SessionFpsFor $item
+  if ([Math]::Abs($want[1] - $script:StreamFpsNum) -lt 0.001) { return $false }
+  Set-StreamFps $want[0] $want[1]
+  Say (T '  The stream now runs at {0} fps, the frame rate of this video.' (Format-Num ([Math]::Round($want[1], 3)))) 'DarkGray'
+  Show-StreamQuality
+  return $true
 }
 
 # ------------------------------------------------------------------ queue items
@@ -2567,7 +2648,8 @@ function Get-VideoGraph($item, [string]$inLabel, [double]$start, [string]$pix, [
   if ($v -and $v.Interlaced -and $script:HasBwdif) { $pre.Add('bwdif=deint=interlaced') }
   if ($v -and $v.Sar -gt 0 -and [Math]::Abs($v.Sar - 1.0) -gt 0.01) { $post.Add('scale=trunc(iw*sar/2)*2:ih:flags=lanczos'); $post.Add('setsar=1') }
   $post.Add("scale=$($W):$($H):force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos$(Get-ColourScaleOpts $v)")
-  if ($item.FpsFilter) { $post.Add("fps=$($item.FpsFilter)") }
+  # (The session's frame rate as it is now, not as it was when this video was got ready: Select-SessionFps may change it.)
+  $post.Add("fps=$($script:StreamFps)")
   $sub = $item.SubTrack
   if ($sub -and $item.SubFile -and $sub.Kind -ne 'bitmap') {
     $sf = 'subtitles=filename=sub.ass:fontsdir=fonts'
@@ -2761,6 +2843,7 @@ function Start-Relay {
   $script:LastEnd = -1.0
   # Nobody can be watching a connection that just opened: the next video waits for the players (Test-HoldReady).
   $script:RelayFresh = $true
+  $script:FpsLocked = $false   # (a reconnect of the same session carries it over: Restart-RelayForResync, Invoke-Queue)
 }
 
 $script:RelayGen = 0
@@ -3334,6 +3417,9 @@ function Step-DownQuality {
   $faster = @{ 'veryslow' = 'slower'; 'slower' = 'slow'; 'slow' = 'medium'; 'medium' = 'fast'; 'fast' = 'faster'; 'faster' = 'veryfast'; 'veryfast' = 'superfast' }
   $cur = "$($script:Cfg.CpuPreset)"
   if ($script:CpuPreset) { $cur = $script:CpuPreset }
+  $script:FastSecs = 0.0
+  # (Slow again after going back up: wait twice as long before the next try.)
+  if ($script:SteppedUp) { $script:StepUpWait = [Math]::Min(3600.0, $script:StepUpWait * 2); $script:SteppedUp = $false }
   if ($script:VEnc -eq 'libx264' -and $faster.ContainsKey($cur)) {
     $script:CpuPreset = $faster[$cur]
     # Another x264 preset writes a different H.264 header: the players reconnect once (Invoke-Queue).
@@ -3341,11 +3427,39 @@ function Step-DownQuality {
     Say (T '  The stream couldn''t keep up with real time{0} - encoding a bit lighter (x264 preset {1}) and carrying on.' $sp $script:CpuPreset) 'Yellow'
     return
   }
-  # Only the average drops; the ceiling in the header stays (with "EncoderArgs": "classic" the players reconnect once).
-  if (Test-ClassicEncoder) { $script:NeedResync = $true }
+  # Only the average drops; the ceiling in the header stays (with "EncoderArgs": "classic" the players reconnect once,
+  # and with AMD / Intel encoders too: that their header stays the same with another bitrate isn't proven).
+  if ((Test-ClassicEncoder) -or $script:VEnc -eq 'h264_amf' -or $script:VEnc -eq 'h264_qsv') { $script:NeedResync = $true }
+  [void]$script:KbpsDown.Add($script:VideoKbps)
   $script:VideoKbps = [int][Math]::Max((Get-KbpsFloor), [Math]::Round($script:VideoKbps * 0.8 / 50) * 50)
   Say (T '  The stream couldn''t keep up with real time{0} - lowering the video bitrate to {1} kbps and carrying on.' $sp $script:VideoKbps) 'Yellow'
   Say (T '  (If this happens every time, set "VideoKbps" in config.json to that number.)') 'DarkGray'
+}
+
+# Back up again: once videos kept up with real time for StepUpWait seconds after a lower bitrate, the next video
+# (never one already playing) gets the bitrate from before the last step down, at most the connection's ceiling.
+# Only where the H.264 header stays the same with another average: NVENC (variable bitrate) and x264 (a lighter
+# x264 preset stays: going back would change the header). Not with "EncoderArgs": "classic", AMD or Intel.
+$script:KbpsDown = New-Object System.Collections.ArrayList   # the bitrates before each step down (last = latest)
+$script:FastSecs = 0.0
+$script:StepUpWait = 300.0
+$script:SteppedUp = $false
+$script:LastStartedItem = $null
+function Test-CanStepUp {
+  if ($script:KbpsDown.Count -eq 0 -or $script:FastSecs -lt $script:StepUpWait -or (Test-ClassicEncoder)) { return $false }
+  return ($script:VEnc -eq 'h264_nvenc' -or $script:VEnc -eq 'libx264')
+}
+
+function Step-UpQuality {
+  $k = [int]$script:KbpsDown[$script:KbpsDown.Count - 1]
+  $script:KbpsDown.RemoveAt($script:KbpsDown.Count - 1)
+  if ($script:RateCapKbps -gt 0) { $k = [Math]::Min($k, [int]$script:RateCapKbps) }
+  $script:FastSecs = 0.0
+  if ($k -le $script:VideoKbps) { return }
+  $script:VideoKbps = $k
+  $script:KbpsSteps = [Math]::Max(0, $script:KbpsSteps - 1)
+  $script:SteppedUp = $true
+  Say (T '  The upload keeps up again - back to {0} kbps video.' $k) 'Green'
 }
 
 # ------------------------------------------------------------------ picture size and bitrate
@@ -3410,11 +3524,21 @@ function Update-StreamQuality {
     $auto = Get-AutoHeight (Get-KbpsCeiling)
     if ($need -gt 0 -and (Get-KbpsCeiling) -lt $need * (Get-FpsFactor) -and $auto -lt $h) { $script:HeightCappedFrom = $h; $h = $auto }
   }
+  $was = @($script:OutW, $script:OutH, $script:RateCapKbps, $script:VideoKbps, $script:KbpsSteps)
   $script:OutH = [int]([Math]::Round($h / 2.0) * 2)
   $script:OutW = [int]([Math]::Round($script:OutH * 16.0 / 9.0 / 2.0) * 2)
   $script:VideoKbps = Get-QualityKbps $script:OutH
   $script:RateCapKbps = $script:VideoKbps
+  # Same size and ceiling after a step down: with "EncoderArgs": "classic", AMD or Intel the bitrate is in the H.264
+  # header (or may be), and the stream may go on on this connection (the resolution menu): keep the lowered one.
+  if ($was[4] -gt 0 -and $was[0] -eq $script:OutW -and $was[1] -eq $script:OutH -and $was[2] -eq $script:RateCapKbps -and $was[3] -lt $script:VideoKbps -and
+      ((Test-ClassicEncoder) -or $script:VEnc -eq 'h264_amf' -or $script:VEnc -eq 'h264_qsv')) {
+    $script:VideoKbps = $was[3]
+    return
+  }
   $script:KbpsSteps = 0
+  $script:KbpsDown.Clear()
+  $script:FastSecs = 0.0
 }
 
 function Show-StreamQuality {
@@ -3424,11 +3548,18 @@ function Show-StreamQuality {
   if ($script:HostP) { $name = T ' on {0}' $script:HostP.Name }
   $size = "$($script:OutH)p"
   if ((Get-HeightSetting) -le 0) { $size = T '{0} (auto)' $size }
-  Say (T '  Picture: {0}, {1} kbps video ({2}{3}).  V = change the resolution.' $size $script:VideoKbps $how $name) 'DarkGray'
+  $fps = Format-Num ([Math]::Round($script:StreamFpsNum, 2))
+  Say (T '  Picture: {0}, {1} fps, {2} kbps video ({3}{4}).  V = change the resolution.' $size $fps $script:VideoKbps $how $name) 'DarkGray'
   if ($script:HeightCappedFrom -gt 0) {
     Say (T '  ({0}p instead of {1}p: at {2} kbps {0}p looks sharper. "HeightPolicy": "exact" in config.json keeps {1}p.)' $script:OutH $script:HeightCappedFrom $script:VideoKbps) 'DarkGray'
   }
+  # (The control window shows this line orange with the advice; here it is said once.)
+  if (-not $script:LowTipShown -and (Get-QualityLine).Low) {
+    $script:LowTipShown = $true
+    Say (T '  Too few bits for this picture size, so it looks blocky. A smaller picture size (V) looks sharper.') 'Yellow'
+  }
 }
+$script:LowTipShown = $false
 
 # The picture and bitrate in one short line for the control window, and whether it is too few bits for the size.
 function Get-QualityLine {
@@ -4100,23 +4231,31 @@ function Invoke-Source {
       # Real playback speed over the last ~10 s (1.00 = keeping up with real time).
       if (-not $markTime) { if ($pos -gt 0) { $markTime = $now; $markPos = $pos } }
       elseif (($now - $markTime).TotalSeconds -ge 10) {
-        $speed = ($pos - $markPos) / ($now - $markTime).TotalSeconds
+        $span = ($now - $markTime).TotalSeconds
+        $speed = ($pos - $markPos) / $span
         $markTime = $now; $markPos = $pos
-        # (A live stream comes at real time at best: a gap in it is the stream's, see the stall check below.)
+        # Upload keeping up (for going back up after a step-down, Step-UpQuality). A video read straight from a server
+        # that is slow says nothing about the upload.
+        if ($Kind -eq 'content') {
+          if ($speed -ge 0.97) { $script:FastSecs += $span }
+          elseif ($speed -lt 0.93 -and -not $Media.IsDirectUrl) { $script:FastSecs = 0.0 }
+        }
+        # Which ones can be helped by a lighter stream:
+        #  - a live stream (IsLive): comes at real time at best, a gap in it is the stream's (see the stall check
+        #    below) - no check at all;
+        #  - a site's stream or a plain link to a video file / playlist (IsDirectUrl): slow because of that server, a
+        #    lighter stream wouldn't help - only a warning (a site's: the next ones download in advance);
+        #  - a local file or a finished download: slow because of this PC or its upload - a notch lighter.
         if ($Kind -eq 'content' -and -not $slowWarned -and -not $Media.IsLive -and ($now - $t0).TotalSeconds -gt 20) {
           if ($speed -lt 0.93) { $slowCount++ } else { $slowCount = 0 }
-          # Played straight from a server (a site's player, a link to a video file): a lighter stream wouldn't help.
-          $fromNet = ($Media.IsDirectUrl -and ($Media.Stream -or $Media.Kind -eq 'url'))
-          if ($slowCount -ge 2 -and -not $requested -and -not $fromNet -and (Test-CanStepDown)) {
+          if ($slowCount -ge 2 -and -not $requested -and -not $Media.IsDirectUrl -and (Test-CanStepDown)) {
             # Falling behind real time means stutter for everyone: go a notch lighter and carry on from here.
             $script:SlowSpeed = $speed
             $requested = 'slow'; Send-Key $proc 'q'; $quitSentAt = $now
-          } elseif ($slowCount -ge 2 -and $fromNet -and $Media.Kind -eq 'site') {
+          } elseif ($slowCount -ge 2 -and $Media.IsDirectUrl) {
             $slowWarned = $true
-            Say (T '  The video site is sending this one slower than real time, so viewers may see stutter. The next videos download in advance, so they won''t have this problem.') 'Yellow'
-          } elseif ($slowCount -ge 2 -and $fromNet) {
-            $slowWarned = $true
-            Say (T '  The server of this video is sending it slower than real time, so viewers may see stutter.') 'Yellow'
+            if ($Media.Kind -eq 'site') { Say (T '  The video site is sending this one slower than real time, so viewers may see stutter. The next videos download in advance, so they won''t have this problem.') 'Yellow' }
+            else { Say (T '  The server this video comes from sends it slower than real time, so viewers may see stutter.') 'Yellow' }
           } elseif ($slowCount -ge 2) {
             $slowWarned = $true
             Say (T '  The stream is running slower than real time, so viewers will see stutter. Either your PC is too busy (close heavy programs, or set "Height" to 540 in config.json) or your internet upload is too slow (lower "VideoKbps" in config.json).') 'Yellow'
@@ -4251,6 +4390,7 @@ function Show-NowPlaying($item) {
   }
   if ($item.SubWarn) { Say (T '  Note: {0}' $item.SubWarn) 'Yellow' }
   if ($item.FpsNote) { Say (T '  Note: {0}' $item.FpsNote) 'DarkGray' }
+  if ($item.Info -and (Test-HdrVideo $item.Info.Video)) { Say (T '  Note: {0}' (T 'this is an HDR video: its colours may look washed out on the stream')) 'DarkGray' }
   if ($item.ResumeAt -gt 0) { Say (T '  Starting from {0}' (Format-Time $item.ResumeAt)) 'Gray' }
 }
 
@@ -4302,6 +4442,7 @@ function Restart-RelayForResync([string]$next = 'hold') {
     Say (T '  (ProTV worlds reconnect by themselves. Other players may need Reload / Resync pressed once.)') 'DarkGray'
   }
   if ($script:Src) { [void](Stop-Source $script:Src -Now) }
+  $locked = $script:FpsLocked
   $old = $script:Relay
   $oldProg = Get-RelayProgPath
   Start-ResyncRelay $next
@@ -4318,6 +4459,7 @@ function Restart-RelayForResync([string]$next = 'hold') {
     Start-ResyncRelay $next
   }
   $script:RelayFresh = $false
+  $script:FpsLocked = $locked   # (a resync before any video leaves the frame rate to the first video)
   $script:ResyncedAt = Get-Date
   $script:RenewedAt = Get-Date      # the players' failure this causes is expected: no extra new connection for it
   $script:PendingHold = New-Hold 'reload' 45
@@ -4337,7 +4479,7 @@ function Invoke-Queue {
     if ($script:Idx -lt $script:Queue.Count) { $cur = $script:Queue[$script:Idx] }
     if ($script:Paused -and $cur) {
       # Keep the viewers connected with a "Paused" screen until someone continues (or skips / stops).
-      if (-not (Test-RelayAlive)) { Start-Relay; $script:RelayFresh = $false; $script:PendingHold = New-Hold 'reload' }
+      if (-not (Test-RelayAlive)) { $locked = $script:FpsLocked; Start-Relay; $script:FpsLocked = $locked; $script:RelayFresh = $false; $script:PendingHold = New-Hold 'reload' }
       $r = Invoke-Source -Kind 'paused' -Media $cur
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { $script:StopAll = $true; break }
       if ($r.Outcome -eq 'relay') { if (-not (Wait-RelayRetry)) { break }; continue }
@@ -4430,9 +4572,11 @@ function Invoke-Queue {
         # Back on the air with the waiting screen; the next video waits until the players are back (or, if no video
         # played on this connection yet, until they show the stream at all).
         $fresh = $script:RelayFresh
+        $locked = $script:FpsLocked
         if (-not (Wait-RelayRetry $false)) { break }
         Start-Relay
         $script:RelayFresh = $fresh
+        $script:FpsLocked = $locked
         if (-not $fresh -and -not ($script:PendingHold -and $script:PendingHold.Reason -eq 'start')) { $script:PendingHold = New-Hold 'reload' }
         continue
       }
@@ -4461,7 +4605,26 @@ function Invoke-Queue {
       $script:Idx++
       continue
     }
-    if (-not (Test-RelayAlive)) { Start-Relay }
+    # The first video on a new connection sets the frame rate of everything on it (without "StreamFps" in config.json).
+    # The H.264 header holds it, so a change needs a new connection. Once the stream sent anything, or VRChat runs here,
+    # someone may be watching: the new connection opens before the old one closes (a resync). Else simply a new one.
+    # Either way the video then waits for the players as on a new connection.
+    if (-not (Test-RelayAlive)) { [void](Select-SessionFps $cur); Start-Relay }
+    elseif ($script:FpsAuto -and -not $script:FpsLocked) {
+      # (The log isn't read while questions wait or a video gets ready: what does the world's player here do now?)
+      if ($script:VrcLog) { $script:RemoteNextPoll = [datetime]::MinValue; Receive-WorldCommands 'waiting' }
+      $start = $script:HoldOn -and ($script:RelayFresh -or ($script:PendingHold -and $script:PendingHold.Reason -eq 'start'))
+      if (Select-SessionFps $cur) {
+        $sent = $false
+        try { $sent = ((Read-RelaySize) -gt 0) } catch {}
+        if ((Test-VrcWatching) -or $sent) {
+          Restart-RelayForResync
+          if ($start) { $script:PendingHold = New-Hold 'start' }
+        }
+        else { Stop-Relay; Start-Relay }
+      }
+    }
+    Set-FpsPlan $cur
     # Wait for the players first when they can't be watching yet (a new connection) or are reconnecting.
     $hold = $script:PendingHold
     if (-not $hold -and $script:RelayFresh -and $script:HoldOn) { $hold = New-Hold 'start' }
@@ -4470,7 +4633,7 @@ function Invoke-Queue {
     if ($hold -and -not (Test-HoldReady $hold)) {
       if (-not $cur.Announced) { Show-NowPlaying $cur; $cur.Announced = $true }
       $r = Invoke-Source -Kind 'hold' -Media $cur -Hold $hold
-      if ($r.Outcome -eq 'renew') { Stop-Relay; Start-Relay; $script:RelayFresh = $false; $script:PendingHold = $hold; continue }
+      if ($r.Outcome -eq 'renew') { $locked = $script:FpsLocked; Stop-Relay; Start-Relay; $script:FpsLocked = $locked; $script:RelayFresh = $false; $script:PendingHold = $hold; continue }
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { $script:StopAll = $true; break }
       if ($r.Outcome -eq 'stop') { Save-ItemState $cur $cur.ResumeAt; Clear-QueueForStop; continue }
       if ($r.Outcome -eq 'relay') {
@@ -4506,6 +4669,12 @@ function Invoke-Queue {
     if (-not $cur.Announced) { Show-NowPlaying $cur }
     $cur.Announced = $true
     Show-Controls
+    # A video starting (not one going on after a pause, seek or reconnect): the bitrate may go back up (Step-UpQuality).
+    if (-not [object]::ReferenceEquals($script:LastStartedItem, $cur)) {
+      $script:LastStartedItem = $cur
+      if (Test-CanStepUp) { Step-UpQuality }
+    }
+    $script:FpsLocked = $true   # (a video started on this connection: later ones go at its frame rate)
     $r = Invoke-Source -Kind 'content' -Media $cur -Start $cur.ResumeAt
     if ($r.Elapsed -gt 60) { $script:RelayFails = 0 }
     if (($r.Position - $cur.ResumeAt) -gt 2) { $script:EncoderProven = $true }
@@ -4662,7 +4831,10 @@ function Get-NumSetting([string]$name, [double]$default, [double]$min, [double]$
 
 function Initialize-StreamSettings {
   $f = "$(Get-Prop $script:Cfg 'StreamFps')".Trim()
-  if (-not $f -or $f -eq 'auto') { $f = '24000/1001' }
+  # Not set: 23.976 until the first video of a connection sets it (Select-SessionFps). Set: always that ("auto" =
+  # 23.976, as before).
+  $script:FpsAuto = (-not $f)
+  if ($script:FpsAuto -or $f -match '^(?i)auto$') { $f = '24000/1001' }
   $num = 0.0
   if ($f -match '^(\d+)/(\d+)$' -and [double]$matches[2] -gt 0) { $num = [double]$matches[1] / [double]$matches[2] }
   elseif (-not [double]::TryParse($f, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$num)) { $num = 0.0 }
