@@ -4,8 +4,7 @@ VRChat Link Maker
 Turns any video on your PC (or a link to one) into a link that plays in any
 VRChat world's video player, for everyone in the instance, with no settings to
 change. By default it streams the video to Topaz Chat, a free streaming server
-that VRChat trusts. It can also stream from your own PC or your own server
-(new, see "WHERE TO STREAM" below).
+that VRChat trusts. It can also stream from your own PC or your own server.
 
 
 HOW TO USE
