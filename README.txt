@@ -4,8 +4,7 @@ VRChat Link Maker
 Turns any video on your PC (or a link to one) into a link that plays in any
 VRChat world's video player, for everyone in the instance, with no settings to
 change. By default it streams the video to Topaz Chat, a free streaming server
-that VRChat trusts. It can also stream from your own PC or your own server
-(new, see "WHERE TO STREAM" below).
+that VRChat trusts. It can also stream from your own PC or your own server.
 
 
 HOW TO USE
@@ -229,10 +228,9 @@ Topaz Chat (the default)
   Public ones included, with no settings to change.
 - About 1350 kbps of video: from far away Topaz only takes about 1.6 Mbps.
 
-The other choices are NEW and the author hasn't tried them in VRChat yet (on PC
-or Quest), so treat them as experimental.
-They are NOT trusted by VRChat, which means:
-- Every viewer must turn on "Allow Untrusted URLs" in VRChat's settings.
+The other choices are NOT trusted by VRChat, which means:
+- Everyone who watches, you included, must turn on "Allow Untrusted URLs" in
+  VRChat's settings.
 - They don't play in Public / Group Public instances (unless the world's
   creator allowlisted the address). Use a Friends+ / Invite instance.
 
@@ -267,13 +265,18 @@ My VPS (your own rented server - the safer choice)
      README-VPS.txt (the exact steps), install.sh and mediamtx.yml.
   2. Get a server. Free: Oracle Cloud "Always Free" (pick a European home
      region when you sign up; take an Ampere A1 machine, 2 OCPU / 12 GB).
-     Or Hetzner CX23 (about 5.49 EUR a month plus an IPv4 address).
+     Not for viewers in Russia: see "Viewers in Russia" below. Paid servers
+     cost about 5-6 EUR / USD a month.
   3. Log in to the server as root and paste install.sh in one go.
   4. Type H, choose "My VPS" again and type the server's address. Before
      every start the tool checks the server and says what's wrong, if
      anything (it doesn't answer, doesn't know your link, wrong password).
   5. Press T for a speed test to your server and save the bitrate it suggests.
-  6. Start streaming as usual. Viewers turn on "Allow Untrusted URLs".
+  6. Start streaming as usual. Everyone who watches, you included, turns on
+     "Allow Untrusted URLs".
+- The picture is encrypted on its way to the server, but the login that goes
+  with it (a user name and password inside SRT's stream id) is not. N (new
+  link) changes it.
 - Several streams at the same time (one per PC, each with its own link):
   - On the PC that set the server up: H -> "My VPS" -> "Add a stream for
     another PC". Paste the new install.sh on the server again (the streams
@@ -294,6 +297,34 @@ My VPS (your own rented server - the safer choice)
     each of them, then send new codes).
   - All streams share the server's upload (2 streams x 10 viewers x 4 Mbps =
     80 Mbps).
+
+Viewers in Russia (which VPS? do your own research)
+- Russian internet providers cut video from the big cloud hosts: Oracle,
+  Hetzner, OVH, DigitalOcean, AWS, Google Cloud, Azure, Linode/Akamai and
+  others (Topaz too). The player connects, but the picture stays black. Oracle
+  Always Free is fine for viewers outside Russia, but not for viewers in
+  Russia.
+- An example: the author's server at Amnezia Hosting (amnezia.host),
+  Netherlands location, about 5.50 USD a month. In October 2026 a small data
+  test from 20 test points on Russian home networks (Rostelecom, MTS, Beeline
+  and others) got through; a viewing test in VRChat is still to come. This is
+  an example, not an endorsement: the author isn't affiliated with it, it can
+  change at any time, and its other locations weren't tested.
+- Do your own research before you pay. What to look out for:
+  - Look up the host's network, not its brand: ipinfo.io/<server IP> shows the
+    network (ASN) and its name. Small shops often rent from the big clouds
+    above, and "anti-DDoS" addresses can belong to such a network too.
+  - Avoid the big cloud networks listed above (and resellers on them).
+  - Before you commit, ask a friend in Russia to watch a test stream for a few
+    minutes with their VPN / WARP off. A ping, an open port or a working login
+    to the server proves nothing; only video that keeps playing does.
+  - Prefer plans you can pay by the hour or month, or with a refund window,
+    and check the current refund terms first.
+  - You need a dedicated IPv4 address (not a shared "NAT VPS" address, not
+    IPv6 only) and free choice of ports.
+  - Check the traffic limit: every viewer downloads the whole stream, about
+    2 GB per viewer per hour at 4-5 Mbps.
+  - Test again now and then: the providers' lists change.
 
 Custom
 - Your own server addresses and links in config.json. For example Twitch:
@@ -375,6 +406,9 @@ GOOD TO KNOW
 - Anyone who has the link can watch, so don't post it publicly.
 - Web links (Twitter/X, Bilibili, Reddit, ...) need yt-dlp, which it offers to
   install the first time. YouTube links already play in VRChat directly.
+- A link straight to a video file or stream (ending in .mp4, .mkv, .webm,
+  .m4v, .mov, .ts or .m3u8) plays as it is, without yt-dlp. A live .m3u8
+  stream plays live: no going back or forward.
 
 
 SETTINGS (config.json, created next to this file on first run)
@@ -399,7 +433,12 @@ All of these are optional.
               "cpu" forces the processor.
   CpuTune     "animation" (the default) tunes CPU encoding for anime; set it
               to "" for live-action shows.
-  StreamFps   one frame rate for the whole session. "auto" = 23.976.
+  StreamFps   not set (the default): each connection runs at the frame
+              rate of its first video (23.976, 25, 29.97...); later videos
+              are converted to it. A number (or "auto" = 23.976) fixes one
+              frame rate for the whole session.
+  MaxFps      30. Videos above it go out at half rate (50 -> 25);
+              set 60 to allow 50/60 fps (needs more upload).
   StartDelaySeconds   3. Extra wait for the other viewers' players before a
               video starts.
   ViewerDelaySeconds  5. How far behind the world's player shows the stream
@@ -448,11 +487,12 @@ IF SOMETHING DOESN'T WORK
   start anyway, or set "WaitForPlayers": false in config.json.
 - Plays for you but not for a friend: have them enable "Allow Untrusted URLs"
   in VRChat's settings, or use a Friends+ / Invite instance.
-- A "This PC" or "My VPS" link doesn't play (these are new and not yet tried
-  in VRChat by the author): every viewer needs "Allow Untrusted URLs" on, and
-  the instance can't be Public / Group Public. For "This PC", check that ports
-  8554 and 1935 reach your PC, and whether it said you're behind CGNAT - if
-  so, use a VPS or the IPv6 link. Try both the name link and the bare-IP link.
+- A "This PC" or "My VPS" link doesn't play: everyone who watches, you
+  included, needs "Allow Untrusted URLs" on, and the instance can't be
+  Public / Group Public. For "This PC", check that ports 8554 and 1935 reach
+  your PC, and whether it said you're behind CGNAT - if so, use a VPS or the
+  IPv6 link. Try both the name link and the bare-IP link. Viewers in Russia
+  see black: see "Viewers in Russia" above.
 - "My VPS" doesn't take the stream: the tool checks the server before every
   start and says why (it doesn't answer, doesn't know your link, wrong
   password, someone else is on your link). A PC that streams with a

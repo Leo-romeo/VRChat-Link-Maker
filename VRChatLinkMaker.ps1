@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.4.1'
+$script:Version = '1.4.3'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -79,6 +79,7 @@ $script:PanelShown = $false
 $script:ChoosingMode = $true          # nothing has streamed yet (or it was stopped): questions are fine
 $script:PendingHold = $null
 $script:RelayFresh = $false
+$script:FpsLocked = $false            # a video started on this connection: its frame rate is fixed (Select-SessionFps)
 $script:RelayErr = $null
 $script:LastStatus = ''
 $script:ControlsShown = $false
@@ -951,11 +952,13 @@ function Clear-OldTemp {
 
 # ------------------------------------------------------------------ encoders
 function Test-Encoder([string]$enc) {
-  # Same settings as the real stream, so an old graphics driver fails here instead of mid-stream.
+  # Same settings as the real stream at the most a session can ask of it (1080p at the highest frame rate it may run
+  # at, with that level), so an old graphics card / driver fails here instead of mid-stream.
   $pix = 'yuv420p'
   if ($enc -eq 'h264_qsv') { $pix = 'nv12' }
-  $argv = @('-hide_banner', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=1280x720:r=24:d=1', '-vf', "format=$pix")
-  $argv += Get-VideoEncArgs $enc 1700 24
+  $fps = Get-TopStreamFps
+  $argv = @('-hide_banner', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', "color=c=black:s=1920x1080:r=$(Format-Num $fps):d=1", '-vf', "format=$pix")
+  $argv += Get-VideoEncArgs $enc 1700 $fps -Width 1920 -Height 1080
   $argv += @('-f', 'null', '-')
   $r = Invoke-Capture $script:FFmpeg $argv
   return ($r.ExitCode -eq 0)
@@ -988,9 +991,12 @@ function Get-EncoderName([string]$enc) {
 # bitrate), and a header that changes while viewers are connected can freeze VRChat's player.
 # A keyframe every second: VRChat's players need one to show a picture after joining or a resync.
 # -ForTest (the upload speed test) and "EncoderArgs": "classic" in config.json: constant bitrate, as before.
-function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForTest) {
+function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForTest, [int]$Width = 0, [int]$Height = 0) {
   $g = [int][Math]::Round($fps)
   if ($g -lt 12) { $g = 24 }
+  if ($Width -le 0) { $Width = $script:OutW }
+  if ($Height -le 0) { $Height = $script:OutH }
+  $lvl = Get-H264Level $Width $Height $fps
   $classic = $ForTest -or (Test-ClassicEncoder)
   $cap = $kbps
   if (-not $classic -and $script:RateCapKbps -ge $kbps) { $cap = [int]$script:RateCapKbps }
@@ -1009,17 +1015,18 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
     if ($script:NvTier -le 1) { $preset = 'p5' }
     $rc = @('-rc', 'vbr', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf)
     if ($classic) { $rc = @('-rc', 'cbr', '-b:v', $b, '-maxrate', $b, '-bufsize', $buf) }
-    $a = @('-c:v', 'h264_nvenc', '-preset', $preset, '-tune', 'hq', '-profile:v', 'high', '-level:v', '4.1') + $rc + @('-bf', '0', '-g', "$g", '-no-scenecut', '1')
+    $a = @('-c:v', 'h264_nvenc', '-preset', $preset, '-tune', 'hq', '-profile:v', 'high', '-level:v', $lvl) + $rc + @('-bf', '0', '-g', "$g", '-no-scenecut', '1')
     if ($script:NvTier -ge 3) { $a += @('-multipass', 'fullres') }
     if ($script:NvTier -ge 2) { $a += @('-temporal-aq', '1') }
     return $a + $col
   }
   if ($venc -eq 'h264_amf') {
-    return @('-c:v', 'h264_amf', '-usage', 'transcoding', '-quality', 'quality', '-profile:v', 'high', '-rc', 'vbr_peak', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
+    return @('-c:v', 'h264_amf', '-usage', 'transcoding', '-quality', 'quality', '-profile:v', 'high', '-level', $lvl, '-rc', 'vbr_peak', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
       '-bf', '0', '-g', "$g") + $col
   }
   if ($venc -eq 'h264_qsv') {
-    return @('-c:v', 'h264_qsv', '-preset', 'medium', '-profile:v', 'high', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf, '-bf', '0', '-g', "$g") + $col
+    # (Quick Sync takes the level as a number: 41 = 4.1.)
+    return @('-c:v', 'h264_qsv', '-preset', 'medium', '-profile:v', 'high', '-level', ($lvl -replace '\.', ''), '-b:v', $b, '-maxrate', $m, '-bufsize', $buf, '-bf', '0', '-g', "$g") + $col
   }
   $preset = "$($script:Cfg.CpuPreset)"
   if ($script:CpuPreset) { $preset = $script:CpuPreset }
@@ -1028,8 +1035,22 @@ function Get-VideoEncArgs([string]$venc, [int]$kbps, [double]$fps, [switch]$ForT
   $tune = Get-Prop $script:Cfg 'CpuTune'
   if ($null -eq $tune) { $tune = 'animation' }
   if ("$tune".Trim()) { $a += @('-tune', "$tune".Trim()) }
-  return $a + @('-profile:v', 'high', '-level:v', '4.1', '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
+  return $a + @('-profile:v', 'high', '-level:v', $lvl, '-b:v', $b, '-maxrate', $m, '-bufsize', $buf,
     '-bf', '0', '-g', "$g", '-keyint_min', "$g", '-sc_threshold', '0') + $col
+}
+
+# The H.264 level written into the header: 4.1 carries up to 1080p at 30 fps (every usual session), 4.2 1080p at
+# 60 fps. Other sizes / rates get the lowest level whose limits (macroblocks per frame and per second, H.264 table A-1)
+# they fit, never below 4.1.
+function Get-H264Level([int]$w, [int]$h, [double]$fps) {
+  if ($w -le 0 -or $h -le 0) { $w = 1920; $h = 1080 }
+  if ($w -le 1920 -and $h -le 1080 -and $fps -le 30.5) { return '4.1' }
+  $fs = [Math]::Ceiling($w / 16.0) * [Math]::Ceiling($h / 16.0)
+  $mbps = $fs * [Math]::Max(1.0, $fps)
+  foreach ($l in @(@('4.1', 8192, 245760), @('4.2', 8704, 522240), @('5.0', 22080, 589824), @('5.1', 36864, 983040), @('5.2', 36864, 2073600))) {
+    if ($fs -le $l[1] -and $mbps -le $l[2]) { return $l[0] }
+  }
+  return '5.2'
 }
 
 # ------------------------------------------------------------------ media info + track choice
@@ -1079,7 +1100,7 @@ function Get-MediaInfoArgs([string]$src, [bool]$isUrl, $stream = $null) {
 
 function Get-MediaInfo([string]$src, [bool]$isUrl, $stream = $null) {
   $r = Invoke-Capture $script:FFprobe (Get-MediaInfoArgs $src $isUrl $stream)
-  $info = ConvertFrom-ProbeOutput $r
+  $info = ConvertFrom-ProbeOutput $r $stream
   if ($stream -and $stream.AudioUrl) {
     # A web stream whose sound is a separate playlist (played as a second input).
     $ai = Get-MediaInfo $stream.AudioUrl $true (New-Stream $stream.AudioUrl $stream.Kind $stream.Headers)
@@ -1091,7 +1112,9 @@ function Get-MediaInfo([string]$src, [bool]$isUrl, $stream = $null) {
 }
 
 # ffprobe's answer ($r: ExitCode, Out, Err) -> Duration, BitRate, Video, Audio, Subs, Fonts.
-function ConvertFrom-ProbeOutput($r) {
+# $stream with PickBw/PickH: an HLS master playlist read as it is, which lists every quality; the one Complete-HlsStream
+# picked is taken (and only its own sound, when it has some), else the first one listed.
+function ConvertFrom-ProbeOutput($r, $stream = $null) {
   if ($r.ExitCode -ne 0 -or -not $r.Out -or -not $r.Out.Trim()) {
     $why = Get-LastLines $r.Err 1
     if (-not $why) { $why = (T 'unknown format') }
@@ -1111,7 +1134,11 @@ function ConvertFrom-ProbeOutput($r) {
   $info = [pscustomobject]@{ Duration = 0.0; BitRate = 0; Video = $null; Audio = @(); Subs = @(); Fonts = @(); AudioInput = 0 }
   if ($format['duration']) { try { $info.Duration = [double]$format['duration'] } catch {} }
   $info.BitRate = ConvertTo-IntSafe $format['bit_rate']
+  $fmtBr = $info.BitRate
+  $wantBw = 0; $wantH = 0; $vRank = -1
+  if ($stream -and $stream.PSObject.Properties['PickBw']) { $wantBw = [int]$stream.PickBw; $wantH = [int]$stream.PickH }
   $audio = New-Object System.Collections.ArrayList
+  $ownAudio = New-Object System.Collections.ArrayList
   $subs = New-Object System.Collections.ArrayList
   $fonts = New-Object System.Collections.ArrayList
   foreach ($key in @($streamMap.Keys | Sort-Object)) {
@@ -1124,9 +1151,13 @@ function ConvertFrom-ProbeOutput($r) {
     $isForced = ("$($s['disposition.forced'])" -eq '1')
     $idx = $key
     if ($s['index']) { $idx = ConvertTo-IntSafe $s['index'] }
+    $vbw = ConvertTo-IntSafe $s['tags.variant_bitrate']
     if ($type -eq 'video') {
       if ("$($s['disposition.attached_pic'])" -eq '1') { continue }
-      if ($info.Video) { continue }
+      $rank = 0
+      if ($wantBw -gt 0 -and $vbw -eq $wantBw) { $rank = 2 } elseif ($wantH -gt 0 -and (ConvertTo-IntSafe $s['height']) -eq $wantH) { $rank = 1 }
+      if ($info.Video -and $rank -le $vRank) { continue }
+      $vRank = $rank
       $fpsStr = "$($s['avg_frame_rate'])"
       $fps = ConvertFrom-Ratio $fpsStr '/'
       if ($fps -le 0 -or $fps -gt 240) { $fpsStr = "$($s['r_frame_rate'])"; $fps = ConvertFrom-Ratio $fpsStr '/' }
@@ -1136,11 +1167,13 @@ function ConvertFrom-ProbeOutput($r) {
       $info.Video = [pscustomobject]@{
         Index = $idx; Codec = $codec; Width = (ConvertTo-IntSafe $s['width']); Height = (ConvertTo-IntSafe $s['height'])
         Sar = $sar; Fps = $fps; FpsStr = $fpsStr; Interlaced = (@('tt', 'bb', 'tb', 'bt') -contains $fo)
-        ColorSpace = "$($s['color_space'])"; ColorRange = "$($s['color_range'])"; PixFmt = "$($s['pix_fmt'])"
+        ColorSpace = "$($s['color_space'])"; ColorRange = "$($s['color_range'])"; PixFmt = "$($s['pix_fmt'])"; ColorTransfer = "$($s['color_transfer'])"
       }
-      if ($info.BitRate -le 0) { $info.BitRate = ConvertTo-IntSafe $s['tags.variant_bitrate'] }
+      if ($fmtBr -le 0) { $info.BitRate = $vbw }
     } elseif ($type -eq 'audio') {
-      [void]$audio.Add([pscustomobject]@{ Index = $idx; Codec = $codec; Lang = $lang; Title = $title; Default = $isDef; Forced = $isForced; Kind = 'audio'; Path = $null; Channels = (ConvertTo-IntSafe $s['channels']) })
+      $a = [pscustomobject]@{ Index = $idx; Codec = $codec; Lang = $lang; Title = $title; Default = $isDef; Forced = $isForced; Kind = 'audio'; Path = $null; Channels = (ConvertTo-IntSafe $s['channels']) }
+      [void]$audio.Add($a)
+      if ($wantBw -gt 0 -and $vbw -eq $wantBw) { [void]$ownAudio.Add($a) }
     } elseif ($type -eq 'subtitle') {
       $kind = $null
       if ($script:TextSubCodecs -contains $codec) { $kind = 'text' } elseif ($script:BitmapSubCodecs -contains $codec) { $kind = 'bitmap' }
@@ -1158,9 +1191,16 @@ function ConvertFrom-ProbeOutput($r) {
     }
   }
   $info.Audio = $audio.ToArray()
+  if ($vRank -eq 2 -and $ownAudio.Count -gt 0) { $info.Audio = $ownAudio.ToArray() }
   $info.Subs = $subs.ToArray()
   $info.Fonts = $fonts.ToArray()
   return $info
+}
+
+# HDR (PQ / HLG): the stream is plain HD (BT.709) and nothing maps the brightness down, so the colours look pale.
+function Test-HdrVideo($v) {
+  if (-not $v -or -not $v.PSObject.Properties['ColorTransfer']) { return $false }
+  return ("$($v.ColorTransfer)" -match '^(?i)(smpte2084|arib-std-b67)$')
 }
 
 function New-ExternalSubTrack([string]$f) {
@@ -1290,8 +1330,15 @@ function Select-Tracks($item) {
   $audio = @($item.Info.Audio)
   $subs = @()
   if ($script:CanSubs -and -not $item.IsDirectUrl) { $subs = @($item.Info.Subs) + @($item.ExtraSubs) }
-  else { $subs = @($item.Info.Subs | Where-Object { $_.Kind -eq 'bitmap' }) }  # text subs would mean reading the whole file first
+  else {
+    $subs = @($item.Info.Subs | Where-Object { $_.Kind -eq 'bitmap' })  # text subs inside it would mean reading the whole file first
+    # Subtitle files already on this PC are fine (a web video's own subtitle file, see Add-SiteSubtitle).
+    if ($script:CanSubs) { $subs += @($item.ExtraSubs | Where-Object { $_ -and $_.Kind -eq 'external' -and $_.Path -and [System.IO.File]::Exists($_.Path) }) }
+  }
   $subs = @($subs | Where-Object { $_ })
+  # (A translation that is subtitles only: its subtitle file is the translation, see Add-SiteSubtitle.)
+  $sitePos = -1
+  for ($i = 0; $i -lt $subs.Count; $i++) { if ($subs[$i].PSObject.Properties['FromSite']) { $sitePos = $i; break } }
   $aPos = Get-DefaultAudioPos $audio
   $sPos = -1
   $canAsk = (Test-CanAsk) -and ($null -eq $script:TrackPref)
@@ -1310,6 +1357,7 @@ function Select-Tracks($item) {
       $at = $null
       if ($ap -ge 0) { $at = $audio[$ap] }
       $sp = Get-DefaultSubPos $subs $at
+      if ($sp -lt 0) { $sp = $sitePos }
       if ($subs.Count -gt 0) {
         $labels = @($subs | ForEach-Object { Get-TrackLabel $_ })
         $sp = Read-Choice (T 'Which subtitles? (they get drawn into the picture)') $labels $sp $true -Key 'subs'
@@ -1345,6 +1393,8 @@ function Select-Tracks($item) {
     if ($aPos -ge 0) { $aTrack = $audio[$aPos] }
     $sPos = Get-DefaultSubPos $subs $aTrack
   }
+  # (Whatever language the sound is tagged with, unless "no subtitles" was picked.)
+  if ($sPos -lt 0 -and $sitePos -ge 0 -and -not ($script:TrackPref -and $script:TrackPref.SNone)) { $sPos = $sitePos }
   $item.AudioTrack = $null
   if ($aPos -ge 0 -and $aPos -lt $audio.Count) { $item.AudioTrack = $audio[$aPos] }
   $item.SubTrack = $null
@@ -1359,8 +1409,62 @@ function Set-FpsPlan($item) {
   $item.OutFps = $script:StreamFpsNum
   $item.FpsNote = $null
   if ($v -and $v.Fps -gt 0 -and [Math]::Abs($v.Fps - $script:StreamFpsNum) -gt 0.6 -and [Math]::Abs($v.Fps / 2 - $script:StreamFpsNum) -gt 0.6) {
-    $item.FpsNote = T 'this video is {0} fps, the stream runs at {1} fps ("StreamFps" in config.json)' (Format-Num ([Math]::Round($v.Fps, 3))) (Format-Num ([Math]::Round($script:StreamFpsNum, 3)))
+    $vf = Format-Num ([Math]::Round($v.Fps, 3))
+    $sf = Format-Num ([Math]::Round($script:StreamFpsNum, 3))
+    if ($script:FpsAuto) { $item.FpsNote = T 'this video is {0} fps, the stream runs at {1} fps (the first video on this connection set it)' $vf $sf }
+    else { $item.FpsNote = T 'this video is {0} fps, the stream runs at {1} fps ("StreamFps" in config.json)' $vf $sf }
   }
+}
+
+# Without "StreamFps" in config.json the frame rate follows the first video of each new connection (Select-SessionFps):
+# 23.976 / 24 / 25 / 29.97 / 30 as they are; faster videos at half their rate, unless "MaxFps" is 50 or more (then
+# at their own rate up to MaxFps); unknown -> 23.976. Other rates take the nearest of these.
+$script:FpsAuto = $false
+$script:FpsLow = @(@('24000/1001', (24000.0 / 1001.0)), @('24', 24.0), @('25', 25.0), @('30000/1001', (30000.0 / 1001.0)), @('30', 30.0))
+$script:FpsHigh = @(@('50', 50.0), @('60000/1001', (60000.0 / 1001.0)), @('60', 60.0))
+function Get-MaxFpsSetting { return (Get-NumSetting 'MaxFps' 30 10 60) }
+
+# The frame rate (@(text for ffmpeg, number)) a session that starts with $item runs at.
+function Get-SessionFpsFor($item) {
+  $f = 0.0
+  if ($item -and $item.Info -and $item.Info.Video) { $f = [double]$item.Info.Video.Fps }
+  if ($f -le 0) { return , $script:FpsLow[0] }
+  $lim = 30.5
+  $mx = Get-MaxFpsSetting
+  if ($mx -ge 50) { $lim = $mx + 0.5 }
+  while ($f -gt $lim) { $f = $f / 2.0 }
+  $set = $script:FpsLow
+  if ($f -gt 30.5) { $set = @($script:FpsHigh | Where-Object { $_[1] -le $lim }) }
+  $best = $set[0]
+  foreach ($c in $set) { if ([Math]::Abs($c[1] - $f) -lt [Math]::Abs($best[1] - $f)) { $best = $c } }
+  return , $best
+}
+
+# The highest frame rate this session may run at (what the encoder check at the start tries).
+function Get-TopStreamFps {
+  $f = [Math]::Max(30.0, $script:StreamFpsNum)
+  if ($script:FpsAuto -and (Get-MaxFpsSetting) -ge 50) { $f = [Math]::Max($f, (Get-MaxFpsSetting)) }
+  return $f
+}
+
+# Sets the stream's frame rate (only for a new connection: it is in the H.264 header). Above 40 fps a picture size
+# needs more bitrate (Get-FpsFactor), so size and bitrate are worked out again when that changes.
+function Set-StreamFps([string]$str, [double]$num) {
+  $before = Get-FpsFactor
+  $script:StreamFps = $str
+  $script:StreamFpsNum = $num
+  if ((Get-FpsFactor) -ne $before) { Update-StreamQuality }
+}
+
+# The first video on a new connection decides the frame rate of everything on it. $true = it changed.
+function Select-SessionFps($item) {
+  if (-not $script:FpsAuto -or -not $item -or -not $item.Info) { return $false }
+  $want = Get-SessionFpsFor $item
+  if ([Math]::Abs($want[1] - $script:StreamFpsNum) -lt 0.001) { return $false }
+  Set-StreamFps $want[0] $want[1]
+  Say (T '  The stream now runs at {0} fps, the frame rate of this video.' (Format-Num ([Math]::Round($want[1], 3)))) 'DarkGray'
+  Show-StreamQuality
+  return $true
 }
 
 # ------------------------------------------------------------------ queue items
@@ -1371,7 +1475,7 @@ function New-QueueItem([string]$kind, [string]$src) {
   return [pscustomobject]@{
     Kind = $kind; Source = $src; Path = $path; Name = $name; State = 'new'; Error = $null
     JobDir = $null; Info = $null; AudioTrack = $null; SubTrack = $null; SubFile = $null; SubIsSrt = $false; SubWarn = $null
-    ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false
+    ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false; IsLive = $false
     FpsFilter = $null; OutFps = 24.0; FpsNote = $null; ResumeAt = 0.0; Attempts = 0; Announced = $false
     Site = $null; Cands = $null; CandIdx = 0; Using = $null; Stream = $null; DlKind = $null; Errors = @(); Retried = $false; NoDirect = $false; DirectFails = 0; Reset = $false
   }
@@ -1908,6 +2012,8 @@ function Complete-HlsStream($stream) {
     $pick = @($vars | Where-Object { $_.Height -ge $want } | Sort-Object Height, Bw | Select-Object -First 1)
     if ($pick.Count -eq 0) { $pick = @($vars | Sort-Object Height, Bw -Descending | Select-Object -First 1) }
     $v = $pick[0]
+    $stream | Add-Member -Force -NotePropertyName PickBw -NotePropertyValue $v.Bw
+    $stream | Add-Member -Force -NotePropertyName PickH -NotePropertyValue $v.Height
     $audioUri = $null
     if ($v.Audio) {
       # The sound comes as its own playlist: take the group's default one (else the first).
@@ -1938,6 +2044,23 @@ function Complete-HlsStream($stream) {
   foreach ($m in [regex]::Matches($text, '#EXTINF:\s*([0-9.]+)')) { $sum += [double]::Parse($m.Groups[1].Value, $script:Inv) }
   $stream.Duration = $sum
   return $stream
+}
+
+# Complete-HlsStream in a runspace of its own (its playlists can take up to 20 s each to load). Poll .H.IsCompleted;
+# .Ps.EndInvoke(.H) then gives the stream, or nothing when it didn't work out.
+function Start-HlsPickBg($hls) {
+  $defs = @(foreach ($n in @('Invoke-Web', 'Get-M3u8Attr', 'Get-AbsUrl', 'New-Stream', 'Complete-HlsStream')) {
+      "function $n {`n" + (Get-Item "function:$n").ScriptBlock.ToString() + "`n}" }) -join "`n"
+  $ps = [powershell]::Create()
+  [void]$ps.AddScript({
+      param($defs, $ua, $outH, $url, $headers)
+      $script:WebUA = $ua; $script:WebCookies = New-Object System.Net.CookieContainer
+      $script:OutH = $outH; $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
+      function T { return [string]$args[0] }
+      . ([scriptblock]::Create($defs))
+      try { return (Complete-HlsStream (New-Stream $url 'hls' $headers)) } catch { return $null }
+    }).AddArgument($defs).AddArgument($script:WebUA).AddArgument($script:OutH).AddArgument($hls.Url).AddArgument($hls.Headers)
+  return [pscustomobject]@{ Ps = $ps; H = $ps.BeginInvoke(); Started = Get-Date }
 }
 
 $script:HlsOpts = $null
@@ -1997,6 +2120,12 @@ function Get-DownloadFraction($item) {
 }
 
 function Get-DownloadText($item) {
+  if ($item.DlKind -eq 'ytdlp' -and $item.DlDir) {
+    # yt-dlp runs quietly: what is on disk so far.
+    $mb = (Get-DirBytes $item.DlDir) / 1MB
+    if ($mb -lt 0.1) { return (T 'starting the download') }
+    return (T 'downloaded {0} MB' ([Math]::Round($mb, 1).ToString('0.0', $script:Inv)))
+  }
   if ($item.DlKind -ne 'ffmpeg' -or -not $item.DlDir) { return (T 'downloading') }
   $pr = Read-Progress (PathJoin $item.DlDir 'progress.txt')
   if (-not $pr -or $pr.Time -le 0) { return (T 'starting the download') }
@@ -2037,7 +2166,7 @@ function Get-ShowKey($item) {
     'animelib' { return "al:$($s.Sid):$(@($s.Names)[0]):$($s.DubName)" }
     'shikimori' { return "sh:$($s.Sid):$($s.DubName)" }
     # A release with its own player and a backup (AniLiberty: its HLS + Kodik): one show per release.
-    'player' { if (@($s.Cands).Count -gt 1) { return "pl:$($item.Source -replace '#.*$', ''):$(@($s.Cands)[0].Dub)" } }
+    'player' { if (@($s.Cands | Where-Object { -not $_.PSObject.Properties['Backup'] }).Count -gt 1) { return "pl:$($item.Source -replace '#.*$', ''):$(@($s.Cands)[0].Dub)" } }
   }
   return $null
 }
@@ -2129,7 +2258,8 @@ function Get-ResolvedStream($c) {
 # "auto": looks up every player with the chosen voice-over, reads the real picture size of each with ffprobe (all at
 # once), then puts them in order: tallest real picture, then higher bitrate, then the usual order.
 function Invoke-AutoPick($item) {
-  $same = @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly } | Select-Object -First 4)
+  # (A Backup candidate is the same player's file in another quality, see Expand-Animevost: nothing to compare.)
+  $same = @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly -and -not $_.PSObject.Properties['Backup'] } | Select-Object -First 4)
   if ($same.Count -lt 2) { Set-AutoWinner $item ''; return }
   Say (T '  Checking {0} players for the sharpest picture...' $same.Count) 'Gray'
   $jobs = New-Object System.Collections.ArrayList
@@ -2236,7 +2366,7 @@ function Start-NextSource($item) {
       # No checking while a video streams (it would hold up this window). A show not checked yet waits for its turn:
       # getting it ready now meant taking the first player in the list (Kodik), whatever "auto" would have picked.
       $won = Get-AutoWinner $item
-      if ($null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly }).Count -ge 2) { return }
+      if ($null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly -and -not $_.PSObject.Properties['Backup'] }).Count -ge 2) { return }
     }
     $item | Add-Member -NotePropertyName PlayerPicked -NotePropertyValue $true
     if ($pref -ne 'auto') { Set-CandFirst $item $pref }
@@ -2285,12 +2415,17 @@ function Complete-StreamDownload($item) {
     return $true
   }
   $why = Get-LastLines (Get-BgText $item.Dl) 2
-  if ($short -and $null -ne $got -and $item.Stream.Duration -gt 0) { $why = T 'it stopped at {0} of {1}' (Format-Time $got) (Format-Time $item.Stream.Duration) }
+  $stalled = [bool]($item.Dl.PSObject.Properties['Stalled'] -and $item.Dl.Stalled)
+  if ($stalled) {
+    $why = T 'no progress for {0} seconds' $script:DlStallSec
+    $item.Retried = $true   # (not the same source once more: on to the next one)
+  } elseif ($short -and $null -ne $got -and $item.Stream.Duration -gt 0) { $why = T 'it stopped at {0} of {1}' (Format-Time $got) (Format-Time $item.Stream.Duration) }
   elseif ($short) { $why = T 'the connection was cut off' }
   if (-not $why) { $why = T 'ffmpeg error {0}' $exit }
   $item.Errors = @($item.Errors) + @("$($item.Using.Label): " + (T 'download failed ({0})' $why))
-  if (-not $item.Retried) {
-    # Try the same source once more (links can expire or a server can hiccup), then the others.
+  if (-not $item.Retried -and $why -notmatch '(?i)\b404\b') {
+    # Try the same source once more (links can expire or a server can hiccup), then the others. (A file that isn't
+    # there, HTTP 404, won't be there a second later.)
     $item.Retried = $true
     $item.CandIdx = [Math]::Max(0, $item.CandIdx - 1)
   }
@@ -2379,6 +2514,61 @@ function Find-DownloadedFile([string]$dir) {
   return $best
 }
 
+# A link straight to a video file or an HLS playlist (by the end of its path; a ?query doesn't count): the extension
+# ('mp4', 'm3u8', ...), else ''. Such links are played as they are, not handed to yt-dlp.
+function Get-UrlMediaExt([string]$u) {
+  if ($u -notmatch '^(?i)https?://') { return '' }
+  $m = [regex]::Match(($u -split '[?#]', 2)[0], '(?i)\.(mp4|mkv|webm|m4v|mov|ts|m3u8)$')
+  if ($m.Success) { return $m.Groups[1].Value.ToLowerInvariant() }
+  return ''
+}
+
+# A link that was to be played as it is goes to yt-dlp after all (it can't be read as it is, or it needs the whole
+# file), when yt-dlp is installed (or gets installed now). $true = its download started.
+function Switch-UrlToDownload($item) {
+  if ($item.Kind -ne 'url' -or $item.NoDirect -or $item.Source -notmatch '^(?i)https?://') { return $false }
+  $yt = Get-YtDlp   # (asks to install it only when a question can be asked here)
+  if (-not $yt) { return $false }
+  $item.NoDirect = $true
+  $item.IsDirectUrl = $false; $item.IsLive = $false; $item.Info = $null; $item.Path = $null
+  Start-Download $item $yt
+  return $true
+}
+
+# The bytes of video in a folder (a download's progress: yt-dlp's .part files, ffmpeg's video.mkv). Not progress.txt:
+# ffmpeg adds to it every half second even while nothing arrives.
+function Get-DirBytes([string]$dir) {
+  $n = [long]0
+  try {
+    foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
+      if ([System.IO.Path]::GetFileName($f) -eq 'progress.txt') { continue }
+      try { $n += (New-Object System.IO.FileInfo($f)).Length } catch {}
+    }
+  } catch {}
+  return $n
+}
+
+# A download that hasn't moved for this long is given up (a server that stopped sending, a hung yt-dlp).
+$script:DlStallSec = 120
+function Test-DownloadStalled($item) {
+  $dl = $item.Dl
+  if (-not $dl -or -not $item.DlDir) { return $false }
+  $now = Get-Date
+  if (-not $dl.PSObject.Properties['MovedAt']) {
+    $dl | Add-Member -Force -NotePropertyName Bytes -NotePropertyValue ([long]-1)
+    $dl | Add-Member -Force -NotePropertyName MovedAt -NotePropertyValue $now
+    $dl | Add-Member -Force -NotePropertyName CheckAt -NotePropertyValue $now
+  }
+  if ($now -lt $dl.CheckAt) { return $false }
+  # (A look at the folder every 2 s. A long gap since the last look = this PC was asleep: not the download's fault.)
+  if (($now - $dl.CheckAt).TotalSeconds -gt 30) { $dl.MovedAt = $now }
+  $dl.CheckAt = $now.AddSeconds(2)
+  $b = Get-DirBytes $item.DlDir
+  if ($b -ne $dl.Bytes) { $dl.Bytes = $b; $dl.MovedAt = $now; return $false }
+  return (($now - $dl.MovedAt).TotalSeconds -ge $script:DlStallSec)
+}
+
+# yt-dlp downloads in the background (also before the stream starts: Wait-Prep shows how far it got).
 function Start-Download($item, [string]$yt) {
   $dl = PathJoin $item.JobDir 'dl'
   [void][System.IO.Directory]::CreateDirectory($dl)
@@ -2386,16 +2576,16 @@ function Start-Download($item, [string]$yt) {
   $argv = @('--no-playlist', '--no-mtime', '--ffmpeg-location', $script:FFmpegDir,
     '-f', 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b', '--merge-output-format', 'mkv',
     '-P', $dl, '-o', '%(title).80B.%(ext)s', $item.Source)
+  # (A link that wants its server's headers, a WPARTY room's video: yt-dlp sends them too.)
+  if ($item.Stream -and $item.Stream.Headers) {
+    foreach ($k in @($item.Stream.Headers.Keys)) { $argv = @('--add-header', "$($k):$($item.Stream.Headers[$k])") + $argv }
+  }
   if (-not (Test-RelayAlive)) {
     Say ''
     Say (T 'Downloading: {0}' $item.Source) 'Cyan'
-    $psi = New-StartInfo $yt $argv $dl
-    $p = Start-Child $psi
-    $p.WaitForExit()
-    $item.Dl = [pscustomobject]@{ Proc = $p; Out = $null; Err = $null; Started = Get-Date }
-  } else {
-    $item.Dl = Start-Background $yt (@('--no-progress') + $argv) $dl
   }
+  $item.Dl = Start-Background $yt (@('--no-progress') + $argv) $dl
+  $item.DlKind = 'ytdlp'
   $item.State = 'downloading'
 }
 
@@ -2452,6 +2642,38 @@ function Complete-Extract($item) {
   }
 }
 
+# A web video whose subtitles come as a file of their own (an AnimeLib or Collaps translation with subtitles only: the
+# stream's .Subtitle, see Resolve-Candidate). Saved into the job folder once and offered like a subtitle file next to a
+# video, so it gets drawn into the picture. If it can't be fetched, the video plays without it (said once, as a note
+# under "Now streaming").
+function Add-SiteSubtitle($item) {
+  $item.ExtraSubs = @($item.ExtraSubs | Where-Object { $_ -and -not $_.PSObject.Properties['FromSite'] })
+  $st = $item.Stream
+  if ($item.Kind -ne 'site' -or -not $st -or -not $st.PSObject.Properties['Subtitle'] -or -not $st.Subtitle -or -not $script:CanSubs) { return }
+  $s = $st.Subtitle
+  $failText = T 'the subtitles didn''t download, so it plays without them'
+  if (-not $s.PSObject.Properties['Path']) {
+    $s | Add-Member -Force -NotePropertyName Path -NotePropertyValue $null
+    $ext = '.' + "$($s.Format)".ToLowerInvariant()
+    if ($script:SubExts -notcontains $ext) { $ext = '.vtt' }
+    $path = PathJoin $item.JobDir ('site-sub' + $ext)
+    try {
+      if ($s.Provider -eq 'collaps') { [void](Save-CollapsSubtitle $s.Url $path) } else { [void](Save-AnimelibSubtitle $s.Url $path) }
+      # (Only a real subtitle file: a server can answer with an error page, and ffmpeg wouldn't start with that.)
+      $txt = ''
+      if ([System.IO.File]::Exists($path)) { $txt = ([System.IO.File]::ReadAllText($path)).TrimStart() }
+      if ($txt -and -not $txt.StartsWith('<') -and $txt -match '(?m)^\[Script Info\]|^\[Events\]|^WEBVTT|-->') { $s.Path = $path }
+    } catch {}
+  }
+  if (-not $s.Path) { $item.SubWarn = $failText; return }
+  if ($item.SubWarn -eq $failText) { $item.SubWarn = $null }
+  $t = New-ExternalSubTrack $s.Path
+  if ("$($s.Lang)" -match '^[A-Za-z]{2,3}$') { $t.Lang = "$($s.Lang)".ToLowerInvariant() }
+  if ($s.Label) { $t.Title = [string]$s.Label } else { $t.Title = T 'subtitles from the site' }
+  $t | Add-Member -Force -NotePropertyName FromSite -NotePropertyValue $true
+  $item.ExtraSubs = @($t) + @($item.ExtraSubs)
+}
+
 function Step-Prep($item) {
   if (-not $item) { return }
   if ($item.State -eq 'ready' -or $item.State -eq 'failed') { return }
@@ -2462,16 +2684,58 @@ function Step-Prep($item) {
         Start-NextSource $item
         if ($item.State -ne 'probe') { return }
       } elseif ($item.Kind -eq 'url') {
+        # A link straight to a video file / playlist plays as it is (also with yt-dlp installed); a link with the
+        # server's headers (a WPARTY room's video) too; any other web page goes to yt-dlp.
         $yt = $null
-        if ($item.Source -match '^(?i)https?://') { $yt = Get-YtDlp }
+        $ext = Get-UrlMediaExt $item.Source
+        if ($item.Source -match '^(?i)https?://' -and -not $ext -and -not $item.Stream) { $yt = Get-YtDlp }
         if ($yt) { Start-Download $item $yt; return }
+        # An HLS playlist may list several qualities: the one that fits the picture we send (ffmpeg alone would take
+        # the first one listed, often the smallest).
+        $hls = $item.Stream
+        if (-not $hls -and $ext -eq 'm3u8') { $hls = New-Stream $item.Source 'hls' @{} }
+        if ($hls -and $hls.Kind -eq 'hls' -and -not $hls.PSObject.Properties['Checked']) {
+          $st = $null
+          $pk = $null
+          if ($item.PSObject.Properties['PickBg']) { $pk = $item.PickBg }
+          if ($pk -or (Test-RelayAlive)) {
+            # While the stream is on, the playlists load in the background, so the window keeps answering meanwhile.
+            if (-not $pk) { $item | Add-Member -Force -NotePropertyName PickBg -NotePropertyValue (Start-HlsPickBg $hls); return }
+            if (-not $pk.H.IsCompleted -and ((Get-Date) - $pk.Started).TotalSeconds -lt 60) { return }
+            $item.PickBg = $null
+            if ($pk.H.IsCompleted) {
+              try { $res = @($pk.Ps.EndInvoke($pk.H)); if ($res.Count -gt 0) { $st = $res[0] } } catch {}
+              try { $pk.Ps.Dispose() } catch {}
+            } else { try { [void]$pk.Ps.BeginStop($null, $null) } catch {} }
+          } else {
+            try { $st = Complete-HlsStream (New-Stream $hls.Url 'hls' $hls.Headers) } catch {}
+          }
+          # Only a quality that carries its own sound is taken. Else the master playlist plays as it is: ffmpeg reads
+          # all of it, and the group's default sound is chosen (a separate sound playlist could be another language);
+          # the picked quality is then looked for in what ffprobe lists (see ConvertFrom-ProbeOutput).
+          if ($st -and $st.Program -lt 0 -and -not $st.AudioUrl) { $hls = $st }
+          elseif ($st -and $st.PSObject.Properties['PickBw']) {
+            $hls | Add-Member -Force -NotePropertyName PickBw -NotePropertyValue $st.PickBw
+            $hls | Add-Member -Force -NotePropertyName PickH -NotePropertyValue $st.PickH
+          }
+          $hls | Add-Member -Force -NotePropertyName Checked -NotePropertyValue $true
+          $item.Stream = $hls
+        }
         $item.IsDirectUrl = $true
         $item.Path = $item.Source
+        if ($item.Stream) { $item.Path = $item.Stream.Url }
       }
       $item.State = 'probe'
     }
     if ($item.State -eq 'downloading') {
-      if (-not $item.Dl.Proc.HasExited) { return }
+      if (-not $item.Dl.Proc.HasExited) {
+        if (-not (Test-DownloadStalled $item)) { return }
+        # No progress for minutes: give it up (and go on with the next source, or the next video).
+        Stop-ProcessTree $item.Dl.Proc   # (yt-dlp's own ffmpeg too)
+        $item.Dl | Add-Member -Force -NotePropertyName Stalled -NotePropertyValue $true
+        Say (T '  The download of {0} made no progress for {1} seconds, so it was stopped.' $item.Name $script:DlStallSec) 'Yellow'
+        if ($item.DlKind -ne 'ffmpeg') { throw (T 'the download made no progress for {0} seconds' $script:DlStallSec) }
+      }
       if ($item.DlKind -eq 'ffmpeg') {
         if (-not (Complete-StreamDownload $item)) { return }
       } else {
@@ -2484,8 +2748,33 @@ function Step-Prep($item) {
       if ($item.IsDirectUrl) { $st = $item.Stream }
       try {
         if ($st -and $st.PSObject.Properties['Probe'] -and $st.Probe) { $item.Info = $st.Probe; $st.Probe = $null }   # (read by the quality check)
+        elseif ($item.Kind -eq 'url' -and $item.IsDirectUrl -and -not ($st -and $st.AudioUrl) -and (Test-RelayAlive)) {
+          # A link read over the network while the stream is on (the next video, or this one behind the waiting
+          # screen): ffprobe runs in the background, so the window keeps answering meanwhile.
+          $pb = $null
+          if ($item.PSObject.Properties['ProbeBg'] -and $item.ProbeBg -and $item.ProbeBg.Path -eq $item.Path) { $pb = $item.ProbeBg }
+          if (-not $pb) {
+            $bg = Start-Background $script:FFprobe (Get-MediaInfoArgs $item.Path $true $st)
+            $item | Add-Member -Force -NotePropertyName ProbeBg -NotePropertyValue ([pscustomobject]@{ Bg = $bg; Path = $item.Path })
+            return
+          }
+          if (-not $pb.Bg.Proc.HasExited) {
+            if (((Get-Date) - $pb.Bg.Started).TotalSeconds -lt 90) { return }
+            $item.ProbeBg = $null
+            Stop-Proc $pb.Bg.Proc
+            throw (T 'can''t read it ({0})' 'timeout')
+          }
+          $item.ProbeBg = $null
+          $item.Info = ConvertFrom-ProbeOutput ([pscustomobject]@{ ExitCode = $pb.Bg.Proc.ExitCode; Out = $pb.Bg.Out.Result; Err = $pb.Bg.Err.Result }) $st
+        }
         else { $item.Info = Get-MediaInfo $item.Path $item.IsDirectUrl $st }
       } catch {
+        # A link to a video file that can't be read as it is (a share page, a server that wants a browser): yt-dlp
+        # gets it instead, when it is installed.
+        if ($item.Kind -eq 'url' -and $item.IsDirectUrl) {
+          $why = $_.Exception.Message
+          if (Switch-UrlToDownload $item) { $item.Errors = @($item.Errors) + @($why); return }
+        }
         # Playing straight from the site didn't work out: another player, else download it (or try the next source).
         if (-not ($item.Kind -eq 'site' -and $item.IsDirectUrl)) { throw }
         $item.Errors = @($item.Errors) + @("$($item.Using.Label): $($_.Exception.Message)")
@@ -2497,10 +2786,20 @@ function Step-Prep($item) {
         return
       }
       if (-not $item.Info.Video -and $item.Info.Audio.Count -eq 0) { throw (T 'no video or audio found in it') }
+      # A link to a live stream (an HLS playlist that keeps growing has no length): it plays from where the stream
+      # is now, and can't be skipped back or forward. (Only HLS, an MPEG-TS link (IPTV) and rtmp/rtsp/srt/udp: another
+      # file without a length is still a file.)
+      $isHls = ((Get-UrlMediaExt $item.Source) -eq 'm3u8') -or ($item.Stream -and $item.Stream.Kind -eq 'hls')
+      $liveForm = $isHls -or ((Get-UrlMediaExt $item.Source) -eq 'ts') -or ($item.Source -notmatch '^(?i)https?://')
+      $item.IsLive = ($item.Kind -eq 'url' -and $item.IsDirectUrl -and $liveForm -and $item.Info.Duration -le 0)
+      # Subtitles written as text inside the file can only be drawn in from a downloaded copy: yt-dlp downloads it.
+      if ($item.Kind -eq 'url' -and $item.IsDirectUrl -and -not $item.IsLive -and $script:CanSubs -and
+        @($item.Info.Subs | Where-Object { $_.Kind -eq 'text' }).Count -gt 0 -and (Switch-UrlToDownload $item)) { return }
       if (-not $item.IsDirectUrl) {
         $have = @($item.ExtraSubs | ForEach-Object { $_.Path })
         foreach ($sc in @(Get-SidecarSubs $item.Path)) { if ($have -notcontains $sc.Path) { $item.ExtraSubs = @($item.ExtraSubs) + @($sc) } }
       }
+      Add-SiteSubtitle $item
       Select-Tracks $item
       Set-FpsPlan $item
       Start-Extract $item
@@ -2529,7 +2828,7 @@ function Wait-Prep($item) {
     Step-Prep $item
     if ($item.State -eq 'ready' -or $item.State -eq 'failed') { break }
     if (-not $shown -and ((Get-Date) - $t0).TotalSeconds -gt 1.5) { Say (T 'Getting {0} ready...' $item.Name) 'Gray'; $shown = $true }
-    if ($item.State -eq 'downloading' -and $item.DlKind -eq 'ffmpeg') { Show-Status (T '  {0}   (Ctrl+C = stop)' (Get-DownloadText $item)) }
+    if ($item.State -eq 'downloading') { Show-Status (T '  {0}   (Ctrl+C = stop)' (Get-DownloadText $item)) }
     Wait-Pump 0.2
   }
   Clear-StatusLine
@@ -2542,6 +2841,9 @@ function Update-Prep {
     $it = $script:Queue[$i]
     if ($i -gt $script:Idx) { Step-Prep $it }
     if ($it.State -eq 'downloading' -or ($i -eq $script:Idx -and $it.State -eq 'new')) { break }
+    # (A link still looked at in the background may turn into a download: the ones after it wait, to keep the order.)
+    $bgBusy = ($it.PSObject.Properties['PickBg'] -and $it.PickBg) -or ($it.PSObject.Properties['ProbeBg'] -and $it.ProbeBg)
+    if ($bgBusy -and ($it.State -eq 'new' -or $it.State -eq 'probe')) { break }
   }
 }
 
@@ -2587,7 +2889,8 @@ function Get-VideoGraph($item, [string]$inLabel, [double]$start, [string]$pix, [
   if ($v -and $v.Interlaced -and $script:HasBwdif) { $pre.Add('bwdif=deint=interlaced') }
   if ($v -and $v.Sar -gt 0 -and [Math]::Abs($v.Sar - 1.0) -gt 0.01) { $post.Add('scale=trunc(iw*sar/2)*2:ih:flags=lanczos'); $post.Add('setsar=1') }
   $post.Add("scale=$($W):$($H):force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos$(Get-ColourScaleOpts $v)")
-  if ($item.FpsFilter) { $post.Add("fps=$($item.FpsFilter)") }
+  # (The session's frame rate as it is now, not as it was when this video was got ready: Select-SessionFps may change it.)
+  $post.Add("fps=$($script:StreamFps)")
   $sub = $item.SubTrack
   if ($sub -and $item.SubFile -and $sub.Kind -ne 'bitmap') {
     $sf = 'subtitles=filename=sub.ass:fontsdir=fonts'
@@ -2635,6 +2938,7 @@ function Add-PreviewOutput($a, [ref]$graph) {
 function Get-ContentArgs($item, [double]$start, [double]$off, [bool]$preview = $false) {
   $W = $script:OutW; $H = $script:OutH
   $info = $item.Info
+  if ($item.IsLive) { $start = 0.0 }   # (a live stream always goes on from where it is now)
   $a = New-Object System.Collections.Generic.List[string]
   foreach ($x in @('-hide_banner', '-y', '-v', 'error', '-nostats', '-progress', 'progress.txt')) { $a.Add($x) }
   if ($start -gt 0.5) { $a.Add('-ss'); $a.Add((Format-Num $start)) }
@@ -2780,6 +3084,7 @@ function Start-Relay {
   $script:LastEnd = -1.0
   # Nobody can be watching a connection that just opened: the next video waits for the players (Test-HoldReady).
   $script:RelayFresh = $true
+  $script:FpsLocked = $false   # (a reconnect of the same session carries it over: Restart-RelayForResync, Invoke-Queue)
 }
 
 $script:RelayGen = 0
@@ -4025,6 +4330,9 @@ function Step-DownQuality {
   $faster = @{ 'veryslow' = 'slower'; 'slower' = 'slow'; 'slow' = 'medium'; 'medium' = 'fast'; 'fast' = 'faster'; 'faster' = 'veryfast'; 'veryfast' = 'superfast' }
   $cur = "$($script:Cfg.CpuPreset)"
   if ($script:CpuPreset) { $cur = $script:CpuPreset }
+  $script:FastSecs = 0.0
+  # (Slow again after going back up: wait twice as long before the next try.)
+  if ($script:SteppedUp) { $script:StepUpWait = [Math]::Min(3600.0, $script:StepUpWait * 2); $script:SteppedUp = $false }
   if ($script:VEnc -eq 'libx264' -and $faster.ContainsKey($cur)) {
     $script:CpuPreset = $faster[$cur]
     # Another x264 preset writes a different H.264 header: the players reconnect once (Invoke-Queue).
@@ -4032,11 +4340,39 @@ function Step-DownQuality {
     Say (T '  The stream couldn''t keep up with real time{0} - encoding a bit lighter (x264 preset {1}) and carrying on.' $sp $script:CpuPreset) 'Yellow'
     return
   }
-  # Only the average drops; the ceiling in the header stays (with "EncoderArgs": "classic" the players reconnect once).
-  if (Test-ClassicEncoder) { $script:NeedResync = $true }
+  # Only the average drops; the ceiling in the header stays (with "EncoderArgs": "classic" the players reconnect once,
+  # and with AMD / Intel encoders too: that their header stays the same with another bitrate isn't proven).
+  if ((Test-ClassicEncoder) -or $script:VEnc -eq 'h264_amf' -or $script:VEnc -eq 'h264_qsv') { $script:NeedResync = $true }
+  [void]$script:KbpsDown.Add($script:VideoKbps)
   $script:VideoKbps = [int][Math]::Max((Get-KbpsFloor), [Math]::Round($script:VideoKbps * 0.8 / 50) * 50)
   Say (T '  The stream couldn''t keep up with real time{0} - lowering the video bitrate to {1} kbps and carrying on.' $sp $script:VideoKbps) 'Yellow'
   Say (T '  (If this happens every time, set "VideoKbps" in config.json to that number.)') 'DarkGray'
+}
+
+# Back up again: once videos kept up with real time for StepUpWait seconds after a lower bitrate, the next video
+# (never one already playing) gets the bitrate from before the last step down, at most the connection's ceiling.
+# Only where the H.264 header stays the same with another average: NVENC (variable bitrate) and x264 (a lighter
+# x264 preset stays: going back would change the header). Not with "EncoderArgs": "classic", AMD or Intel.
+$script:KbpsDown = New-Object System.Collections.ArrayList   # the bitrates before each step down (last = latest)
+$script:FastSecs = 0.0
+$script:StepUpWait = 300.0
+$script:SteppedUp = $false
+$script:LastStartedItem = $null
+function Test-CanStepUp {
+  if ($script:KbpsDown.Count -eq 0 -or $script:FastSecs -lt $script:StepUpWait -or (Test-ClassicEncoder)) { return $false }
+  return ($script:VEnc -eq 'h264_nvenc' -or $script:VEnc -eq 'libx264')
+}
+
+function Step-UpQuality {
+  $k = [int]$script:KbpsDown[$script:KbpsDown.Count - 1]
+  $script:KbpsDown.RemoveAt($script:KbpsDown.Count - 1)
+  if ($script:RateCapKbps -gt 0) { $k = [Math]::Min($k, [int]$script:RateCapKbps) }
+  $script:FastSecs = 0.0
+  if ($k -le $script:VideoKbps) { return }
+  $script:VideoKbps = $k
+  $script:KbpsSteps = [Math]::Max(0, $script:KbpsSteps - 1)
+  $script:SteppedUp = $true
+  Say (T '  The upload keeps up again - back to {0} kbps video.' $k) 'Green'
 }
 
 # ------------------------------------------------------------------ picture size and bitrate
@@ -4101,11 +4437,21 @@ function Update-StreamQuality {
     $auto = Get-AutoHeight (Get-KbpsCeiling)
     if ($need -gt 0 -and (Get-KbpsCeiling) -lt $need * (Get-FpsFactor) -and $auto -lt $h) { $script:HeightCappedFrom = $h; $h = $auto }
   }
+  $was = @($script:OutW, $script:OutH, $script:RateCapKbps, $script:VideoKbps, $script:KbpsSteps)
   $script:OutH = [int]([Math]::Round($h / 2.0) * 2)
   $script:OutW = [int]([Math]::Round($script:OutH * 16.0 / 9.0 / 2.0) * 2)
   $script:VideoKbps = Get-QualityKbps $script:OutH
   $script:RateCapKbps = $script:VideoKbps
+  # Same size and ceiling after a step down: with "EncoderArgs": "classic", AMD or Intel the bitrate is in the H.264
+  # header (or may be), and the stream may go on on this connection (the resolution menu): keep the lowered one.
+  if ($was[4] -gt 0 -and $was[0] -eq $script:OutW -and $was[1] -eq $script:OutH -and $was[2] -eq $script:RateCapKbps -and $was[3] -lt $script:VideoKbps -and
+      ((Test-ClassicEncoder) -or $script:VEnc -eq 'h264_amf' -or $script:VEnc -eq 'h264_qsv')) {
+    $script:VideoKbps = $was[3]
+    return
+  }
   $script:KbpsSteps = 0
+  $script:KbpsDown.Clear()
+  $script:FastSecs = 0.0
 }
 
 function Show-StreamQuality {
@@ -4115,11 +4461,18 @@ function Show-StreamQuality {
   if ($script:HostP) { $name = T ' on {0}' $script:HostP.Name }
   $size = "$($script:OutH)p"
   if ((Get-HeightSetting) -le 0) { $size = T '{0} (auto)' $size }
-  Say (T '  Picture: {0}, {1} kbps video ({2}{3}).  V = change the resolution.' $size $script:VideoKbps $how $name) 'DarkGray'
+  $fps = Format-Num ([Math]::Round($script:StreamFpsNum, 2))
+  Say (T '  Picture: {0}, {1} fps, {2} kbps video ({3}{4}).  V = change the resolution.' $size $fps $script:VideoKbps $how $name) 'DarkGray'
   if ($script:HeightCappedFrom -gt 0) {
     Say (T '  ({0}p instead of {1}p: at {2} kbps {0}p looks sharper. "HeightPolicy": "exact" in config.json keeps {1}p.)' $script:OutH $script:HeightCappedFrom $script:VideoKbps) 'DarkGray'
   }
+  # (The control window shows this line orange with the advice; here it is said once.)
+  if (-not $script:LowTipShown -and (Get-QualityLine).Low) {
+    $script:LowTipShown = $true
+    Say (T '  Too few bits for this picture size, so it looks blocky. A smaller picture size (V) looks sharper.') 'Yellow'
+  }
 }
+$script:LowTipShown = $false
 
 # The picture and bitrate in one short line for the control window, and whether it is too few bits for the size.
 function Get-QualityLine {
@@ -4636,7 +4989,7 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $qtip = T 'What the stream carries: picture size, frames per second, video bitrate, server.'
     if ($ql.Low) { $qtip += ' ' + (T 'Orange: too few bits for this picture size, so it looks blocky. A smaller picture size (Settings > Picture size) looks sharper.') }
     $script:PanelState = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up
-      Link = $script:ShownLink; Clock = $script:ClockOn; CanSeek = ($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold')
+      Link = $script:ShownLink; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
       Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip }
     Update-ControlPanel $script:PanelState
   } catch { $script:PanelShown = $false }
@@ -4699,6 +5052,11 @@ function Invoke-Source {
       if ($requested -eq 'seek') { $target += (Get-QueuedSeek) }
     } else {
       $c = Get-NextCmd $Kind
+      if ($c -and $Media -and $Media.IsLive -and ($c.Cmd -eq 'seek' -or $c.Cmd -eq 'seekto')) {
+        [void](Get-QueuedSeek)
+        Say (T '  This is a live stream: it can''t go back or forward.') 'Gray'
+        $c = $null
+      }
       if ($c) {
         $cur = $Start + $pos
         $pr = Read-Progress $progFile
@@ -4789,17 +5147,31 @@ function Invoke-Source {
       # Real playback speed over the last ~10 s (1.00 = keeping up with real time).
       if (-not $markTime) { if ($pos -gt 0) { $markTime = $now; $markPos = $pos } }
       elseif (($now - $markTime).TotalSeconds -ge 10) {
-        $speed = ($pos - $markPos) / ($now - $markTime).TotalSeconds
+        $span = ($now - $markTime).TotalSeconds
+        $speed = ($pos - $markPos) / $span
         $markTime = $now; $markPos = $pos
-        if ($Kind -eq 'content' -and -not $slowWarned -and ($now - $t0).TotalSeconds -gt 20) {
+        # Upload keeping up (for going back up after a step-down, Step-UpQuality). A video read straight from a server
+        # that is slow says nothing about the upload.
+        if ($Kind -eq 'content') {
+          if ($speed -ge 0.97) { $script:FastSecs += $span }
+          elseif ($speed -lt 0.93 -and -not $Media.IsDirectUrl) { $script:FastSecs = 0.0 }
+        }
+        # Which ones can be helped by a lighter stream:
+        #  - a live stream (IsLive): comes at real time at best, a gap in it is the stream's (see the stall check
+        #    below) - no check at all;
+        #  - a site's stream or a plain link to a video file / playlist (IsDirectUrl): slow because of that server, a
+        #    lighter stream wouldn't help - only a warning (a site's: the next ones download in advance);
+        #  - a local file or a finished download: slow because of this PC or its upload - a notch lighter.
+        if ($Kind -eq 'content' -and -not $slowWarned -and -not $Media.IsLive -and ($now - $t0).TotalSeconds -gt 20) {
           if ($speed -lt 0.93) { $slowCount++ } else { $slowCount = 0 }
-          if ($slowCount -ge 2 -and -not $requested -and -not ($Media.IsDirectUrl -and $Media.Stream) -and (Test-CanStepDown)) {
+          if ($slowCount -ge 2 -and -not $requested -and -not $Media.IsDirectUrl -and (Test-CanStepDown)) {
             # Falling behind real time means stutter for everyone: go a notch lighter and carry on from here.
             $script:SlowSpeed = $speed
             $requested = 'slow'; Send-Key $proc 'q'; $quitSentAt = $now
-          } elseif ($slowCount -ge 2 -and $Media.IsDirectUrl -and $Media.Stream) {
+          } elseif ($slowCount -ge 2 -and $Media.IsDirectUrl) {
             $slowWarned = $true
-            Say (T '  The video site is sending this one slower than real time, so viewers may see stutter. The next videos download in advance, so they won''t have this problem.') 'Yellow'
+            if ($Media.Kind -eq 'site') { Say (T '  The video site is sending this one slower than real time, so viewers may see stutter. The next videos download in advance, so they won''t have this problem.') 'Yellow' }
+            else { Say (T '  The server this video comes from sends it slower than real time, so viewers may see stutter.') 'Yellow' }
           } elseif ($slowCount -ge 2) {
             $slowWarned = $true
             Say (T '  The stream is running slower than real time, so viewers will see stutter. Either your PC is too busy (close heavy programs, or set "Height" to 540 in config.json) or your internet upload is too slow (lower "VideoKbps" in config.json).') 'Yellow'
@@ -4849,7 +5221,7 @@ function Invoke-Source {
     if ($stalled) {
       # A web stream that stalls is usually the site. If the relay takes the rest of the pipe once the
       # source is stopped, it's fine: keep it (and the viewers) connected and try the site again.
-      if ($Kind -eq 'content' -and $Media.IsDirectUrl -and $Media.Stream) {
+      if ($Kind -eq 'content' -and $Media.IsDirectUrl -and ($Media.Stream -or $Media.IsLive -or "$($Media.Path)" -match '^(?i)https?://')) {
         try { [void]$copy.Wait(4000) } catch {}
         $sourceStalled = ($copy.IsCompleted -and -not $copy.IsFaulted)
       }
@@ -4869,7 +5241,11 @@ function Invoke-Source {
   elseif (-not $pr) { $script:LastEnd = [Math]::Max($script:LastEnd, $off + ((Get-Date) - $t0).TotalSeconds) }
   Clear-StatusLine
   $outcome = 'failed'
-  if ($sourceStalled -and -not $relayBroke -and -not $copyFailed -and (Test-RelayAlive)) { $outcome = 'failed' }
+  if ($sourceStalled -and -not $relayBroke -and -not $copyFailed -and (Test-RelayAlive)) {
+    $outcome = 'failed'
+    # A live stream that stopped sending has ended (or is gone): on to the next video.
+    if ($Media.IsLive) { $outcome = 'done'; Say (T '  The live stream stopped sending - going on.') 'Yellow' }
+  }
   elseif ($relayBroke -or $stalled -or $copyFailed -or -not (Test-RelayAlive)) { $outcome = 'relay' }
   elseif ($requested) { $outcome = $requested }
   elseif ($exit -eq 0) { $outcome = 'done' }
@@ -4930,6 +5306,7 @@ function Show-NowPlaying($item) {
   }
   if ($item.SubWarn) { Say (T '  Note: {0}' $item.SubWarn) 'Yellow' }
   if ($item.FpsNote) { Say (T '  Note: {0}' $item.FpsNote) 'DarkGray' }
+  if ($item.Info -and (Test-HdrVideo $item.Info.Video)) { Say (T '  Note: {0}' (T 'this is an HDR video: its colours may look washed out on the stream')) 'DarkGray' }
   if ($item.ResumeAt -gt 0) { Say (T '  Starting from {0}' (Format-Time $item.ResumeAt)) 'Gray' }
 }
 
@@ -4949,7 +5326,8 @@ function Clear-QueueForStop {
   if ($script:Idx -lt $script:Queue.Count) {
     for ($i = $script:Idx; $i -lt $script:Queue.Count; $i++) {
       $it = $script:Queue[$i]
-      if ($it.Dl) { Stop-Proc $it.Dl.Proc }
+      # (A download still running stops as a whole tree: yt-dlp's own ffmpeg too.)
+      if ($it.Dl -and $it.Dl.Proc) { try { if (-not $it.Dl.Proc.HasExited) { Stop-ProcessTree $it.Dl.Proc } } catch {} }
       Remove-ItemFiles $it
     }
   }
@@ -4982,6 +5360,7 @@ function Restart-RelayForResync([string]$next = 'hold') {
     Say (T '  (ProTV worlds reconnect by themselves. Other players may need Reload / Resync pressed once.)') 'DarkGray'
   }
   if ($script:Src) { [void](Stop-Source $script:Src -Now) }
+  $locked = $script:FpsLocked
   $old = $script:Relay
   $oldProg = Get-RelayProgPath
   Start-ResyncRelay $next
@@ -4998,6 +5377,7 @@ function Restart-RelayForResync([string]$next = 'hold') {
     Start-ResyncRelay $next
   }
   $script:RelayFresh = $false
+  $script:FpsLocked = $locked   # (a resync before any video leaves the frame rate to the first video)
   $script:ResyncedAt = Get-Date
   $script:RenewedAt = Get-Date      # the players' failure this causes is expected: no extra new connection for it
   $script:PendingHold = New-Hold 'reload' 45
@@ -5017,7 +5397,7 @@ function Invoke-Queue {
     if ($script:Idx -lt $script:Queue.Count) { $cur = $script:Queue[$script:Idx] }
     if ($script:Paused -and $cur) {
       # Keep the viewers connected with a "Paused" screen until someone continues (or skips / stops).
-      if (-not (Test-RelayAlive)) { Start-Relay; $script:RelayFresh = $false; $script:PendingHold = New-Hold 'reload' }
+      if (-not (Test-RelayAlive)) { $locked = $script:FpsLocked; Start-Relay; $script:FpsLocked = $locked; $script:RelayFresh = $false; $script:PendingHold = New-Hold 'reload' }
       $r = Invoke-Source -Kind 'paused' -Media $cur
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { $script:StopAll = $true; break }
       if ($r.Outcome -eq 'relay') { if (-not (Wait-RelayRetry)) { break }; continue }
@@ -5108,9 +5488,11 @@ function Invoke-Queue {
         # Back on the air with the waiting screen; the next video waits until the players are back (or, if no video
         # played on this connection yet, until they show the stream at all).
         $fresh = $script:RelayFresh
+        $locked = $script:FpsLocked
         if (-not (Wait-RelayRetry $false)) { break }
         Start-Relay
         $script:RelayFresh = $fresh
+        $script:FpsLocked = $locked
         if (-not $fresh -and -not ($script:PendingHold -and $script:PendingHold.Reason -eq 'start')) { $script:PendingHold = New-Hold 'reload' }
         continue
       }
@@ -5139,7 +5521,26 @@ function Invoke-Queue {
       $script:Idx++
       continue
     }
-    if (-not (Test-RelayAlive)) { Start-Relay }
+    # The first video on a new connection sets the frame rate of everything on it (without "StreamFps" in config.json).
+    # The H.264 header holds it, so a change needs a new connection. Once the stream sent anything, or VRChat runs here,
+    # someone may be watching: the new connection opens before the old one closes (a resync). Else simply a new one.
+    # Either way the video then waits for the players as on a new connection.
+    if (-not (Test-RelayAlive)) { [void](Select-SessionFps $cur); Start-Relay }
+    elseif ($script:FpsAuto -and -not $script:FpsLocked) {
+      # (The log isn't read while questions wait or a video gets ready: what does the world's player here do now?)
+      if ($script:VrcLog) { $script:RemoteNextPoll = [datetime]::MinValue; Receive-WorldCommands 'waiting' }
+      $start = $script:HoldOn -and ($script:RelayFresh -or ($script:PendingHold -and $script:PendingHold.Reason -eq 'start'))
+      if (Select-SessionFps $cur) {
+        $sent = $false
+        try { $sent = ((Read-RelaySize) -gt 0) } catch {}
+        if ((Test-VrcWatching) -or $sent) {
+          Restart-RelayForResync
+          if ($start) { $script:PendingHold = New-Hold 'start' }
+        }
+        else { Stop-Relay; Start-Relay }
+      }
+    }
+    Set-FpsPlan $cur
     # Wait for the players first when they can't be watching yet (a new connection) or are reconnecting.
     $hold = $script:PendingHold
     if (-not $hold -and $script:RelayFresh -and $script:HoldOn) { $hold = New-Hold 'start' }
@@ -5148,7 +5549,7 @@ function Invoke-Queue {
     if ($hold -and -not (Test-HoldReady $hold)) {
       if (-not $cur.Announced) { Show-NowPlaying $cur; $cur.Announced = $true }
       $r = Invoke-Source -Kind 'hold' -Media $cur -Hold $hold
-      if ($r.Outcome -eq 'renew') { Stop-Relay; Start-Relay; $script:RelayFresh = $false; $script:PendingHold = $hold; continue }
+      if ($r.Outcome -eq 'renew') { $locked = $script:FpsLocked; Stop-Relay; Start-Relay; $script:FpsLocked = $locked; $script:RelayFresh = $false; $script:PendingHold = $hold; continue }
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { $script:StopAll = $true; break }
       if ($r.Outcome -eq 'stop') { Save-ItemState $cur $cur.ResumeAt; Clear-QueueForStop; continue }
       if ($r.Outcome -eq 'relay') {
@@ -5184,11 +5585,20 @@ function Invoke-Queue {
     if (-not $cur.Announced) { Show-NowPlaying $cur }
     $cur.Announced = $true
     Show-Controls
+    # A video starting (not one going on after a pause, seek or reconnect): the bitrate may go back up (Step-UpQuality).
+    if (-not [object]::ReferenceEquals($script:LastStartedItem, $cur)) {
+      $script:LastStartedItem = $cur
+      if (Test-CanStepUp) { Step-UpQuality }
+    }
+    $script:FpsLocked = $true   # (a video started on this connection: later ones go at its frame rate)
     $r = Invoke-Source -Kind 'content' -Media $cur -Start $cur.ResumeAt
     if ($r.Elapsed -gt 60) { $script:RelayFails = 0 }
     if (($r.Position - $cur.ResumeAt) -gt 2) { $script:EncoderProven = $true }
-    # A web stream that ends well before the episode does was cut off, not finished.
-    if ($r.Outcome -eq 'done' -and $cur.Kind -eq 'site' -and $cur.IsDirectUrl -and $cur.Info.Duration -gt 60 -and $r.Position -lt $cur.Info.Duration - 20) { $r.Outcome = 'failed' }
+    # A web stream that ends well before the episode does was cut off, not finished (also a link played as it is).
+    if ($r.Outcome -eq 'done' -and ($cur.Kind -eq 'site' -or ($cur.Kind -eq 'url' -and -not $cur.IsLive)) -and $cur.IsDirectUrl -and
+      $cur.Info.Duration -gt 60 -and $r.Position -lt $cur.Info.Duration - 20) { $r.Outcome = 'failed' }
+    # (A link whose server failed it at once is the server's doing, not the encoder's.)
+    $inputErr = ($cur.Kind -eq 'url' -and $cur.IsDirectUrl -and "$($r.Error)" -match '(?i)HTTP error|Server returned|Input/output error|I/O error|Connection (refused|reset|timed out)|Failed to resolve|Error opening input|Invalid data found')
     $fromLink = ($r.Cmd -and $r.Cmd.From -eq 'link')
     if ($r.Outcome -eq 'done' -or $r.Outcome -eq 'skip' -or $r.Outcome -eq 'playnow') {
       Remove-ItemFiles $cur
@@ -5271,7 +5681,7 @@ function Invoke-Queue {
       }
       continue
     }
-    if (-not $script:EncoderProven -and $r.Elapsed -lt 20 -and ($r.Position - $cur.ResumeAt) -lt 1 -and $script:VEnc -ne 'libx264' -and $cur.Attempts -lt 3) {
+    if (-not $script:EncoderProven -and -not $inputErr -and $r.Elapsed -lt 20 -and ($r.Position - $cur.ResumeAt) -lt 1 -and $script:VEnc -ne 'libx264' -and $cur.Attempts -lt 3) {
       $resync = $false
       if ($script:VEnc -eq 'h264_nvenc' -and $script:NvTier -gt 1) {
         $script:NvTier--
@@ -5287,6 +5697,14 @@ function Invoke-Queue {
       $cur.ResumeAt = [Math]::Max(0.0, $r.Position - 2)
       # Another encoder means another H.264 header: the players reconnect once, so none of them freezes on it.
       if ($resync -and (Test-RelayAlive)) { Restart-RelayForResync }
+      continue
+    }
+    if ($cur.Kind -eq 'url' -and $cur.IsDirectUrl -and -not $cur.IsLive -and "$($cur.Path)" -match '^(?i)https?://' -and $cur.DirectFails -lt 3) {
+      # A link played straight from its server that stopped (the server hiccuped): again from where it was.
+      $cur.DirectFails++
+      $cur.ResumeAt = Get-ClampedPos $cur ([Math]::Max($cur.ResumeAt, $r.Position - 2))
+      Say (T 'The stream from the server stopped - trying again from {0}.' (Format-Time $cur.ResumeAt)) 'Yellow'
+      if ($r.Error) { Say "  ($(Get-ShortText $r.Error 110))" 'DarkGray' }
       continue
     }
     $why = (T 'ffmpeg stopped with error {0}' $r.ExitCode)
@@ -5332,7 +5750,10 @@ function Get-NumSetting([string]$name, [double]$default, [double]$min, [double]$
 
 function Initialize-StreamSettings {
   $f = "$(Get-Prop $script:Cfg 'StreamFps')".Trim()
-  if (-not $f -or $f -eq 'auto') { $f = '24000/1001' }
+  # Not set: 23.976 until the first video of a connection sets it (Select-SessionFps). Set: always that ("auto" =
+  # 23.976, as before).
+  $script:FpsAuto = (-not $f)
+  if ($script:FpsAuto -or $f -match '^(?i)auto$') { $f = '24000/1001' }
   $num = 0.0
   if ($f -match '^(\d+)/(\d+)$' -and [double]$matches[2] -gt 0) { $num = [double]$matches[1] / [double]$matches[2] }
   elseif (-not [double]::TryParse($f, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$num)) { $num = 0.0 }
@@ -5677,8 +6098,9 @@ function Stop-Everything {
   if (Get-Command Stop-ViewerPreview -CommandType Function -ErrorAction SilentlyContinue) { try { Stop-ViewerPreview } catch {} }
   if ($script:PanelShown) { try { Close-ControlPanel } catch {} }
   $script:PanelShown = $false
+  # Downloads first, as whole trees (yt-dlp's own ffmpeg would go on recording once yt-dlp is gone).
+  foreach ($it in $script:Queue) { if ($it.Dl -and $it.Dl.Proc) { try { if (-not $it.Dl.Proc.HasExited) { Stop-ProcessTree $it.Dl.Proc } } catch {} } }
   foreach ($bg in $script:BgProcs) { Stop-Proc $bg.Proc }
-  foreach ($it in $script:Queue) { if ($it.Dl) { Stop-Proc $it.Dl.Proc } }
   Close-Relay
   Start-Sleep -Milliseconds 300
   try { [System.IO.File]::Delete((Get-RelayProgPath)) } catch {}

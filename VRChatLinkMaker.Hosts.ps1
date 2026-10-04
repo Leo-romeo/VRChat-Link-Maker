@@ -497,7 +497,7 @@ function Show-HostLinks($p, [string]$pcLink = '') {
   if ($p.Trusted) {
     Say (T '  Trusted by VRChat: plays in every instance (Public ones too), nobody has to change a setting.') 'DarkGreen'
   } else {
-    Say (T '  Not on VRChat''s trusted list: every viewer must turn on "Allow Untrusted URLs" in VRChat''s settings.') 'Yellow'
+    Say (T '  Not on VRChat''s trusted list: everyone who watches, you included, must turn on "Allow Untrusted URLs" in VRChat''s settings.') 'Yellow'
     Say (T '  It doesn''t play in Public or Group Public instances - use a Friends, Invite or Group instance.') 'Yellow'
     Say (T '  (In a Public instance only if the world''s creator adds this address to the world''s allowed domains.)') 'DarkGray'
   }
@@ -1016,7 +1016,7 @@ function Show-VpsBundle($v, [switch]$Quiet) {
   if (ConvertTo-HostBool (Get-Prop $v 'Hls') $false) { $tcp += ", $($v.HlsPort)" }
   Say ''
   Say (T '  The setup files for your VPS are in:  {0}' $dir) 'White'
-  Say (T '   1) Open README-VPS.txt there: it shows how to get the free Oracle Cloud server (or Hetzner).') 'Gray'
+  Say (T '   1) Open README-VPS.txt there: it shows how to get the free Oracle Cloud server (or Hetzner). Viewers in Russia can''t watch from either: see "Viewers in Russia" in README.txt.') 'Gray'
   Say (T '   2) In the server''s network rules allow TCP ports {0} and UDP port {1}.' $tcp $v.SrtPort) 'Gray'
   Say (T '   3) Log in to the server (ssh) and paste the text of install.sh. That''s it.') 'Gray'
   Say (T '  Keep these files to yourself: they contain your VPS''s passwords.') 'Yellow'
@@ -1224,6 +1224,7 @@ function Set-VpsInteractive($v) {
   Say ''
   Say (T '  Your own small server on the internet streams to the viewers: they don''t see your home address and') 'Gray'
   Say (T '  don''t use your upload. Free with Oracle Cloud "Always Free", or about 5.49 EUR/month at Hetzner.') 'Gray'
+  Say (T '  Viewers in Russia can''t watch from Oracle, Hetzner or the other big clouds: see "Viewers in Russia" in README.txt.') 'Yellow'
   Say (T '  One server can carry several streams at the same time (one per PC), each with its own link.') 'Gray'
   if ("$(Get-Prop $v 'Role')" -eq 'guest') {
     $name = ConvertTo-VpsStreamName (Get-Prop $v 'Name')
@@ -1341,7 +1342,7 @@ function Select-Host {
   $opts = @(
     (T 'Topaz Chat - free, trusted by VRChat, plays everywhere (Public too). Up to about 1.4 Mbps.'),
     (T 'This PC - free, sharper picture; viewers see your home IP; not for Public instances; uses your upload.'),
-    (T 'My VPS - your own server (Oracle free, or ~5.49 EUR/month); hides your IP; not for Public instances.'),
+    (T 'My VPS - your own server (Oracle free, or ~5.49 EUR/month; viewers in Russia need another host, see README); hides your IP; not for Public instances.'),
     (T 'Custom server - type the links yourself (e.g. Twitch: trusted, but the stream is public).')
   )
   $ci = [array]::IndexOf($script:HostIds, $curId)
@@ -2380,6 +2381,7 @@ function New-VpsSetupBundle($s) {
     (T 'These files contain your stream passwords. Don''t share them or post them anywhere.'),
     '',
     (T '1) Get a free VPS: Oracle Cloud Always Free (https://www.oracle.com/cloud/free/).'),
+    (T '   - Not for viewers in Russia: Russian internet providers cut video from Oracle, Hetzner and the other big cloud hosts. See "Viewers in Russia" in README.txt before you pick a server for them.'),
     (T '   - IMPORTANT: the home region is picked once, when you sign up, and can''t be changed later. Always Free servers only run there. Pick one in Europe, e.g. Germany Central (Frankfurt).'),
     (T '   - Create a VM: Compute > Instances > Create instance. Image: Canonical Ubuntu 24.04 (or 22.04). Shape: Ampere VM.Standard.A1.Flex with 2 OCPU and 12 GB memory (the Always Free limit). Download the SSH key it offers.'),
     (T '   - Write down the instance''s public IP address.'),
@@ -2398,10 +2400,10 @@ function New-VpsSetupBundle($s) {
     '',
     (T 'More streams at the same time (one per PC, each with its own link): in VRChat Link Maker choose "My VPS" -> "Add a stream for another PC", paste the new install.sh here again, and give the other PC the connection code the tool shows. That PC pastes the code under "My VPS" instead of an address - it must not run an install.sh of its own (that would replace this setup).'),
     (T 'All streams share the server''s upload: e.g. 2 streams with 10 viewers each at 4 Mbps need 80 Mbps.'),
-    (T 'Paid alternative: Hetzner Cloud CX23 (about 5.49 EUR a month plus a public IPv4 address). Create an Ubuntu 24.04 server in an EU location, then do step 3 as root (ssh root@<address>, no sudo needed). If you turned on Hetzner''s cloud firewall, open the same ports there.'),
+    (T 'Paid alternative: Hetzner Cloud CX23 (about 5.49 EUR a month plus a public IPv4 address). Create an Ubuntu 24.04 server in an EU location, then do step 3 as root (ssh root@<address>, no sudo needed). If you turned on Hetzner''s cloud firewall, open the same ports there. Viewers in Russia can''t watch from Hetzner either.'),
     '',
     (T 'Security: only this tool can send the stream (user + password, and on SRT an encryption passphrase). Viewers can only watch live/<token>; every other path is refused. Like any stream link, anyone who has the link can watch.'),
-    (T 'The server''s address is not trusted by VRChat: viewers need "Allow Untrusted URLs", and it doesn''t play in Public or Group Public instances.')
+    (T 'The server''s address is not trusted by VRChat: everyone who watches, you included, needs "Allow Untrusted URLs", and it doesn''t play in Public or Group Public instances.')
   )
   [System.IO.File]::WriteAllText((PathJoin $dir 'README-VPS.txt'), (($readme -join "`r`n") + "`r`n"), $utf8)
   return $dir
