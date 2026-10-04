@@ -275,10 +275,12 @@ function New-ControlPanel {
   }
   $p.Root = $root
 
-  # Row 0: what the stream is doing + the title
-  $top = New-PanelGrid 2 ($p.Bold.Height + 8)
+  # Row 0: what the stream is doing + the title, and what the stream carries (a dim chip: host - picture fps kbps;
+  # orange when it is too few bits for the picture size). The chip is as wide as its text: the title gives way.
+  $top = New-PanelGrid 3 ($p.Bold.Height + 8)
   [void]$top.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
   [void]$top.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+  [void]$top.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
   $p.Badge = New-Object "$WF.Label"
   $p.Badge.AutoSize = $true
   $p.Badge.Font = $p.Small
@@ -288,11 +290,16 @@ function New-ControlPanel {
   $p.Title = New-PanelLabel (T 'Nothing is playing') ($p.Bold.Height + 6) $p.Bold $null
   $top.Controls.Add($p.Badge, 0, 0)
   $top.Controls.Add($p.Title, 1, 0)
+  $p.Quality = New-Object "$WF.Label"
+  $p.Quality.AutoSize = $true
+  $p.Quality.ForeColor = $c.Dim
+  $p.Quality.Anchor = [System.Windows.Forms.AnchorStyles]::Right
+  $p.Quality.Margin = New-Object System.Windows.Forms.Padding([int](6 * $k), 1, 2, 1)
+  $top.Controls.Add($p.Quality, 2, 0)
   $root.Controls.Add($top, 0, 0)
 
-  # Row 1: the link for the world's player, [Copy], [Quest link] (when the host has one), and what the stream carries
-  # (a dim chip: host - picture fps kbps; orange when it is too few bits for the picture size).
-  $lk = New-PanelGrid 5 ([int]($fh * 2.1))
+  # Row 1: the link for the world's player, [Copy], [Quest link] (when the host has one).
+  $lk = New-PanelGrid 4 ([int]($fh * 2.1))
   $p.LinkLabel = New-Object "$WF.Label"
   $p.LinkLabel.Text = T 'Link for VRChat:'
   $p.LinkLabel.AutoSize = $true
@@ -315,25 +322,17 @@ function New-ControlPanel {
   $p.Quest = New-PanelButton (T 'Quest link') '' '' $null $null
   $p.Quest.Add_Click({ try { $q = $script:Panel; if ($q.QuestLink) { Set-PanelClipboard $q.Quest ([string]$q.QuestLink) } } catch {} })
   $p.QuestText = $p.Quest.Text
-  # (One line, cut with "..." when narrow: the whole text is its tooltip.)
-  $p.Quality = New-PanelLabel '' ($fh + 4) $null $c.Dim
-  $p.Quality.Dock = [System.Windows.Forms.DockStyle]::None
-  $p.Quality.Anchor = [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
-  $p.Quality.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-  $p.Quality.Margin = New-Object System.Windows.Forms.Padding([int](6 * $k), 1, 2, 1)
   $bw = [Math]::Max([System.Windows.Forms.TextRenderer]::MeasureText($p.CopyText, $p.Font).Width, [System.Windows.Forms.TextRenderer]::MeasureText((T 'Copied!'), $p.Font).Width) + [int](22 * $k)
   $p.QuestW = [Math]::Max([System.Windows.Forms.TextRenderer]::MeasureText($p.QuestText, $p.Font).Width, [System.Windows.Forms.TextRenderer]::MeasureText((T 'Copied!'), $p.Font).Width) + [int](22 * $k)
   [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
-  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 62)))
+  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
   [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, [single]$bw)))
   [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 0)))
-  [void]$lk.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 38)))
   $p.Quest.Visible = $false
   $lk.Controls.Add($p.LinkLabel, 0, 0)
   $lk.Controls.Add($lb0, 1, 0)
   $lk.Controls.Add($p.Copy, 2, 0)
   $lk.Controls.Add($p.Quest, 3, 0)
-  $lk.Controls.Add($p.Quality, 4, 0)
   $p.LinkBar = $lk
   $root.Controls.Add($lk, 0, 1)
 
@@ -386,7 +385,7 @@ function New-ControlPanel {
   $pv.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
   $pv.BackColor = $c.Black
   $pv.Margin = New-Object System.Windows.Forms.Padding(2, [int](4 * $k), 2, [int](4 * $k))
-  $pv.MinimumSize = New-Object System.Drawing.Size(0, [int](120 * $k))
+  # (No minimum height: a control taller than its row would spill over the seek bar below it.)
   $pv.Add_Paint({
     param($sender, $e)
     try {
@@ -506,7 +505,7 @@ function New-ControlPanel {
   $p.Status.TextAlign = [System.Drawing.ContentAlignment]::TopLeft
   $p.Status.Margin = New-Object System.Windows.Forms.Padding(2, [int](6 * $k), 2, 1)
   $root.Controls.Add($p.Status, 0, 7)
-  # The VRChat player's state (what the stream carries is the chip in the link bar).
+  # The VRChat player's state (what the stream carries is the chip right of the title).
   $p.Player = New-PanelLabel '' ($fh + 6) $null $c.Dim
   $root.Controls.Add($p.Player, 0, 8)
   $root.Controls.Add((New-PanelLabel (T 'Up next') ($p.Small.Height + 8) $p.Small $c.Dim), 0, 9)
@@ -747,18 +746,25 @@ function Submit-PanelInput {
   $q.Input.Clear()
 }
 
-# Ctrl+V outside a text box: copied files are added, text goes into the input box (focused). $true = handled.
+# Ctrl+V outside a text box: copied files are added, text goes into the input box (focused). Text of several lines
+# (a list of links) is added as it is, like a drop, also from inside the input box: the one-line box would keep only
+# its first line. $true = handled.
 function Invoke-PanelPaste([System.Windows.Forms.Keys]$keyData) {
   $K = [System.Windows.Forms.Keys]
   if ($keyData -ne ($K::Control -bor $K::V)) { return $false }
   $q = $script:Panel
   $fc = $null
   try { $fc = Get-PanelFocus } catch {}
-  if ($fc -is [System.Windows.Forms.TextBoxBase] -or $fc -is [System.Windows.Forms.ComboBox]) { return $false }
+  $inBox = ($fc -is [System.Windows.Forms.TextBoxBase] -or $fc -is [System.Windows.Forms.ComboBox])
+  if ($inBox -and -not ($fc -eq $q.Input -and $q.InputOn)) { return $false }
   if (-not $q.InputOn) { return $true }
   $do = $null
   try { $do = [System.Windows.Forms.Clipboard]::GetDataObject() } catch {}
-  if ($do -and $do.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { [void](Receive-PanelDrop $do); return $true }
+  if ($do -and -not $inBox -and $do.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) { [void](Receive-PanelDrop $do); return $true }
+  $txt = ''
+  try { $txt = [string][System.Windows.Forms.Clipboard]::GetText() } catch {}
+  if ($txt.Trim() -match "[`r`n]") { Add-PanelCommand 'line' $txt.Trim(); return $true }
+  if ($inBox) { return $false }
   $q.Input.Focus() | Out-Null
   $q.Input.SelectionStart = $q.Input.TextLength
   $q.Input.Paste()
@@ -924,7 +930,7 @@ function Update-PanelQueueMenu {
   $q = $script:Panel
   $s = $null
   try { $s = $script:PanelSync.State } catch {}
-  $ok = ($null -ne $s -and -not [bool]$s['Prompt'])
+  $ok = ($null -ne $s -and -not [bool]$s['Prompt'] -and -not [bool]$s['Asking'])
   $ids = @($q.ListIds)
   $ix = $q.List.SelectedIndex
   $has = ($ok -and (Get-PanelListId) -gt 0)
@@ -1372,8 +1378,9 @@ function Remove-PanelResources {
 # $s (from the main thread, $null before the first update): Mode ('content'|'paused'|'hold'|'waiting'|'reconnect'|
 # 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]) and UpcomingIds (int[], the
 # queue items' Ids, same order), Link, QuestLink ('' = none), Clock (bool), CanSeek (bool), Quality / QualityLow /
-# QualityTip (the link bar's chip), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu),
+# QualityTip (the chip right of the title), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu),
 # Prompt (bool: start questions in the tool's window, Next / Stop / Resync / Settings / the input row off).
+# Asking (bool: a question waits in the tool's window: the input row and the Up next menu off).
 function Update-PanelView($s) {
   try {
     $hasState = ($null -ne $s)
@@ -1426,8 +1433,9 @@ function Update-PanelView($s) {
       $q.LinkBar.ColumnStyles[3].Width = [single]$w
     }
     if ($q.CopiedUntil -ne [DateTime]::MinValue -and $now -ge $q.CopiedUntil) { Reset-PanelCopied }
-    # The input row: off while the start questions wait in the console (the window's answers come later).
-    $inputOn = ($hasState -and -not [bool]$s['Prompt'])
+    # The input row: off while the start questions or any other question waits in the console (Asking; the window's
+    # answers come later): a line typed here meanwhile would only run after the question, as a new line.
+    $inputOn = ($hasState -and -not [bool]$s['Prompt'] -and -not [bool]$s['Asking'])
     $q.InputOn = $inputOn
     foreach ($ctl in @($q.Input, $q.AddLine, $q.Files, $q.Folder)) { Set-PanelProp ('in' + $ctl.GetHashCode()) $ctl 'Enabled' $inputOn }
     if ($script:PanelLast['inputtip'] -ne $inputOn) {

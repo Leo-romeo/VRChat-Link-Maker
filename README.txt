@@ -170,10 +170,10 @@ At the top:
 
   Link for VRChat  the link to put in the world's video player, with Copy and
                    Quest link (copies the link for Quest / Android viewers,
-                   when the server has one). On the right: what the stream
-                   carries (server, picture size, frames per second, video
-                   bitrate). Orange means too little bitrate for that picture
-                   size: a smaller size looks sharper.
+                   when the server has one). Right of the title: what the
+                   stream carries (server, picture size, frames per second,
+                   video bitrate). Orange means too little bitrate for that
+                   picture size: a smaller size looks sharper.
   The input box    type a title, paste a link or a file path and press Enter
                    (or Add): it works like typing it into the console. Files...
                    and Folder... pick videos. You can also drop files, a folder

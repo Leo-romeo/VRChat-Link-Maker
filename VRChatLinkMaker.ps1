@@ -2861,6 +2861,12 @@ function Wait-Prep($item) {
 
 # Gets the next videos ready in the background. Downloads run one at a time, in queue order.
 function Update-Prep {
+  # (Up next reordered while a download runs: the videos moved ahead of it wait until it is done, not a 2nd download.)
+  for ($i = $script:Idx + 1; $i -lt $script:Queue.Count; $i++) {
+    if ($script:Queue[$i].State -ne 'downloading') { continue }
+    for ($j = $script:Idx + 1; $j -lt $i; $j++) { if ($script:Queue[$j].State -eq 'new') { Step-Prep $script:Queue[$i]; return } }
+    break
+  }
   $last = [Math]::Min($script:Queue.Count - 1, $script:Idx + 2)
   for ($i = $script:Idx; $i -le $last; $i++) {
     $it = $script:Queue[$i]
@@ -3268,11 +3274,14 @@ function Wait-Pump([double]$seconds) {
   while ((Get-Date) -lt $until) { Invoke-PanelPump; Start-Sleep -Milliseconds 50 }
 }
 
-function Invoke-PanelPump {
+# -Asking: a question waits for its answer here (Read-NavKey): the window's input row is off meanwhile (a line typed
+# there would only run after the question, as a new line); the next Update-Panel turns it on again.
+function Invoke-PanelPump([switch]$Asking) {
   if (-not $script:PanelShown) { return }
   try {
     # (While a question waits nothing else updates the window: on / off and the link follow here.)
     $s = $script:PanelState
+    if ($Asking -and $s -and -not $s['Asking']) { $s = $s.Clone(); $s.Asking = $true; $script:PanelState = $s }
     if ($s -and ($s.Mode -eq 'waiting' -or $s.Mode -eq 'off')) {
       $mode = 'off'
       if (Test-RelayAlive) { $mode = 'waiting' }
@@ -3340,7 +3349,7 @@ function Test-NavKeyWaiting {
 function Read-NavKey {
   if ($script:NavKeyAhead.Count -gt 0) { $k = $script:NavKeyAhead[0]; $script:NavKeyAhead.RemoveAt(0); return $k }
   if ($script:KeySource) { return (& $script:KeySource 'read') }
-  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
+  while (-not [Console]::KeyAvailable) { Invoke-PanelPump -Asking; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
   return [Console]::ReadKey($true)
 }
 
@@ -4222,6 +4231,12 @@ function Get-NextCmd([string]$kind) {
     # The plain link put in again while paused: continue (the TV then shows the stream again, from live).
     if ($c.Cmd -eq 'sync' -and $c.From -eq 'link' -and $c.Arg -eq 'plain' -and $kind -eq 'paused') { $c = [pscustomobject]@{ Cmd = 'resume'; Arg = $null; From = 'link'; At = $c.At } }
     if ($c.Cmd -in @('lost', 'sync', 'restart') -and $kind -ne 'content') { continue }   # only matter while a video plays
+    # A "Play now" from the window's Up next names its video: once that one plays (an earlier "Play now" switched to it)
+    # or is no longer the next one, it is old and would skip what plays.
+    if ($c.Cmd -eq 'playnow' -and $c.From -eq 'panel' -and $c.Arg -is [System.Collections.IDictionary]) {
+      $nx = $script:Idx + 1
+      if ($nx -ge $script:Queue.Count -or [int](Get-Prop $script:Queue[$nx] 'Id') -ne [int]$c.Arg['Id']) { continue }
+    }
     $why = ''
     $r = Resolve-Cmd $c $kind ([ref]$why)
     $fromWorld = ($c.From -eq 'link' -or $c.From -eq 'button')
@@ -4258,7 +4273,13 @@ function Receive-Commands([string]$kind) {
         'viewer' { Open-ViewerPreview }
         'clock' { Switch-Clock }
         # The window's input box: each line as if typed here and Enter pressed; files / a folder as if dropped here.
-        'line' { foreach ($ln in @(([string]$p.Arg) -split "`r?`n")) { if ($ln.Trim()) { Add-TypedLine $ln.Trim() $kind } } }
+        # (Several lines - a drop, a paste - are links / paths each; with a title among them only the first line counts:
+        # one search, one second window.)
+        'line' {
+          $lns = @(@(([string]$p.Arg) -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+          if ($lns.Count -gt 1 -and @($lns | Where-Object { Test-IsTitle $_ }).Count -gt 0) { $lns = @($lns[0]) }
+          foreach ($ln in $lns) { Add-TypedLine $ln $kind }
+        }
         'files' {
           $fs = @(@($p.Arg) | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() })
           if ($fs.Count -gt 0) { Invoke-AddEntries $fs $kind }
@@ -4339,7 +4360,7 @@ function Invoke-QueueCommand([string]$cmd, $arg, [string]$kind) {
       $to = $script:Idx
       if ($kind -ne 'waiting') { $to = $script:Idx + 1 }
       if ($i -ne $to) { $script:Queue.RemoveAt($i); $script:Queue.Insert($to, $it) }
-      if ($kind -ne 'waiting') { Add-Cmd (New-Cmd 'playnow' $null 'panel') }
+      if ($kind -ne 'waiting') { Add-Cmd (New-Cmd 'playnow' @{ Id = (Get-Prop $it 'Id') } 'panel') }
       else { Say (T '  Next up: {0}' $it.Name) 'Gray' }
     }
     'qup' {
@@ -4643,7 +4664,7 @@ function Get-QualityLine {
   $fps = [Math]::Round($script:StreamFpsNum, 2)
   $bpp = 0.0
   if ($script:OutW -gt 0 -and $script:OutH -gt 0 -and $script:StreamFpsNum -gt 0) { $bpp = $script:VideoKbps * 1000.0 / ($script:OutW * $script:OutH * $script:StreamFpsNum) }
-  # (The chip in the window's link bar: "<host> - <picture> <fps> fps <kbps> kbps".)
+  # (The chip in the control window's title row: "<host> - <picture> <fps> fps <kbps> kbps".)
   if ($script:HostP) { $txt = T '{0} - {1}p {2} fps {3} kbps' $script:HostP.Name $script:OutH (Format-Num $fps) $script:VideoKbps }
   else { $txt = T '{0}p {1} fps {2} kbps' $script:OutH (Format-Num $fps) $script:VideoKbps }
   return [pscustomobject]@{ Text = $txt; Low = ($bpp -gt 0 -and $bpp -lt 0.04) }
