@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.4.2'
+$script:Version = '1.4.3'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
