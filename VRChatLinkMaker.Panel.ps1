@@ -210,7 +210,7 @@ function New-ControlPanel {
     PrevCheck = [DateTime]::MinValue; PrevTime = [DateTime]::MinValue; PrevMissing = [DateTime]::MinValue
     InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; CueSet = $false; CueTries = 0; InputParked = $false; InRows = $false; Timer = $null
     AskId = ''; AskSent = ''; AskSentAt = [DateTime]::MinValue; AskView = $null; AskFocus = $null; AskFocusPending = $false; AskFlashing = $false
-    AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null
+    AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null; AskDigits = ''; AskDigitsAt = [DateTime]::MinValue
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -759,22 +759,21 @@ function Submit-PanelInput {
   if (-not $q.InputOn) { return }
   $t = [string]$q.Input.Text
   if (-not $t.Trim()) { return }
-  [void](Submit-PanelLine $t.Trim())
-  $q.Input.Clear()
+  if (Submit-PanelLine $t.Trim()) { $q.Input.Clear() }
 }
 
 # A typed / dropped line and picked / dropped files: the answer to the start screen's '>' while it waits (bus.Ask of
 # kind 'line'), else a command (Receive-Commands: as typed into the console while it streams).
 function Submit-PanelLine([string]$text) {
   $a = Get-PanelAsk
-  if ($a -and [string]$a['Kind'] -eq 'line') { return (Send-PanelAnswer @{ Text = $text }) }
+  if ($a -and [string]$a['Kind'] -eq 'line') { return (Send-PanelAnswer @{ Text = $text } -Line) }
   Add-PanelCommand 'line' $text
   return $true
 }
 
 function Submit-PanelFiles([string[]]$files) {
   $a = Get-PanelAsk
-  if ($a -and [string]$a['Kind'] -eq 'line') { return (Send-PanelAnswer @{ Files = [string[]]@($files) }) }
+  if ($a -and [string]$a['Kind'] -eq 'line') { return (Send-PanelAnswer @{ Files = [string[]]@($files) } -Line) }
   Add-PanelCommand 'files' $files
   return $true
 }
@@ -1071,13 +1070,17 @@ function Test-PanelActive {
 }
 
 # One answer per question (a double click sends one): the strip is locked until the question goes (or, if the main
-# thread didn't take it, for 2 s: Update-PanelAsk).
-function Send-PanelAnswer([hashtable]$ans) {
+# thread didn't take it, for 2 s: Update-PanelAsk). The strip answers the question it shows ($q.AskId) and nothing
+# once that one has gone (a click on a strip a tick late never answers the next question, unseen); -Line answers the
+# start screen's '>' (the input box).
+function Send-PanelAnswer([hashtable]$ans, [switch]$Line) {
   $q = $script:Panel
   $b = Get-PanelBus
   $a = Get-PanelAsk
   if ($null -eq $b -or $null -eq $a) { return $false }
   $id = [string]$a['Id']
+  if ($Line) { if ([string]$a['Kind'] -ne 'line') { return $false } }
+  elseif (-not $q.AskId -or $q.AskId -cne $id) { return $false }
   if ($q.AskSent -ceq $id) { return $false }
   $ans['Id'] = $id
   if (-not $ans.ContainsKey('Nav')) { $ans['Nav'] = '' }
@@ -1180,7 +1183,9 @@ function New-PanelAskStrip {
   $p.AskBar.AutoSize = $true
   $p.AskBar.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
   $p.AskBar.Dock = [System.Windows.Forms.DockStyle]::Fill
-  $p.AskBar.WrapContents = $true
+  # (One row: Back, Forward, Cancel, OK fit the window's narrowest width. A wrapping bar reports the height of its
+  # buttons stacked, an empty band under them.)
+  $p.AskBar.WrapContents = $false
   $p.AskBar.Margin = New-Object System.Windows.Forms.Padding(0, [int](4 * $k), 0, 0)
   $t.Controls.Add($p.AskTitle, 0, 0)
   $t.Controls.Add($p.AskInfo, 1, 0)
@@ -1191,6 +1196,8 @@ function New-PanelAskStrip {
   $t.Controls.Add($p.AskBar, 0, 3)
   $t.SetColumnSpan($p.AskBar, 2)
   $t.Visible = $false
+  # (Clicked or tabbed into: the user is at the strip, a parked focus is over.)
+  $t.Add_Enter({ try { $script:Panel.AskFocusPending = $false } catch {} })
   $p.Ask = $t
   return $t
 }
@@ -1227,8 +1234,9 @@ function Get-PanelAskInfo($a) {
   if ($null -eq $a) { return '' }
   $dl = $a['Deadline']
   if ($dl -is [DateTime]) {
-    $left = [int][Math]::Ceiling(($dl - [DateTime]::UtcNow).TotalSeconds)
-    return (T 'Using the default in {0} s' ([Math]::Max(0, $left)))
+    $left = [Math]::Max(0, [int][Math]::Ceiling(($dl - [DateTime]::UtcNow).TotalSeconds))
+    if ([string]$a['TimeoutLabel']) { return (T 'Answering "{0}" in {1} s' ([string]$a['TimeoutLabel']) $left) }
+    return (T 'Using the default in {0} s' $left)
   }
   switch ([string]$a['BackMode']) {
     'back' { return (T '  (Esc = back)').Trim() }
@@ -1246,6 +1254,7 @@ function Show-PanelAsk($a) {
   $q.AskView = $a
   $q.AskId = [string]$a['Id']
   $q.AskSent = ''
+  $q.AskDigits = ''
   $focus = $null
   $q.Ask.SuspendLayout()
   try {
@@ -1380,8 +1389,15 @@ function Show-PanelAsk($a) {
   $q.AskFocus = $focus
   Set-PanelAskWidths
   if (-not $q.Ask.Visible) { $q.Ask.Visible = $true; Update-PanelRows }
-  # Its answer box gets the focus inside this window only: never taking it from another program (VRChat).
-  if (Test-PanelActive) { Move-PanelAskFocus } else { $q.AskFocusPending = $true; Invoke-PanelAttention }
+  # Its answer box gets the focus inside this window only: never taking it from another program (VRChat), nor from the
+  # input box while the user types there (an Enter / Space / digit meant for the line would answer it unseen). The
+  # strip then waits for a click or Tab (its keys too: Invoke-PanelAskKey), and the input box gets the focus back
+  # when the question ends (InputParked, see Update-PanelView).
+  $fc = $null
+  try { $fc = Get-PanelFocus } catch {}
+  if ($fc -and $q.InputRow.Contains($fc)) { $q.Form.ActiveControl = $q.LinkBox; $q.InputParked = $true; $q.AskFocusPending = $true }
+  if (-not (Test-PanelActive)) { $q.AskFocusPending = $true; Invoke-PanelAttention }
+  elseif (-not $q.AskFocusPending) { Move-PanelAskFocus }
 }
 
 function Move-PanelAskFocus {
@@ -1443,6 +1459,8 @@ function Update-PanelAsk {
 function Invoke-PanelAskKey([System.Windows.Forms.Keys]$keyData) {
   $q = $script:Panel
   if ($null -eq $q -or -not $q.AskId -or -not $q.Ask.Enabled) { return $false }
+  # (A question that came while the user typed in the input box: its keys wait until the user is at the strip.)
+  if ($q.AskFocusPending -and -not $q.Ask.ContainsFocus) { return $false }
   $a = $q.AskView
   $K = [System.Windows.Forms.Keys]
   $code = $keyData -band $K::KeyCode
@@ -1459,12 +1477,25 @@ function Invoke-PanelAskKey([System.Windows.Forms.Keys]$keyData) {
     $d = -1
     if ($code -ge $K::D0 -and $code -le $K::D9) { $d = [int]$code - [int]$K::D0 }
     elseif ($code -ge $K::NumPad0 -and $code -le $K::NumPad9) { $d = [int]$code - [int]$K::NumPad0 }
-    if ($d -ge 1 -and $d -le @($a['Options']).Count) { [void](Send-PanelAnswer @{ Pick = ($d - 1) }); return $true }
-    if ($d -eq 0) {
-      if ([bool]$a['AllowNone']) { [void](Send-PanelAnswer @{ Pick = -1 }) }
-      elseif ($bm -eq 'back' -or $bm -eq 'leave') { Send-PanelAskNav 'back' }
+    if ($d -lt 0) { return $false }
+    # (10 options or more: a number of two digits as in the console. A digit that can start a larger number only
+    # selects its row; the next digit within a second, or Enter, answers.)
+    $num = $d
+    if ($q.AskDigits -and ([DateTime]::UtcNow - $q.AskDigitsAt).TotalMilliseconds -lt 1000) { $num = [int]($q.AskDigits + [string]$d) }
+    $q.AskDigits = ''
+    $n = @($a['Options']).Count
+    if ($num -ge 1 -and $num * 10 -le $n) {
+      $q.AskDigits = [string]$num
+      $q.AskDigitsAt = [DateTime]::UtcNow
+      if ($q.AskList) { $ix = [array]::IndexOf([int[]]$q.AskPicks, $num - 1); if ($ix -ge 0) { $q.AskList.SelectedIndex = $ix } }
       return $true
     }
+    if ($num -ge 1 -and $num -le $n) { [void](Send-PanelAnswer @{ Pick = ($num - 1) }); return $true }
+    if ($num -eq 0) {
+      if ([bool]$a['AllowNone']) { [void](Send-PanelAnswer @{ Pick = -1 }) }
+      elseif ($bm -eq 'back' -or $bm -eq 'leave') { Send-PanelAskNav 'back' }
+    }
+    return $true
   }
   return $false
 }

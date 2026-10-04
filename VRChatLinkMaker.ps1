@@ -1389,6 +1389,7 @@ function Select-Tracks($item) {
     # (Preparation has started: no Back goes past the queue insert. The two questions are a flow of their own that
     # can't be left: Back at subtitles returns to the audio track; Esc at the audio track does nothing.)
     Lock-NavStep
+    $tos = $script:AskTimeouts
     $tr = Invoke-NavFlow -Name 'tracks' -Own -Body {
       $ap = $aPos
       if ($audio.Count -gt 1) {
@@ -1410,7 +1411,8 @@ function Select-Tracks($item) {
     $p = [pscustomobject]@{ ALang = ''; ATitle = ''; APos = $aPos; SNone = ($sPos -lt 0); SLang = ''; STitle = ''; SSigns = $false; SPos = $sPos; SExternal = $false }
     if ($aPos -ge 0) { $p.ALang = $audio[$aPos].Lang; $p.ATitle = $audio[$aPos].Title }
     if ($sPos -ge 0) { $p.SLang = $subs[$sPos].Lang; $p.STitle = $subs[$sPos].Title; $p.SSigns = (Test-Signs $subs[$sPos]); $p.SExternal = ($subs[$sPos].Kind -eq 'external') }
-    $script:TrackPref = $p
+    # (Kept for the next videos only when someone answered: a question that timed out asks again next time.)
+    if ($script:AskTimeouts -eq $tos) { $script:TrackPref = $p }
   } elseif ($script:TrackPref) {
     $p = $script:TrackPref
     if ($audio.Count -gt 0) {
@@ -1814,6 +1816,15 @@ function Read-Entries([string]$Prefill = '') {
     }
     if (-not $keys) { $line = [string](Read-Host '>') }
     $script:EntryLine = $line
+    # A VPS connection code (it is a password: never search for it or print it): set up "My VPS" with it. A code a chat
+    # wrapped over several lines (pasted in the control window) is one code, as Read-PastedRest joins it in the console.
+    if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
+      $script:EntryLine = ''
+      $line = (@($line -split "`r?`n") | ForEach-Object { $_.Trim() }) -join ''
+      $line += Read-PastedRest
+      if ($hostKeys) { Use-VpsCode $line } else { Say (T '  That is a VPS connection code: paste it in the window that streams (H -> My VPS).') 'Yellow' }
+      continue
+    }
     # Several lines at once (a list of links pasted or dropped in the control window): each a link or a path; of the
     # titles among them only the first one is searched for.
     $lns = @(@($line -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1833,13 +1844,6 @@ function Read-Entries([string]$Prefill = '') {
     }
     # Q + Enter (or "quit"; on a Russian keyboard layout the Q key types U+0439) = end.
     if ($line -match '^\s*(?:q|quit|\u0439)\s*$') { return @($script:QuitMark) }
-    # A VPS connection code (it is a password: never search for it or print it): set up "My VPS" with it.
-    if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
-      $script:EntryLine = ''
-      $line += Read-PastedRest
-      if ($hostKeys) { Use-VpsCode $line } else { Say (T '  That is a VPS connection code: paste it in the window that streams (H -> My VPS).') 'Yellow' }
-      continue
-    }
     # The menu letters (Get-MenuItems): H / V / T / N / L, and M = the settings menu.
     $mi = Get-MenuItemFor $line
     if ($mi -and -not $add -and (Test-MenuItemOn $mi)) { Invoke-MenuAction $mi.Id; continue }
@@ -2285,9 +2289,13 @@ function Get-PlayerPref($item) {
   Say ''
   # (Asked while preparing: a one-off question, Esc = Auto. No Back goes past the queue insert.)
   Lock-NavStep
+  $tos = $script:AskTimeouts
   $i = Read-Choice (T 'Which player should the video come from?') $opts 0 $false -Key 'player' -Values (@('auto') + @($provs | ForEach-Object { [string]$_ })) -Esc 0
-  if ($i -le 0) { $script:PlayerPref = 'auto' } else { $script:PlayerPref = [string]$provs[$i - 1] }
-  return $script:PlayerPref
+  $pick = 'auto'
+  if ($i -gt 0) { $pick = [string]$provs[$i - 1] }
+  # (Kept for the session only when someone answered: a question that timed out asks again next time.)
+  if ($script:AskTimeouts -eq $tos) { $script:PlayerPref = $pick }
+  return $pick
 }
 
 # A second window (it hands what it found to the streaming one, which can't ask while a video plays) asks here which
@@ -3417,7 +3425,7 @@ function Test-NavKeyWaiting {
 function Read-NavKey {
   if ($script:NavKeyAhead.Count -gt 0) { $k = $script:NavKeyAhead[0]; $script:NavKeyAhead.RemoveAt(0); return $k }
   if ($script:KeySource) { return (& $script:KeySource 'read') }
-  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Update-NavKeyUp; Start-Sleep -Milliseconds 40 }
+  while (-not [Console]::KeyAvailable) { Invoke-PanelPump; Update-NavKeyUp; Update-AskLeases; Start-Sleep -Milliseconds 40 }
   return [Console]::ReadKey($true)
 }
 
@@ -3635,7 +3643,8 @@ function Publish-UiAsk($a, [bool]$canHome = $false) {
   if ($kind -eq 'yesno') { $title = $title -replace '\s*\[[^\[\]]{1,8}/[^\[\]]{1,8}\]\s*:?\s*$', '' }
   $v = @{ Id = [string]$a.Id; Kind = $kind; Title = $title.Trim(); Options = [string[]]@(); AllowNone = $false; NoneLabel = ''; Default = $null
     Prev = $null; Crumb = ([string]$a.Crumb).Trim(); BackMode = [string]$a.BackMode; CanBack = [bool]$a.CanBack; BackLabel = [string]$a.BackLabel
-    CanHome = $canHome; EscLabel = ''; CanForward = [bool]$a.CanForward; Secret = [bool]$a.Secret; Prefill = ''; All = ''; Deadline = $a.Deadline }
+    CanHome = $canHome; EscLabel = ''; CanForward = [bool]$a.CanForward; Secret = [bool]$a.Secret; Prefill = ''; All = ''; Deadline = $a.Deadline; TimeoutLabel = '' }
+  if ($a.TimeoutEsc) { try { $v.TimeoutLabel = [string](Get-AskEscValue $a).Label } catch {} }
   if ($a.BackMode -eq 'esc') { try { $v.EscLabel = [string](Get-AskEscValue $a).Label } catch {} }
   if ($kind -eq 'choice') {
     $v.Options = [string[]]@(@($a.Options) | ForEach-Object { [string]$_ })
@@ -3685,6 +3694,7 @@ function Clear-UiAsk([string]$id) {
 # install asked meanwhile: $script:PrepAsk) takes its suggested answer after "AskTimeoutSec" (config.json; 60, 0 = never)
 # seconds: whoever is in VR isn't kept waiting. Startup and menu questions wait as long as it takes. -> seconds, 0 = none.
 $script:PrepAsk = $false
+$script:AskTimeouts = 0   # questions that took their answer by themselves (Read-AskAnswer)
 function Get-AskTimeout {
   if (-not $script:PrepAsk -or -not (Test-RelayAlive)) { return 0 }
   return [int](Get-NumSetting 'AskTimeoutSec' 60 0 86400)
@@ -4105,9 +4115,12 @@ function Invoke-Ask($a) {
   Show-AskBody $a
   $limit = Get-AskTimeout
   $a.Deadline = $null
+  # (A yes / no with its own Esc answer - a consent: install, download - takes that one, never a yes nobody gave.)
+  $a.TimeoutEsc = ($a.Kind -eq 'yesno' -and [bool]$a.HasEsc)
   if ($limit -gt 0) {
     $a.Deadline = [DateTime]::UtcNow.AddSeconds($limit)
-    Show-NavHint (T '  (No answer in {0} s = the suggested answer.)' $limit)
+    if ($a.TimeoutEsc) { Show-NavHint (T '  (No answer in {0} s = {1}.)' $limit (Get-AskEscValue $a).Label) }
+    else { Show-NavHint (T '  (No answer in {0} s = the suggested answer.)' $limit) }
   }
   # (The control window shows it too, until it ends in any way: answered here or there, Back, Ctrl+C, End stream. Should
   # that copy fail, the console still asks: the window just doesn't show it.)
@@ -4126,7 +4139,9 @@ function Read-AskAnswer($a, [bool]$step, [bool]$sealed, $f, [bool]$rej, [int]$li
   while ($true) {
     $reply = Read-AskReply $a
     $res = Resolve-AskReply $a $reply
+    if ($reply.Timeout -and $a.TimeoutEsc) { $res = Get-AskEscValue $a }
     if ($res.Act -eq 'value' -and $reply.Timeout) {
+      $script:AskTimeouts++   # (not a choice to keep for the session: Select-Tracks, Get-PlayerPref)
       $lab = [string]$res.Label
       if ($a.Secret -or $a.Private) { $lab = '***' }
       Say (T 'No answer in {0} s - used: {1}' $limit $lab) 'Yellow'
@@ -5619,7 +5634,7 @@ function Invoke-Source {
       if ($nx) {
         $idleSince = $now
         $script:PromptOk = $script:Interactive
-        $script:PrepAsk = $true
+        $script:PrepAsk = -not $script:ChoosingMode   # (startup questions never time out)
         try { Step-Prep $nx } finally { $script:PromptOk = $false; $script:PrepAsk = $false }
         if ($nx.State -eq 'ready' -or $nx.State -eq 'failed') { $requested = 'ready'; Stop-Proc $proc; $quitSentAt = $now }
       } elseif (($now - $idleSince).TotalMinutes -ge $script:IdleMinutes) {
@@ -5954,7 +5969,7 @@ function Invoke-Queue {
       $ask = $script:ChoosingMode -and $script:Interactive
       if ($ask -and (Test-RelayAlive)) { Start-Standby }
       $script:PromptOk = $ask
-      $script:PrepAsk = $true
+      $script:PrepAsk = -not $script:ChoosingMode   # (startup questions never time out)
       try { Step-Prep $cur } finally { $script:PromptOk = $false; $script:PrepAsk = $false }
       $curDone = ($cur.State -eq 'ready' -or $cur.State -eq 'failed')
     }
@@ -6362,7 +6377,7 @@ function Start-HostServer {
   }
   try { $r = Update-DuckDns $s; if ($r) { Say ('  ' + $r) 'Gray' } } catch {}
   if ([bool](Get-Prop $s 'Firewall') -or $null -eq (Get-Prop $s 'Firewall')) {
-    try { [void](Enable-SelfHostFirewall $exe $ports) } catch { Say $_.Exception.Message 'Yellow' }
+    try { [void](Enable-SelfHostFirewall $exe $ports) } catch { if ($script:CtrlCQuit) { throw }; Say $_.Exception.Message 'Yellow' }
   }
   $up = Get-Prop $s 'Upnp'
   if (-not ($cg -and $cg.Verdict -eq 'cgnat')) {

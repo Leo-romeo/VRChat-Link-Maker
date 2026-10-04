@@ -3386,6 +3386,7 @@ function Measure-PushSpeed([string]$url, [string]$fmt, [int]$kbps, [int]$seconds
       $res.Error = Hide-UrlSecrets $last.Trim()   # (ffmpeg's message may contain the link with its password)
     }
   } catch {
+    if ($script:CtrlCQuit) { throw }   # (Ctrl+C, End stream in the control window: Wait-HostPump)
     $res.Error = Hide-UrlSecrets $_.Exception.Message
   } finally {
     if ($p) { Stop-Proc $p }
@@ -3466,6 +3467,7 @@ function Measure-UploadSpeed([long]$maxBytes = 40MB, [int]$conns = 4, [int]$time
       if ($e.Count -gt 0) { $res.Error = $e[0] } else { $res.Error = T 'no answer' }
     }
   } catch {
+    if ($script:CtrlCQuit) { throw }
     $res.Error = $_.Exception.Message
   } finally {
     foreach ($j in $jobs) { try { $j.Ps.Stop() } catch {}; try { $j.Ps.Dispose() } catch {} }

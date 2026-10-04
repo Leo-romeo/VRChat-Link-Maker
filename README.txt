@@ -186,9 +186,11 @@ At the top:
                    Forward > and Cancel where the console has them. Answer
                    either here or in the console: the first answer counts.
                    Enter = OK, Esc = what Esc does in the console, Alt+Left =
-                   back, Alt+Right = forward, 1-9 pick an option. When the
-                   window is behind another one (VRChat), its taskbar button
-                   flashes and a short sound plays; it never takes the focus.
+                   back, Alt+Right = forward, a number picks an option (12 =
+                   1 then 2). A question that comes while you type in the
+                   input box waits for a click or Tab. When the window is
+                   behind another one (VRChat), its taskbar button flashes
+                   and a short sound plays; it never takes the focus.
                    Questions about the next video while viewers wait (which
                    audio / subtitles, which player) take the suggested answer
                    after 60 seconds (AskTimeoutSec); the strip counts down.
@@ -502,7 +504,8 @@ All of these are optional.
   ControlWindow       true (the default) opens the control window.
   AskTimeoutSec       60. A question about the next video asked while viewers
               wait (audio / subtitles, which player, installing yt-dlp) takes
-              the suggested answer after this many seconds. 0 = wait forever.
+              the suggested answer after this many seconds (an install:
+              No), for that video only. 0 = wait forever.
               Questions on the start screen and in Settings always wait.
   WorldPlayerControl  true (the default) lets the world's video player pause /
               continue / skip (see above). false turns that off.

@@ -836,6 +836,8 @@
   "No answer in {0} s - used: {1}": "Нет ответа {0} с - выбрано: {1}",
   "Where to stream, picture size, speed test, new link, language, log.txt and End stream. The stream settings work while nothing plays; their questions show here and in the console window.": "Куда транслировать, размер картинки, проверка скорости, новая ссылка, язык, log.txt и завершение трансляции. Настройки трансляции работают, пока ничего не играет; их вопросы появляются здесь и в окне консоли.",
   "Using the default in {0} s": "Ответ по умолчанию через {0} с",
+  "Answering \"{0}\" in {1} s": "Ответ «{0}» через {1} с",
+  "  (No answer in {0} s = {1}.)": "  (Без ответа {0} с = {1}.)",
   "(Esc = {0})": "(Esc = {0})",
   "Yes": "Да",
   "No": "Нет",
