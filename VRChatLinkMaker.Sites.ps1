@@ -21,7 +21,8 @@
 #   Get-KodikEpisodes  [string]$playerUrl, [string]$referer          -> [pscustomobject] Seasons, Episodes, Translations, ...
 #
 # Flow (verified 2026-09-27):
-#   player page  GET https://kodikplayer.com/{seria|serial|video}/<id>/<hash>/720p?...   (Referer = embedding site, optional)
+#   player page  GET https://kodikplayer.com/{seria|serial|season|video}/<id>/<hash>/720p?...   (Referer = embedding site, optional;
+#                /season/ = one season of a series, YummyAnime's links: with only_episode=true&episode=N it is that episode)
 #     -> var urlParams = '{"d":..,"d_sign":..,"pd":..,"pd_sign":..,"ref":..,"ref_sign":..}' ; vInfo.type/hash/id ;
 #        <script src="/assets/js/app.player_single.<sha>.js">
 #   player JS    -> POST endpoint hidden as $.ajax({type:"POST",url:atob("L2Z0b3I=")...}) = "/ftor" ; decode shift "charCodeAt(0)+18"
@@ -54,9 +55,9 @@ function Test-KodikUrl([string]$url) {
   if (-not $url) { return $false }
   try { $u = [Uri](ConvertTo-KodikAbsoluteUrl $url) } catch { return $false }
   # any host with the Kodik path shape (Kodik rotates mirror domains), or a known Kodik host with find-player
-  if ($u.AbsolutePath -match '(?i)^/(seria|serial|video)/\d+/[0-9a-f]{32}/\d+p') { return $true }
+  if ($u.AbsolutePath -match '(?i)^/(seria|serial|season|video)/\d+/[0-9a-f]{32}/\d+p') { return $true }
   $hostOk = $u.Host -match '(?i)(^|\.)(kodik[a-z0-9-]*\.[a-z]+|aniqit\.com)$'
-  $pathOk = $u.AbsolutePath -match '(?i)^/(seria|serial|video)/\d+/[0-9a-f]{16,}(/|$)' -or $u.AbsolutePath -match '(?i)^/find-player'
+  $pathOk = $u.AbsolutePath -match '(?i)^/(seria|serial|season|video)/\d+/[0-9a-f]{16,}(/|$)' -or $u.AbsolutePath -match '(?i)^/find-player'
   return ($hostOk -and $pathOk)
 }
 
@@ -1690,10 +1691,25 @@ function Resolve-Cvh {
   $pUrl = ConvertTo-AbsoluteUrl $playerUrl.Trim() 'https://animego.me/'
 
   $titleId = $null; $sn = 0; $ep = 0; $voice = $null
+  # YummyAnime's iframe  //ru.yummyani.me/iframeCVH.html?dubbing_code=<CVH voice name, e.g. AnilibriaTV>&anime_id=<Shikimori
+  #   id>&episode=<n>&dubbing=<its own label>  builds <video-player data-aggregator="mali" data-publisher-id=745 ...> in
+  # JavaScript, so there is no page to read: the values come from the query. Publisher 745 (YummyAnime) and 747 (AnimeGO)
+  # listed the same voice-overs (Frieren, checked 2026-10-04); 747 is the fallback.
+  $yummy = ($pUrl -match '(?i)/iframeCVH\.html\?')
+  $voiceAlt = $null
   # FIX (verifier): newer AnimeGO titles use a path style  /cdn-iframe/<id>/<dubbing>/<season>/<episode>
   # (e.g. //animego.me/cdn-iframe/61316/Dream Cast/4/1, no ?dubbing=); the old regex only got the id from those.
   $m = [regex]::Match($pUrl, '(?i)/cdn-iframe/(\d+)/([^/?#]*[^/?#\d][^/?#]*)/(\d+)/(\d+)')
-  if ($m.Success) {
+  if ($yummy) {
+    $titleId = Get-QueryParam $pUrl 'anime_id'
+    if ($titleId -notmatch '^\d+$') { $titleId = $null }
+    $e = Get-QueryParam $pUrl 'episode'
+    if ($e -match '^\d{1,6}$') { $ep = [int]$e }
+    if ($ep -le 0 -and $Episode -le 0) { throw "CVH: no usable episode number in '$playerUrl' (episode=$e)" }   # (not "episode 1")
+    $voice = Get-QueryParam $pUrl 'dubbing_code'
+    $lab = Get-QueryParam $pUrl 'dubbing'
+    if ($lab) { $voiceAlt = ConvertTo-YummyDubName $lab }
+  } elseif ($m.Success) {
     $titleId = $m.Groups[1].Value
     try { $voice = [Uri]::UnescapeDataString($m.Groups[2].Value) } catch { $voice = $m.Groups[2].Value }
     $sn = [int]$m.Groups[3].Value; $ep = [int]$m.Groups[4].Value
@@ -1705,16 +1721,19 @@ function Resolve-Cvh {
       elseif ($m.Groups[2].Success) { $ep = [int]$m.Groups[2].Value }
     }
   }
-  $q = Get-QueryParam $pUrl 'dubbing'
-  if ($q) { $voice = $q }
+  if (-not $yummy) {
+    $q = Get-QueryParam $pUrl 'dubbing'
+    if ($q) { $voice = $q }
+  }
   $pub = '747'; $aggr = 'mali'
+  if ($yummy) { $pub = '745' }
 
   # Read the iframe for the real publisher/aggregator/title/episode (falls back to AnimeGO's known values).
   $origin = 'https://animego.me'
   try {
     $u = New-Object Uri($pUrl)
     $origin = $u.Scheme + '://' + $u.Host
-    if ($NoPage) { throw 'no page' }
+    if ($NoPage -or $yummy) { throw 'no page' }
     $h = @{}
     if ($referer) { $h['Referer'] = $referer }
     $page = Invoke-Web -Url $pUrl -Headers $h -TimeoutSec 20
@@ -1735,55 +1754,69 @@ function Resolve-Cvh {
   if ($ep -le 0) { $ep = 1 }
 
   $api = 'https://plapi.cdnvideohub.com/api/v1/player/sv'
-  $apiHeaders = @{ 'Accept' = 'application/json'; 'Origin' = $origin; 'Referer' = $origin + '/' }
-  $q = 'pub=' + [Uri]::EscapeDataString($pub) + '&aggr=' + [Uri]::EscapeDataString($aggr) + '&id=' + [Uri]::EscapeDataString($titleId) + '&ep=' + $ep
-  if ($sn -gt 0) { $q += '&sn=' + $sn }
-  $pl = $null
-  for ($try = 0; $try -lt 3; $try++) {
-    try { $pl = Invoke-Web -Url ($api + '/playlist?' + $q) -Headers $apiHeaders -TimeoutSec 20 } catch { $pl = $null }
-    if ($pl -and ($pl.Status -eq 200 -or $pl.Status -eq 204)) { break }
-    Start-Sleep -Seconds 2
-  }
-  if (-not $pl) { throw 'CVH: plapi.cdnvideohub.com is unreachable' }
-  if ($pl.Status -eq 204) { throw "CVH: no content for title $titleId (publisher $pub, aggregator $aggr)" }
-  if ($pl.Status -ne 200) { throw "CVH: playlist API returned HTTP $($pl.Status) for title $titleId" }
-  $data = ConvertFrom-JsonDict $pl.Text
-  if ($data -isnot [System.Collections.IDictionary]) { throw 'CVH: unexpected playlist response' }
-  if ($data.ContainsKey('tags') -and $data['tags'] -and (@($data['tags']) -contains 5)) { throw "CVH: title $titleId is blocked (tag Blocked)" }
+  # A YummyAnime link: its publisher first, then AnimeGO's (it lists the same Shikimori ids) when that one doesn't have
+  # the episode or the voice-over.
+  $pubs = @(@{ Pub = $pub; Origin = $origin })
+  if ($yummy) { $pubs += @{ Pub = '747'; Origin = 'https://animego.me' } }
+  $pick = $null; $epItems = @(); $data = $null; $apiHeaders = $null; $firstErr = $null; $hard = $false
+  for ($pubIdx = 0; $pubIdx -lt $pubs.Count; $pubIdx++) {
+    $pub = $pubs[$pubIdx].Pub; $origin = $pubs[$pubIdx].Origin
+    try {
+      $apiHeaders = @{ 'Accept' = 'application/json'; 'Origin' = $origin; 'Referer' = $origin + '/' }
+      $q = 'pub=' + [Uri]::EscapeDataString($pub) + '&aggr=' + [Uri]::EscapeDataString($aggr) + '&id=' + [Uri]::EscapeDataString($titleId) + '&ep=' + $ep
+      if ($sn -gt 0) { $q += '&sn=' + $sn }
+      $pl = $null
+      for ($try = 0; $try -lt 3; $try++) {
+        try { $pl = Invoke-Web -Url ($api + '/playlist?' + $q) -Headers $apiHeaders -TimeoutSec 20 } catch { $pl = $null }
+        if ($pl -and ($pl.Status -eq 200 -or $pl.Status -eq 204)) { break }
+        Start-Sleep -Seconds 2
+      }
+      # (Both publishers are on that host: an outage or an HTTP error is not worth asking the other one.)
+      if (-not $pl) { $hard = $true; throw 'CVH: plapi.cdnvideohub.com is unreachable' }
+      if ($pl.Status -eq 204) { throw "CVH: no content for title $titleId (publisher $pub, aggregator $aggr)" }
+      if ($pl.Status -ne 200) { $hard = $true; throw "CVH: playlist API returned HTTP $($pl.Status) for title $titleId" }
+      $data = ConvertFrom-JsonDict $pl.Text
+      if ($data -isnot [System.Collections.IDictionary]) { throw 'CVH: unexpected playlist response' }
+      if ($data.ContainsKey('tags') -and $data['tags'] -and (@($data['tags']) -contains 5)) { throw "CVH: title $titleId is blocked (tag Blocked)" }
 
-  $items = @()
-  foreach ($it in @($data['items'])) {
-    if ($it -isnot [System.Collections.IDictionary]) { continue }
-    $vk = 0.0
-    if (-not ($it.ContainsKey('vkId') -and [double]::TryParse([string]$it['vkId'], [ref]$vk) -and $vk -gt 0)) { continue }
-    $items += $it
-  }
-  if ($items.Count -eq 0) { throw "CVH: playlist for title $titleId has no playable items" }
+      $items = @()
+      foreach ($it in @($data['items'])) {
+        if ($it -isnot [System.Collections.IDictionary]) { continue }
+        $vk = 0.0
+        if (-not ($it.ContainsKey('vkId') -and [double]::TryParse([string]$it['vkId'], [ref]$vk) -and $vk -gt 0)) { continue }
+        $items += $it
+      }
+      if ($items.Count -eq 0) { throw "CVH: playlist for title $titleId has no playable items" }
 
-  $epItems = @($items | Where-Object { [int]$_['episode'] -eq $ep -or (-not $_.ContainsKey('episode') -and $ep -eq 1) })
-  if ($sn -gt 0) {
-    $bySeason = @($epItems | Where-Object { [int]$_['season'] -eq $sn })
-    if ($bySeason.Count -gt 0) { $epItems = $bySeason }
-    else {
-      $seasons = @($epItems | ForEach-Object { [int]$_['season'] } | Select-Object -Unique)
-      if ($seasons.Count -gt 1) { throw "CVH: season $sn episode $ep not found (title $titleId has seasons $($seasons -join ', '))" }
-    }
-  }
-  if ($epItems.Count -eq 0) {
-    $eps = @($items | ForEach-Object { [int]$_['episode'] } | Sort-Object -Unique)
-    throw "CVH: episode $ep not found for title $titleId (available near it: $($eps -join ', '))"
-  }
+      $epItems = @($items | Where-Object { [int]$_['episode'] -eq $ep -or (-not $_.ContainsKey('episode') -and $ep -eq 1) })
+      if ($sn -gt 0) {
+        $bySeason = @($epItems | Where-Object { [int]$_['season'] -eq $sn })
+        if ($bySeason.Count -gt 0) { $epItems = $bySeason }
+        else {
+          $seasons = @($epItems | ForEach-Object { [int]$_['season'] } | Select-Object -Unique)
+          if ($seasons.Count -gt 1) { throw "CVH: season $sn episode $ep not found (title $titleId has seasons $($seasons -join ', '))" }
+        }
+      }
+      if ($epItems.Count -eq 0) {
+        $eps = @($items | ForEach-Object { [int]$_['episode'] } | Sort-Object -Unique)
+        throw "CVH: episode $ep not found for title $titleId (available near it: $($eps -join ', '))"
+      }
 
-  $pick = $null
-  if ($voice) {
-    $pick = Find-CvhItem $epItems $voice
-    if (-not $pick) {
-      $names = @($epItems | ForEach-Object { if ($_['voiceStudio']) { $_['voiceStudio'] } else { '(' + $_['voiceType'] + ')' } })
-      throw "CVH: dub '$voice' not available for episode $ep; available: $($names -join ', ')"
-    }
-  } else {
-    $pick = $epItems | Where-Object { $_['voiceStudio'] } | Select-Object -First 1
-    if (-not $pick) { $pick = $epItems[0] }
+      $pick = $null
+      if ($voice -or $voiceAlt) {
+        if ($voice) { $pick = Find-CvhItem $epItems $voice }
+        if (-not $pick -and $voiceAlt) { $pick = Find-CvhItem $epItems $voiceAlt }
+        if (-not $pick) {
+          $names = @($epItems | ForEach-Object { if ($_['voiceStudio']) { $_['voiceStudio'] } else { '(' + $_['voiceType'] + ')' } })
+          $want = $voice; if (-not $want) { $want = $voiceAlt }
+          throw "CVH: dub '$want' not available for episode $ep (publisher $pub); available: $($names -join ', ')"
+        }
+      } else {
+        $pick = $epItems | Where-Object { $_['voiceStudio'] } | Select-Object -First 1
+        if (-not $pick) { $pick = $epItems[0] }
+      }
+      break
+    } catch { if (-not $firstErr) { $firstErr = $_ }; if ($hard -or $pubIdx -ge $pubs.Count - 1) { throw $firstErr } }
   }
 
   $vkId = [string]$pick['vkId']
@@ -4381,6 +4414,344 @@ function Test-WebFileThere([string]$url) {
 }
 
 # ==================================================================================================
+# YummyAnime: a catalogue of every voice-over, with the players each episode has, a free JSON API (checked 2026-10-04)
+# ==================================================================================================
+# Search  GET <api>/search?q=<text>&limit=8  -> {response:[{anime_id, anime_url (alias), title (Russian), year,
+#           type{alias: tv|movie|ova|special|ona}, anime_status{alias: released|ongoing|announcement},
+#           remote_ids{shikimori_id, kp_id, anilibria_alias}, blocked_in[]}]}   (no episode counts, no other titles)
+# Title   GET <api>/anime/<id or alias>?need_videos=true  -> {response:{anime_id, anime_url, title, other_titles[], type,
+#           year, episodes{count}, remote_ids, videos:[{number (text), duration (s, 0 = not known), iframe_url,
+#           data{player_id, dubbing}}]}}  (one call for everything; /anime/<id>/videos has the same list).
+#           Unknown id: HTTP 404 {"error_code":4}. Every answer is wrapped as {"response": ...}.
+# data.dubbing: "Ozvuchka <team>" (voice-over), "Subtitry <team>" (subtitles), "Dublyazh <studio>" (official dub), in
+#   Russian; the same label on every player of that voice-over.
+# Players (data.player_id): 4 Kodik (//kodikplayer.com/season/<id>/<hash>/720p?..&only_episode=true&episode=N, films
+#   /video/), 3 CVH (//ru.yummyani.me/iframeCVH.html?dubbing_code=..&anime_id=<Shikimori id>&episode=N: see Resolve-Cvh),
+#   2 Alloha (//alloha.yani.tv/?token_movie=..&translation=..&season=..&episode=..&token=..), 7 Sibnet
+#   (//video.sibnet.ru/shell.php?videoid=N), 1 Aksor (a player that only works in a browser: left out).
+# Season, special and ONA are separate titles; "season" in the answer is the calendar quarter. Episode numbers of one
+# voice-over can differ between players (Mushoku Tensei S2: Kodik 0-12, CVH 1-12): see Get-YummyAligned.
+# The API needs no token so far (its docs ask for one in X-Application): "YummyAppToken" in config.json is sent when set.
+# The link the tool hands out and understands: https://api.yani.tv/anime/<id> (the site's own domain changes); the
+# site's https://<site>/catalog/item/<alias> links work too.
+$script:YummyApi = 'https://api.yani.tv'
+$script:YummyReferer = 'https://yummyanime.tv/'          # Kodik (Yummy's Kodik links are registered to yummyanime.tv)
+$script:YummyAllohaReferer = 'https://ru.yummyani.me/'   # Alloha (the site the player is embedded in today)
+$script:YummyLinkRe = '^(?i)https?://(?:[a-z0-9-]+\.)*(?:yummy-?ani(?:me)?\.[a-z]+|yani\.tv)/(?:catalog/item|anime)/([a-z0-9-]+)'
+$script:YummyTitles = @{}   # id / alias -> @{ At; Title } (read this session, kept 30 minutes)
+$script:YummyPlayers = @{ 4 = 'kodik'; 3 = 'cvh'; 2 = 'alloha'; 7 = 'sibnet' }
+$script:YummyPlayerOrder = @('kodik', 'cvh', 'alloha', 'sibnet')
+
+function Test-YummyUrl([string]$u) { return ([string]$u -match $script:YummyLinkRe) }
+
+# The id or alias a link names ("...-2026-10-04": the date the site adds to its links is not part of the alias).
+function Get-YummyKey([string]$u) {
+  $k = [regex]::Match($u, $script:YummyLinkRe).Groups[1].Value.ToLowerInvariant()
+  if ($k -notmatch '^\d+$') { $k = $k -replace '-\d{4}-\d{2}-\d{2}$', '' }
+  return $k
+}
+
+function Get-YummyHeaders {
+  $h = @{ 'Accept' = 'application/json'; 'Lang' = 'ru' }
+  $tok = ''
+  if ($script:Cfg) { $tok = ([string](Get-Prop $script:Cfg 'YummyAppToken')).Trim() }
+  if ($tok) { $h['X-Application'] = $tok }
+  return $h
+}
+
+function Get-YummySearchRequest([string]$query, [int]$timeoutSec) {
+  return @{ Url = $script:YummyApi + '/search?q=' + [Uri]::EscapeDataString($query) + '&limit=8'; Headers = (Get-YummyHeaders); TimeoutSec = $timeoutSec }
+}
+
+function Get-YummyVal($d, [string]$a, [string]$b) {
+  if ($d -isnot [System.Collections.IDictionary]) { return $null }
+  $x = $d[$a]
+  if (-not $b) { return $x }
+  if ($x -isnot [System.Collections.IDictionary]) { return $null }
+  return $x[$b]
+}
+
+# A number from the answer as text, '' when it is missing or 0.
+function Get-YummyId($v) {
+  $s = [string]$v
+  if ($s -match '^\d+$' -and $s -ne '0') { return $s }
+  return ''
+}
+
+function ConvertTo-YummyKind([string]$alias) {
+  if ($alias -eq 'tv') { return (T 'series') }
+  if ($alias -eq 'movie') { return (T 'film') }
+  if ($alias -eq 'special') { return (T 'special') }
+  return $alias.ToUpperInvariant()
+}
+
+function ConvertFrom-YummySearch([string]$text, [string]$query) {
+  $j = ConvertFrom-JsonDict $text
+  if ($j -isnot [System.Collections.IDictionary] -or -not $j.ContainsKey('response')) { throw 'bad answer' }
+  $rows = @()
+  foreach ($x in @($j['response'])) {
+    if ($x -isnot [System.Collections.IDictionary]) { continue }
+    $id = Get-YummyId $x['anime_id']
+    if (-not $id) { continue }
+    if ([string](Get-YummyVal $x 'anime_status' 'alias') -eq 'announcement') { continue }   # nothing to watch yet
+    $title = ([string]$x['title']).Trim()
+    if (-not $title) { continue }
+    $words = (([string]$x['anime_url']) -replace '[-_]+', ' ').Trim()   # (the alias in Latin letters, a weak extra key)
+    $year = Get-YummyId $x['year']
+    $r = New-SearchRow 'yummy' $id $title $year (ConvertTo-YummyKind ([string](Get-YummyVal $x 'type' 'alias'))) '' ($script:YummyApi + '/anime/' + $id) @($title, $words)
+    $sid = Get-YummyId (Get-YummyVal $x 'remote_ids' 'shikimori_id')
+    if ($sid) { $r.ShikiId = $sid }
+    $rows += $r
+  }
+  return @(Sort-SearchRows $rows $query)
+}
+
+# A voice-over's name as shown and matched: "Ozvuchka X" -> "X", "Subtitry X" -> "X (subtitles)" (the marker AnimeLib's
+# names use: see Format-DubName), anything else as it is ("Dublyazh X" stays, so DubPriority's "official" finds it).
+function ConvertTo-YummyDubName([string]$raw) {
+  $t = ([string]$raw).Trim()
+  $m = [regex]::Match($t, '^(?i)\u043e\u0437\u0432\u0443\u0447\u043a\u0430\s+(.+)$')
+  if ($m.Success) { return $m.Groups[1].Value.Trim() }
+  $m = [regex]::Match($t, '^(?i)\u0441\u0443\u0431\u0442\u0438\u0442\u0440\u044b\s+(.+)$')
+  if ($m.Success) { return $m.Groups[1].Value.Trim() + ' (subtitles)' }
+  return $t
+}
+
+# The videos of an answer: Number (text), Player ('kodik' | 'cvh' | 'alloha' | 'sibnet'), Url (https:), DubRaw (the
+# site's label), Dub (ConvertTo-YummyDubName), Duration (s, 0 = not known). Aksor and unknown players are left out.
+function ConvertFrom-YummyVideos($list) {
+  # (A long show lists thousands of videos: kept cheap, no function calls per video.)
+  $out = New-Object System.Collections.ArrayList
+  $names = New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal)   # label -> name
+  $inv = [System.Globalization.CultureInfo]::InvariantCulture
+  foreach ($v in @($list)) {
+    if ($v -isnot [System.Collections.IDictionary]) { continue }
+    $d = $v['data']
+    if ($d -isnot [System.Collections.IDictionary]) { continue }
+    $plId = 0
+    if (-not [int]::TryParse([string]$d['player_id'], [ref]$plId) -or -not $script:YummyPlayers.ContainsKey($plId)) { continue }
+    $prov = $script:YummyPlayers[$plId]
+    $url = ([string]$v['iframe_url']).Trim()
+    if ($url.StartsWith('//')) { $url = 'https:' + $url }
+    if ($prov -eq 'kodik') { if ($url -notmatch '^(?i)https?://[^/?#]+/(?:seria|serial|season|video)/\d+/[0-9a-f]{16,}') { continue } }
+    elseif ($prov -eq 'sibnet') { if ($url -notmatch '^(?i)https?://[^?#]*\?(?:.*&)?videoid=\d+') { continue } }
+    elseif ($prov -eq 'cvh') { if ($url -notmatch '^(?i)https?://[^?#]+/iframeCVH\.html\?.*anime_id=\d+') { continue } }
+    elseif ($url -notmatch '^(?i)https?://') { continue }
+    $num = ([string]$v['number']).Trim()
+    if ($num -notmatch '^\d+(\.\d+)?$') { continue }
+    if ($num.Length -gt 1 -and $num.StartsWith('0') -and $num -notmatch '^0\.') { $num = ([double]$num).ToString($inv) }   # ("01" -> "1")
+    $raw = ([string]$d['dubbing']).Trim()
+    if (-not $raw) { continue }
+    $dub = $names[$raw]
+    if ($null -eq $dub) { $dub = ConvertTo-YummyDubName $raw; $names[$raw] = $dub }
+    $dur = 0.0
+    [void][double]::TryParse([string]$v['duration'], [System.Globalization.NumberStyles]::Float, $inv, [ref]$dur)
+    [void]$out.Add([pscustomobject]@{ Number = $num; Player = $prov; Url = $url; DubRaw = $raw; Dub = $dub; Duration = $dur })
+  }
+  return , $out.ToArray()
+}
+
+# The /anime answer -> Id, Alias, Title, Names (title + other titles), Type (tv, movie, ...), Year, EpCount, ShikiId,
+# KpId, AnilibriaAlias, Videos ($null when the answer has none: ask /videos).
+function ConvertFrom-YummyTitle([string]$text) {
+  $j = ConvertFrom-JsonDict $text
+  if ($j -isnot [System.Collections.IDictionary]) { throw 'YummyAnime: unexpected answer' }
+  if ($j.ContainsKey('error')) {
+    if ([string]$j['error_code'] -eq '4') { throw 'YummyAnime: 404 (no such title)' }
+    throw ('YummyAnime: ' + [string]$j['error'])
+  }
+  $x = $j['response']
+  if ($x -isnot [System.Collections.IDictionary]) { throw 'YummyAnime: unexpected answer' }
+  $id = Get-YummyId $x['anime_id']
+  if (-not $id) { throw 'YummyAnime: unexpected answer (no id)' }
+  $title = ([string]$x['title']).Trim()
+  $names = @(@($title) + @(@($x['other_titles']) | ForEach-Object { ([string]$_).Trim() }) | Where-Object { $_ } | Select-Object -Unique)
+  if (-not $title -and $names.Count -gt 0) { $title = $names[0] }
+  $videos = $null
+  if ($null -ne $x['videos']) { $videos = ConvertFrom-YummyVideos $x['videos'] }
+  return [pscustomobject]@{
+    Id = $id; Alias = [string]$x['anime_url']; Title = $title; Names = $names; Type = [string](Get-YummyVal $x 'type' 'alias')
+    Year = (Get-YummyId $x['year']); EpCount = (ConvertTo-KodikInt (Get-YummyVal $x 'episodes' 'count'))
+    ShikiId = (Get-YummyId (Get-YummyVal $x 'remote_ids' 'shikimori_id')); KpId = (Get-YummyId (Get-YummyVal $x 'remote_ids' 'kp_id'))
+    AnilibriaAlias = [string](Get-YummyVal $x 'remote_ids' 'anilibria_alias'); Videos = $videos
+  }
+}
+
+# An API answer worth reading, else a short error (404 = no such title; 401 / 403 = it wants an app token).
+function Test-YummyAnswer($r) {
+  $t = ([string]$r.Text).TrimStart()
+  if ($r.Status -eq 404) { throw 'YummyAnime: 404 (no such title)' }
+  if ($r.Status -eq 401 -or $r.Status -eq 403) { throw "YummyAnime: HTTP $($r.Status) (app token wanted)" }
+  if ($r.Status -ne 200) { throw "HTTP $($r.Status)" }
+  if (-not ($t.StartsWith('{') -or $t.StartsWith('['))) { throw 'not a JSON answer' }
+}
+
+# One title with its videos (one call; long shows have big lists, hence the long timeout). Kept 30 minutes.
+function Get-YummyTitle([string]$key) {
+  $key = ([string]$key).ToLowerInvariant()
+  $hit = $script:YummyTitles[$key]
+  if ($hit -and ((Get-Date) - $hit.At).TotalMinutes -lt 30) { return $hit.Title }
+  $r = Invoke-Web -Url ($script:YummyApi + '/anime/' + [Uri]::EscapeDataString($key) + '?need_videos=true') -Headers (Get-YummyHeaders) -TimeoutSec 30
+  Test-YummyAnswer $r
+  $t = ConvertFrom-YummyTitle $r.Text
+  if ($null -eq $t.Videos) {
+    $v = Invoke-Web -Url ($script:YummyApi + '/anime/' + $t.Id + '/videos') -Headers (Get-YummyHeaders) -TimeoutSec 30
+    Test-YummyAnswer $v
+    $d = ConvertFrom-JsonDict $v.Text
+    $t.Videos = ConvertFrom-YummyVideos (Get-YummyVal $d 'response')
+  }
+  $e = @{ At = (Get-Date); Title = $t }
+  $script:YummyTitles[$key] = $e
+  $script:YummyTitles[[string]$t.Id] = $e
+  return $t
+}
+
+# Which players of one voice-over number its episodes the same way (player -> $true / $false). The reference is Kodik's
+# set of numbers, else the biggest one. A player is aligned when its set is the reference or a part of it that starts at
+# the same number. Mushoku Tensei S2: Kodik 0-12, CVH 1-12 (AniLibria: 1-13) -> CVH is not aligned there (its 1 may be
+# Kodik's 0, the special). Players that are not aligned only play numbers the reference doesn't have.
+# Returns @{ Aligned = player -> bool; Ref = number -> $true }.
+function Get-YummyAligned($videos) {
+  $sets = @{}
+  foreach ($v in @($videos)) {
+    if (-not $sets.ContainsKey($v.Player)) { $sets[$v.Player] = @{} }
+    $sets[$v.Player][[string]$v.Number] = $true
+  }
+  $ref = $null
+  if ($sets.ContainsKey('kodik')) { $ref = 'kodik' }
+  else { foreach ($p in $script:YummyPlayerOrder) { if ($sets.ContainsKey($p) -and (-not $ref -or $sets[$p].Count -gt $sets[$ref].Count)) { $ref = $p } } }
+  $out = @{}
+  $min = { param($set) ($set.Keys | ForEach-Object { [double]$_ } | Measure-Object -Minimum).Minimum }
+  foreach ($p in @($sets.Keys)) {
+    if ($p -eq $ref) { $out[$p] = $true; continue }
+    $sub = $true
+    foreach ($n in $sets[$p].Keys) { if (-not $sets[$ref].ContainsKey($n)) { $sub = $false; break } }
+    $out[$p] = ($sub -and (& $min $sets[$p]) -eq (& $min $sets[$ref]))
+  }
+  $refSet = @{}
+  if ($ref) { $refSet = $sets[$ref] }
+  return @{ Aligned = $out; Ref = $refSet }
+}
+
+# The entries that play episode $number of one voice-over: the aligned players when the reference has that number,
+# else (a last resort) the others that have it. Kodik, CVH, Alloha, Sibnet order. $videos may be the whole voice-over
+# or just that number's videos (Expand-Yummy hands each number its own few: a long show has thousands).
+function Get-YummyEntries($videos, $al, [string]$number) {
+  $onlyAligned = $al.Ref.ContainsKey($number)
+  $here = New-Object System.Collections.ArrayList
+  foreach ($v in @($videos)) { if ($v.Number -eq $number -and (-not $onlyAligned -or $al.Aligned[$v.Player])) { [void]$here.Add($v) } }
+  $out = New-Object System.Collections.ArrayList
+  foreach ($p in $script:YummyPlayerOrder) { foreach ($v in $here) { if ($v.Player -eq $p) { [void]$out.Add($v) } } }
+  return $out.ToArray()
+}
+
+# One entry -> a candidate ($null when it can't be used now: Alloha while it refuses this PC, CVH for subtitles).
+function ConvertTo-YummyCand($e, [string]$dub) {
+  $c = $null
+  switch ($e.Player) {
+    'kodik' { $c = New-Cand 'kodik' $e.Url $script:YummyReferer $dub }
+    'sibnet' { $c = New-Cand 'sibnet' $e.Url '' $dub }
+    'cvh' {
+      if ((ConvertTo-WpTitleKey $dub).Subs) { return $null }   # (CVH's names don't say which releases are subtitled)
+      if ($e.Number -notmatch '^0*[1-9]\d*$') { return $null }   # (Resolve-Cvh asks for episodes 1, 2, ...: not 0 or 12.5)
+      $c = New-Cand 'cvh' $e.Url 'https://ru.yummyani.me/' $dub
+      $c | Add-Member -NotePropertyName NoPage -NotePropertyValue $true
+    }
+    'alloha' {
+      if ((Get-Date) -lt $script:AllohaBlockedUntil) { return $null }
+      $c = New-Cand 'alloha' $e.Url $script:YummyAllohaReferer $dub
+    }
+  }
+  if (-not $c) { return $null }
+  $c.Label = (Get-ProviderTitle $e.Player) + ', ' + (Format-DubName $dub)
+  if ($e.Duration -gt 60) { $c | Add-Member -NotePropertyName Duration -NotePropertyValue ([double]$e.Duration) }
+  return $c
+}
+
+function Expand-Yummy([string]$u) {
+  $canAsk = Test-CanAsk
+  $key = Get-YummyKey $u
+  if ($canAsk) { Say (T 'Reading the YummyAnime title...') 'Gray' }
+  $t = $null
+  try { $t = Get-YummyTitle $key }
+  catch {
+    $msg = $_.Exception.Message
+    if ($msg -match '404') { throw (T 'YummyAnime has no such title (check the link)') }
+    if ($msg -match 'app token') { throw (T 'YummyAnime wants an app token now: put one in "YummyAppToken" in config.json (see README)') }
+    throw (T 'YummyAnime didn''t answer ({0})' (Get-ShortText $msg 100))
+  }
+  # (CVH is not used for subtitles, see ConvertTo-YummyCand: a voice-over only CVH has then has no player here.)
+  $subs = @{}
+  $vids = @(@($t.Videos) | Where-Object {
+      if (-not $subs.ContainsKey($_.Dub)) { $subs[$_.Dub] = (ConvertTo-WpTitleKey $_.Dub).Subs }
+      -not ($_.Player -eq 'cvh' -and $subs[$_.Dub]) })
+  if ($vids.Count -eq 0) { throw (T 'YummyAnime has no episodes of it yet') }
+  $title = $t.Title
+  if (-not $title) { $title = "YummyAnime $($t.Id)" }
+  # The voice-overs (one per label of the site): those Kodik has first, then the ones with the most videos.
+  $byDub = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.ArrayList]' ([System.StringComparer]::Ordinal)
+  $seen = New-Object System.Collections.ArrayList
+  foreach ($v in $vids) {
+    if (-not $byDub.ContainsKey($v.DubRaw)) { $byDub[$v.DubRaw] = New-Object System.Collections.ArrayList; [void]$seen.Add($v.DubRaw) }
+    [void]$byDub[$v.DubRaw].Add($v)
+  }
+  $dubs = @()
+  for ($i = 0; $i -lt $seen.Count; $i++) {
+    $l = $byDub[$seen[$i]]
+    $dubs += [pscustomobject]@{ Raw = $seen[$i]; Name = $l[0].Dub; Videos = $l.ToArray(); NoKodik = (@($l | Where-Object { $_.Player -eq 'kodik' }).Count -eq 0); Count = $l.Count; Pos = $i }
+  }
+  $dubs = @($dubs | Sort-Object -Property @{ Expression = { $_.NoKodik } }, @{ Expression = { $_.Count }; Descending = $true }, @{ Expression = { $_.Pos } })
+  $used = @{}
+  foreach ($d in $dubs) { if ($used.ContainsKey($d.Name)) { $d.Name = $d.Raw }; $used[$d.Name] = $true }   # (two labels, one name)
+  if ($canAsk) {
+    $seenNum = @{}
+    $numbers = @(foreach ($v in $vids) { if (-not $seenNum.ContainsKey($v.Number)) { $seenNum[$v.Number] = $true; $v.Number } })
+    Say ''
+    if ($numbers.Count -le 1) { Say (T 'Found on YummyAnime: {0}' $title) 'White' } else { Say (T 'Found on YummyAnime: {0} ({1} episodes)' $title $numbers.Count) 'White' }
+  }
+  $pos = 0
+  if ($script:DubPref) { $i = Find-DubIndex @($dubs | ForEach-Object { $_.Name }) $script:DubPref; if ($i -ge 0) { $pos = $i } }
+  $pos = Select-SiteDub @($dubs | ForEach-Object { $_.Name }) $pos $canAsk
+  $dub = $dubs[$pos]
+  $script:DubPref = [string]$dub.Name
+  $al = Get-YummyAligned $dub.Videos
+  # (The voice-over's videos by number, made once: one scan per episode was minutes on a 1000-episode show.)
+  $byNum = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.ArrayList]' ([System.StringComparer]::Ordinal)
+  foreach ($v in $dub.Videos) {
+    if (-not $byNum.ContainsKey($v.Number)) { $byNum[$v.Number] = New-Object System.Collections.ArrayList }
+    [void]$byNum[$v.Number].Add($v)
+  }
+  $eps = @(@($byNum.Keys) | Sort-Object { [double]$_ } | ForEach-Object { [pscustomobject]@{ Number = [string]$_ } })
+  $startPos = 0
+  $want = [regex]::Match($u, '#episode=([\d.]+)')
+  if ($want.Success) { for ($i = 0; $i -lt $eps.Count; $i++) { if ($eps[$i].Number -eq $want.Groups[1].Value) { $startPos = $i } } }
+  $list = @(Select-SiteEpisodes $eps $startPos $canAsk)
+  $single = ($t.Type -eq 'movie' -or $eps.Count -le 1)
+  $items = New-Object System.Collections.ArrayList
+  foreach ($e in $list) {
+    $site = [pscustomobject]@{ Type = 'yummy'; Id = $t.Id; ShikiId = $t.ShikiId; KpId = $t.KpId; AnilibertyAlias = $t.AnilibriaAlias
+      DubRaw = $dub.Raw; Dub = [string]$dub.Name; Number = [string]$e.Number; Names = $t.Names; Entries = @(Get-YummyEntries $byNum[[string]$e.Number] $al ([string]$e.Number)) }
+    $name = $title
+    if (-not $single) { $name = (T '{0} - episode {1}' $title $e.Number) }
+    [void]$items.Add((New-SiteItem ($script:YummyApi + '/anime/' + $t.Id + '#episode=' + $e.Number) $name $site))
+  }
+  if ($script:SiteChoice -and $items.Count -gt 0) { $items[0].ResumeAt = $script:SiteChoice.Start }
+  return $items.ToArray()
+}
+
+# A YummyAnime episode: every player the site lists for that voice-over and episode (they are each other's backups;
+# other voice-overs are never added), in the usual player order.
+function Get-YummyCands($s) {
+  $list = New-Object System.Collections.ArrayList
+  foreach ($e in @($s.Entries)) {
+    $c = ConvertTo-YummyCand $e ([string]$s.Dub)
+    if ($c) { Add-RankedCand $list $c 0 }
+  }
+  if ($list.Count -eq 0) { throw (T 'none of the players YummyAnime has for this episode can be used here') }
+  return (Get-RankedCands $list)
+}
+
+# ==================================================================================================
 # Glue: links -> queue items -> possible sources -> a stream ffmpeg can open
 # ==================================================================================================
 # A queue item of kind 'site' carries .Site (what to play) and gets a list of "candidates" (player links
@@ -4399,6 +4770,7 @@ function Test-SiteLink([string]$u) {
   if (Test-DreamcastUrl $u) { return $true }
   if (Test-AnilibertyUrl $u) { return $true }
   if (Test-AnimevostUrl $u) { return $true }
+  if (Test-YummyUrl $u) { return $true }
   if (Test-AnimelibUrl $u) { return $true }
   if (Test-WpartyUrl $u) { return $true }
   if (Test-KodikUrl $u) { return $true }
@@ -4636,6 +5008,7 @@ function Expand-SiteLinkNow([string]$u) {
   if (Test-DreamcastUrl $u) { return @(Expand-Dreamcast $u) }
   if (Test-AnilibertyUrl $u) { return @(Expand-Aniliberty $u) }
   if (Test-AnimevostUrl $u) { return @(Expand-Animevost $u) }
+  if (Test-YummyUrl $u) { return @(Expand-Yummy $u) }
   if (Test-AnimelibUrl $u) { return @(Expand-Animelib $u) }
   if (Test-WpartyUrl $u) { return @(Expand-Wparty $u) }
   if ((Test-KodikUrl $u) -and $u -match '(?i)/serial/') { return @(Expand-KodikSerial $u) }
@@ -5073,17 +5446,19 @@ function Expand-KodikSerial([string]$u) {
 #   WPARTY    POST https://wparty.net/api/movieSearch {"q":..}          -> [{id (Kinopoisk id), name, year, channel, rating}]
 #   Shikimori GET  https://shikimori.io/api/animes?search=..&limit=..    -> [{id, name, russian, kind, status, episodes, episodes_aired, aired_on}]
 #   AnimeLib  GET  https://api.cdnlibs.org/api/anime?q=..&site_id[]=5   -> {data:[{slug_url, name, rus_name, type{label}, releaseDateString, shikimori_href}]}
+#   YummyAnime GET https://api.yani.tv/search?q=..&limit=8             -> {response:[{anime_id, title, year, type, remote_ids}]} (see its section)
 # Every result carries a .Link that Test-SiteLink / Expand-SiteLink understand, so it also survives the #vrclm= hand-over:
 #   https://www.kinopoisk.ru/series/<kpId>/?name=<title>  -> WPARTY movieCheck -> Kodik (season/part, voice-over, episodes), else Collaps
 #   https://shikimori.io/animes/<id>?name=<title>         -> Kodik by Shikimori id
 #   https://anilib.me/ru/anime/<slug_url>                 -> Expand-Animelib (it only uses the API, never the page)
+#   https://api.yani.tv/anime/<id>                        -> Expand-Yummy (every voice-over, the players the site lists for each)
 # AniLiberty, AnimeVost and Dream Cast (see their sections) search their own catalogues; their rows play only their own
 # voice-over, so they are listed apart (after the others) and never merged with them.
 $script:ShikimoriBase = 'https://shikimori.io'
 $script:SearchTimeoutSec = 10
 $script:SearchMaxRows = 20
-$script:SearchQuota = @{ 'dreamcast' = 3; 'wparty' = 8; 'shikimori' = 3; 'animelib' = 2; 'aniliberty' = 2; 'animevost' = 2 }   # rows per source before the rest fills up
-$script:SearchSourceNames = @{ 'dreamcast' = 'Dream Cast'; 'wparty' = 'WPARTY'; 'shikimori' = 'Shikimori'; 'animelib' = 'AnimeLib'; 'aniliberty' = 'AniLiberty'; 'animevost' = 'AnimeVost' }
+$script:SearchQuota = @{ 'dreamcast' = 3; 'wparty' = 8; 'yummy' = 3; 'shikimori' = 3; 'animelib' = 2; 'aniliberty' = 2; 'animevost' = 2 }   # rows per source before the rest fills up
+$script:SearchSourceNames = @{ 'dreamcast' = 'Dream Cast'; 'wparty' = 'WPARTY'; 'yummy' = 'YummyAnime'; 'shikimori' = 'Shikimori'; 'animelib' = 'AnimeLib'; 'aniliberty' = 'AniLiberty'; 'animevost' = 'AnimeVost' }
 $script:KinopoiskLinkRe = '^(?i)https?://(?:www\.)?kinopoisk\.ru/(film|series)/(\d+)'
 $script:ShikimoriLinkRe = '^(?i)https?://(?:www\.)?(?:shikimori\.(?:io|one|me)|shiki\.one)/animes/[a-z]*(\d+)'
 $script:MovieCheckCache = @{}     # Kinopoisk id -> movieCheck answer (this session)
@@ -5245,9 +5620,9 @@ function ConvertFrom-AnimelibSearch([string]$text) {
   return $rows
 }
 
-# Searches WPARTY (films, series, anime by Kinopoisk id), Shikimori and AnimeLib (anime) for a title, and the
-# catalogues of AniLiberty, AnimeVost and Dream Cast (their own voice-overs).
-# Returns up to $script:SearchMaxRows rows: Title, Year, Kind, Extra, Source ('wparty'|'shikimori'|'animelib'|
+# Searches WPARTY (films, series, anime by Kinopoisk id), YummyAnime, Shikimori and AnimeLib (anime) for a title, and
+# the catalogues of AniLiberty, AnimeVost and Dream Cast (their own voice-overs).
+# Returns up to $script:SearchMaxRows rows: Title, Year, Kind, Extra, Source ('wparty'|'yummy'|'shikimori'|'animelib'|
 # 'aniliberty'|'animevost'|'dreamcast'), Id, Link.
 # A source that doesn't answer gets one short line; the others still show.
 function Find-SiteContent([string]$query) {
@@ -5257,12 +5632,13 @@ function Find-SiteContent([string]$query) {
   $alApi = 'https://api.cdnlibs.org/api'
   if ($script:AnimelibApiGoodHost) { $alApi = $script:AnimelibApiGoodHost }
   $sec = $script:SearchTimeoutSec
-  $srcs = @('dreamcast', 'wparty', 'shikimori', 'animelib', 'aniliberty', 'animevost')
+  $srcs = @('dreamcast', 'wparty', 'yummy', 'shikimori', 'animelib', 'aniliberty', 'animevost')
   $apart = @('dreamcast', 'aniliberty', 'animevost')   # (their own voice-over only: never merged with the others)
   $reqs = @(
     (Get-DreamcastSearchRequest $q $sec),
     @{ Url = $script:WpartyBase + '/api/movieSearch'; Method = 'POST'; Body = (ConvertTo-Json @{ q = $q } -Compress); ContentType = 'application/json'
       Headers = @{ 'Referer' = $script:WpartyBase + '/'; 'Origin' = $script:WpartyBase }; TimeoutSec = $sec },
+    (Get-YummySearchRequest $q $sec),
     @{ Url = $script:ShikimoriBase + '/api/animes?search=' + $esc + '&limit=8'; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = $sec },
     @{ Url = $alApi + '/anime?q=' + $esc + '&site_id[]=' + $script:AnimelibSiteId; Headers = (Get-AnimelibApiHeaders -NoAuth); TimeoutSec = $sec },
     (Get-AnilibertySearchRequest $q $sec),
@@ -5316,12 +5692,15 @@ function Find-SiteContent([string]$query) {
         elseif ($s -eq 'shikimori') { $found[$s] = @(ConvertFrom-ShikimoriSearch $a.Text) }
         elseif ($s -eq 'aniliberty') { $found[$s] = @(ConvertFrom-AnilibertySearch $a.Text $q) }
         elseif ($s -eq 'animevost') { $found[$s] = @(ConvertFrom-AnimevostSearch $a.Text $q) }
+        elseif ($s -eq 'yummy') { $found[$s] = @(ConvertFrom-YummySearch $a.Text $q) }
         else { $found[$s] = @(ConvertFrom-AnimelibSearch $a.Text) }
       } catch { $why = T 'unexpected answer' }
     }
-    if ($why) { Say (T '  {0} search isn''t answering ({1}).' $script:SearchSourceNames[$s] (Get-ShortText ([string]$why) 60)) 'DarkGray' }
+    if ($why -and $s -eq 'yummy' -and ($a.Status -eq 401 -or $a.Status -eq 403)) { Say (T '  YummyAnime wants an app token now: put one in "YummyAppToken" in config.json (see README).') 'DarkGray' }
+    elseif ($why) { Say (T '  {0} search isn''t answering ({1}).' $script:SearchSourceNames[$s] (Get-ShortText ([string]$why) 60)) 'DarkGray' }
   }
-  # Drop what an earlier source already has (same title and year, or the same Shikimori id). Dream Cast's, AniLiberty's
+  # Drop what an earlier source already has (same title and year, or the same Shikimori id: YummyAnime's row, which lists
+  # more players, keeps the Shikimori id and Shikimori's own row goes). Dream Cast's, AniLiberty's
   # and AnimeVost's rows stay apart: they play only their own voice-over, the others offer every voice-over (theirs
   # included).
   $seen = @{}; $shiki = @{}
@@ -5366,7 +5745,7 @@ function Find-SiteContent([string]$query) {
 function Test-SearchAnswer([string]$source, $a) {
   if ($a.Error) { return $false }
   if (-not ($a.Status -eq 200 -or ($source -eq 'animevost' -and $a.Status -eq 404))) { return $false }
-  if ($source -ne 'aniliberty' -and $source -ne 'animevost') { return $true }
+  if ($source -notin @('aniliberty', 'animevost', 'yummy')) { return $true }
   $t = ([string]$a.Text).TrimStart()
   return ($t.StartsWith('{') -or $t.StartsWith('['))
 }
@@ -5688,6 +6067,7 @@ function Get-SiteCandidates($item) {
   if ($s.Type -eq 'animelib') { return (Get-AnimelibCands $s) }
   if ($s.Type -eq 'wparty') { return (Get-WpartyCands $s) }
   if ($s.Type -eq 'shikimori') { return (Get-ShikimoriCands $s) }
+  if ($s.Type -eq 'yummy') { return (Get-YummyCands $s) }
   return @($s.Cands)
 }
 
@@ -5786,5 +6166,7 @@ function Resolve-Candidate($c) {
     default { throw (T 'unknown player ''{0}''' $c.Provider) }
   }
   if (-not $st -or -not $st.Url) { throw (T 'no video address found') }
+  # The length the catalogue gave (YummyAnime) when the player didn't say.
+  if (-not ($st.Duration -gt 0) -and $c.PSObject.Properties['Duration'] -and $c.Duration -gt 60) { $st.Duration = [double]$c.Duration }
   return $st
 }

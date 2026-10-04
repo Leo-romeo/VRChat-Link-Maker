@@ -788,5 +788,14 @@
   "  The live stream stopped sending - going on.": "  Прямой эфир перестал идти - переходим дальше.",
   "subtitles from the site": "субтитры с сайта",
   "the subtitles didn't download, so it plays without them": "субтитры не скачались, поэтому видео играет без них",
-  "The stream from the server stopped - trying again from {0}.": "Поток с сервера оборвался - пробую снова с {0}."
+  "The stream from the server stopped - trying again from {0}.": "Поток с сервера оборвался - пробую снова с {0}.",
+  "Reading the YummyAnime title...": "Читаю тайтл на YummyAnime...",
+  "YummyAnime has no such title (check the link)": "на YummyAnime нет такого тайтла (проверьте ссылку)",
+  "YummyAnime wants an app token now: put one in \"YummyAppToken\" in config.json (see README)": "YummyAnime теперь требует токен приложения: впишите его в \"YummyAppToken\" в config.json (см. README)",
+  "  YummyAnime wants an app token now: put one in \"YummyAppToken\" in config.json (see README).": "  YummyAnime теперь требует токен приложения: впишите его в \"YummyAppToken\" в config.json (см. README).",
+  "YummyAnime didn't answer ({0})": "YummyAnime не ответил ({0})",
+  "YummyAnime has no episodes of it yet": "на YummyAnime пока нет ни одной серии",
+  "Found on YummyAnime: {0}": "Найдено на YummyAnime: {0}",
+  "Found on YummyAnime: {0} ({1} episodes)": "Найдено на YummyAnime: {0} (серий: {1})",
+  "none of the players YummyAnime has for this episode can be used here": "ни один из плееров YummyAnime для этой серии здесь не подходит"
 }

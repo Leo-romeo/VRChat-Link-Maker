@@ -56,6 +56,8 @@ Paste a link to one of these like any other link:
                                                  own site: up to 1080p)
   AnimeVost   https://animevost.org/tip/tv/...  (its own voice-overs, 720p
                                                  where it has it, else 480p)
+  YummyAnime  https://ru.yummyani.me/catalog/item/...   (every voice-over,
+                                                 several players for each)
   AnimeGO     https://animego.me/anime/...      (a series or a movie page)
   AnimeLib    https://anilib.me/ru/anime/...    (also animelib.org links)
   WPARTY      https://wparty.net/s/...          (a room: it plays what the
@@ -105,10 +107,10 @@ If AnimeGO or AnimeLib don't open where you live, you don't need their links:
 just type a title (Russian or English) instead of a link and press Enter.
 
 - Results come from WPARTY's search (films, series and anime, from
-  Kinopoisk), Shikimori (anime) and AnimeLib, then the catalogues of
-  AniLiberty, AnimeVost and Dream Cast (each with its own voice-over only).
-  If AniLiberty's or AnimeVost's main address doesn't answer, their other
-  addresses are tried.
+  Kinopoisk), YummyAnime, Shikimori (anime) and AnimeLib, then the
+  catalogues of AniLiberty, AnimeVost and Dream Cast (each with its own
+  voice-over only). If AniLiberty's or AnimeVost's main address doesn't
+  answer, their other addresses are tried.
 - Pick one, then the season / part, the voice-over (Enter = the preferred
   one) and the episodes.
 - It plays through Kodik, Dream Cast's site, AniLiberty's site (Kodik as
@@ -486,6 +488,9 @@ All of these are optional.
               it asks, and the first one is what Enter takes. Default:
               ["Dream Cast", "AniLibria", "official"] ("official" = any
               official dub). [] = no preference.
+  YummyAppToken  empty (the default). YummyAnime works without one today; if
+              it starts asking for an app token, make one on its site
+              (yummyani.me/dev/applications) and put it here.
 Delete config.json to get a brand-new link.
 
 
