@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.4.2'
+$script:Version = '1.4.3'
 $script:Args0 = @($args)
 
 # ------------------------------------------------------------------ basics
@@ -1086,7 +1086,7 @@ function Get-MediaInfoArgs([string]$src, [bool]$isUrl, $stream = $null) {
 
 function Get-MediaInfo([string]$src, [bool]$isUrl, $stream = $null) {
   $r = Invoke-Capture $script:FFprobe (Get-MediaInfoArgs $src $isUrl $stream)
-  $info = ConvertFrom-ProbeOutput $r
+  $info = ConvertFrom-ProbeOutput $r $stream
   if ($stream -and $stream.AudioUrl) {
     # A web stream whose sound is a separate playlist (played as a second input).
     $ai = Get-MediaInfo $stream.AudioUrl $true (New-Stream $stream.AudioUrl $stream.Kind $stream.Headers)
@@ -1098,7 +1098,9 @@ function Get-MediaInfo([string]$src, [bool]$isUrl, $stream = $null) {
 }
 
 # ffprobe's answer ($r: ExitCode, Out, Err) -> Duration, BitRate, Video, Audio, Subs, Fonts.
-function ConvertFrom-ProbeOutput($r) {
+# $stream with PickBw/PickH: an HLS master playlist read as it is, which lists every quality; the one Complete-HlsStream
+# picked is taken (and only its own sound, when it has some), else the first one listed.
+function ConvertFrom-ProbeOutput($r, $stream = $null) {
   if ($r.ExitCode -ne 0 -or -not $r.Out -or -not $r.Out.Trim()) {
     $why = Get-LastLines $r.Err 1
     if (-not $why) { $why = (T 'unknown format') }
@@ -1118,7 +1120,11 @@ function ConvertFrom-ProbeOutput($r) {
   $info = [pscustomobject]@{ Duration = 0.0; BitRate = 0; Video = $null; Audio = @(); Subs = @(); Fonts = @(); AudioInput = 0 }
   if ($format['duration']) { try { $info.Duration = [double]$format['duration'] } catch {} }
   $info.BitRate = ConvertTo-IntSafe $format['bit_rate']
+  $fmtBr = $info.BitRate
+  $wantBw = 0; $wantH = 0; $vRank = -1
+  if ($stream -and $stream.PSObject.Properties['PickBw']) { $wantBw = [int]$stream.PickBw; $wantH = [int]$stream.PickH }
   $audio = New-Object System.Collections.ArrayList
+  $ownAudio = New-Object System.Collections.ArrayList
   $subs = New-Object System.Collections.ArrayList
   $fonts = New-Object System.Collections.ArrayList
   foreach ($key in @($streamMap.Keys | Sort-Object)) {
@@ -1131,9 +1137,13 @@ function ConvertFrom-ProbeOutput($r) {
     $isForced = ("$($s['disposition.forced'])" -eq '1')
     $idx = $key
     if ($s['index']) { $idx = ConvertTo-IntSafe $s['index'] }
+    $vbw = ConvertTo-IntSafe $s['tags.variant_bitrate']
     if ($type -eq 'video') {
       if ("$($s['disposition.attached_pic'])" -eq '1') { continue }
-      if ($info.Video) { continue }
+      $rank = 0
+      if ($wantBw -gt 0 -and $vbw -eq $wantBw) { $rank = 2 } elseif ($wantH -gt 0 -and (ConvertTo-IntSafe $s['height']) -eq $wantH) { $rank = 1 }
+      if ($info.Video -and $rank -le $vRank) { continue }
+      $vRank = $rank
       $fpsStr = "$($s['avg_frame_rate'])"
       $fps = ConvertFrom-Ratio $fpsStr '/'
       if ($fps -le 0 -or $fps -gt 240) { $fpsStr = "$($s['r_frame_rate'])"; $fps = ConvertFrom-Ratio $fpsStr '/' }
@@ -1145,9 +1155,11 @@ function ConvertFrom-ProbeOutput($r) {
         Sar = $sar; Fps = $fps; FpsStr = $fpsStr; Interlaced = (@('tt', 'bb', 'tb', 'bt') -contains $fo)
         ColorSpace = "$($s['color_space'])"; ColorRange = "$($s['color_range'])"; PixFmt = "$($s['pix_fmt'])"; ColorTransfer = "$($s['color_transfer'])"
       }
-      if ($info.BitRate -le 0) { $info.BitRate = ConvertTo-IntSafe $s['tags.variant_bitrate'] }
+      if ($fmtBr -le 0) { $info.BitRate = $vbw }
     } elseif ($type -eq 'audio') {
-      [void]$audio.Add([pscustomobject]@{ Index = $idx; Codec = $codec; Lang = $lang; Title = $title; Default = $isDef; Forced = $isForced; Kind = 'audio'; Path = $null; Channels = (ConvertTo-IntSafe $s['channels']) })
+      $a = [pscustomobject]@{ Index = $idx; Codec = $codec; Lang = $lang; Title = $title; Default = $isDef; Forced = $isForced; Kind = 'audio'; Path = $null; Channels = (ConvertTo-IntSafe $s['channels']) }
+      [void]$audio.Add($a)
+      if ($wantBw -gt 0 -and $vbw -eq $wantBw) { [void]$ownAudio.Add($a) }
     } elseif ($type -eq 'subtitle') {
       $kind = $null
       if ($script:TextSubCodecs -contains $codec) { $kind = 'text' } elseif ($script:BitmapSubCodecs -contains $codec) { $kind = 'bitmap' }
@@ -1165,6 +1177,7 @@ function ConvertFrom-ProbeOutput($r) {
     }
   }
   $info.Audio = $audio.ToArray()
+  if ($vRank -eq 2 -and $ownAudio.Count -gt 0) { $info.Audio = $ownAudio.ToArray() }
   $info.Subs = $subs.ToArray()
   $info.Fonts = $fonts.ToArray()
   return $info
@@ -1800,6 +1813,8 @@ function Complete-HlsStream($stream) {
     $pick = @($vars | Where-Object { $_.Height -ge $want } | Sort-Object Height, Bw | Select-Object -First 1)
     if ($pick.Count -eq 0) { $pick = @($vars | Sort-Object Height, Bw -Descending | Select-Object -First 1) }
     $v = $pick[0]
+    $stream | Add-Member -Force -NotePropertyName PickBw -NotePropertyValue $v.Bw
+    $stream | Add-Member -Force -NotePropertyName PickH -NotePropertyValue $v.Height
     $audioUri = $null
     if ($v.Audio) {
       # The sound comes as its own playlist: take the group's default one (else the first).
@@ -2513,8 +2528,13 @@ function Step-Prep($item) {
             try { $st = Complete-HlsStream (New-Stream $hls.Url 'hls' $hls.Headers) } catch {}
           }
           # Only a quality that carries its own sound is taken. Else the master playlist plays as it is: ffmpeg reads
-          # all of it, and the group's default sound is chosen (a separate sound playlist could be another language).
+          # all of it, and the group's default sound is chosen (a separate sound playlist could be another language);
+          # the picked quality is then looked for in what ffprobe lists (see ConvertFrom-ProbeOutput).
           if ($st -and $st.Program -lt 0 -and -not $st.AudioUrl) { $hls = $st }
+          elseif ($st -and $st.PSObject.Properties['PickBw']) {
+            $hls | Add-Member -Force -NotePropertyName PickBw -NotePropertyValue $st.PickBw
+            $hls | Add-Member -Force -NotePropertyName PickH -NotePropertyValue $st.PickH
+          }
           $hls | Add-Member -Force -NotePropertyName Checked -NotePropertyValue $true
           $item.Stream = $hls
         }
@@ -2562,7 +2582,7 @@ function Step-Prep($item) {
             throw (T 'can''t read it ({0})' 'timeout')
           }
           $item.ProbeBg = $null
-          $item.Info = ConvertFrom-ProbeOutput ([pscustomobject]@{ ExitCode = $pb.Bg.Proc.ExitCode; Out = $pb.Bg.Out.Result; Err = $pb.Bg.Err.Result })
+          $item.Info = ConvertFrom-ProbeOutput ([pscustomobject]@{ ExitCode = $pb.Bg.Proc.ExitCode; Out = $pb.Bg.Out.Result; Err = $pb.Bg.Err.Result }) $st
         }
         else { $item.Info = Get-MediaInfo $item.Path $item.IsDirectUrl $st }
       } catch {
