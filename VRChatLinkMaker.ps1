@@ -4330,6 +4330,15 @@ function Get-CmdWord($c) {
   }
 }
 
+# The torrent episode the waiting screen is downloading for its turn (the next queue item, read now: items may have
+# been added in front of it meanwhile), or $null. S S on the waiting screen gives exactly this one up.
+function Get-WaitingSkipItem {
+  if ($script:Idx -ge $script:Queue.Count) { return $null }
+  $nx = $script:Queue[$script:Idx]
+  if ($nx -and $nx.Kind -eq 'torrent' -and @('new', 'torrent-meta', 'downloading') -contains $nx.State) { return $nx }
+  return $null
+}
+
 # What a command means for the current source kind ($null = it doesn't apply here, with the reason in $why).
 function Resolve-Cmd($c, [string]$kind, [ref]$why) {
   $why.Value = ''
@@ -4346,10 +4355,7 @@ function Resolve-Cmd($c, [string]$kind, [ref]$why) {
     default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest') }
   }
   # The waiting screen while a torrent episode downloads for its turn: S S gives that episode up.
-  if ($kind -eq 'waiting' -and $script:Idx -lt $script:Queue.Count) {
-    $nx = $script:Queue[$script:Idx]
-    if ($nx.Kind -eq 'torrent' -and @('new', 'torrent-meta', 'downloading') -contains $nx.State) { $fits = @($fits) + @('skip') }
-  }
+  if ($kind -eq 'waiting' -and (Get-WaitingSkipItem)) { $fits = @($fits) + @('skip') }
   if ($fits -contains $cmd) {
     if ($cmd -eq $c.Cmd) { return $c }
     return [pscustomobject]@{ Cmd = $cmd; Arg = $c.Arg; From = $c.From; At = $c.At }
@@ -5686,8 +5692,10 @@ function Invoke-Queue {
       if ($r.Outcome -eq 'quit' -or $r.Outcome -eq 'timeout') { break }
       if ($r.Outcome -eq 'stop') { Say (T '  Nothing is playing. Q Q ends the stream.') 'Gray'; continue }
       if ($r.Outcome -eq 'skip') {
-        # (A torrent episode that was still downloading: given up.)
-        if ($cur -and $cur.State -ne 'ready' -and $cur.State -ne 'failed') { $cur.State = 'failed'; $cur.Error = T 'skipped before its download finished' }
+        # (The torrent episode that was still downloading for its turn: given up.)
+        $sk = Get-WaitingSkipItem
+        if ($sk) { $sk.State = 'failed'; $sk.Error = T 'skipped before its download finished' }
+        $h = New-CmdHold $r.Cmd; if ($h) { $script:PendingHold = $h }
         continue
       }
       if ($r.Outcome -eq 'resync') { Restart-RelayForResync 'waiting'; continue }
