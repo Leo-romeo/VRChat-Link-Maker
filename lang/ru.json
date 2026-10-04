@@ -856,7 +856,7 @@
   "Torrents need rqbit, a free torrent program (12.7 MB, Apache-2.0, github.com/ikatson/rqbit). Nothing is installed.": "Для торрентов нужен rqbit - бесплатная торрент-программа (12,7 МБ, Apache-2.0, github.com/ikatson/rqbit). Ничего не устанавливается.",
   "While an episode downloads it also uploads to other people, capped at {0} KB/s, and it stops uploading when the episode is complete. Only download what you are allowed to.": "Пока серия скачивается, она заодно раздаётся другим людям (не быстрее {0} КБ/с), а когда серия скачана, раздача останавливается. Скачивайте только то, что вам разрешено.",
   "Windows may ask whether rqbit may use the network: Cancel is fine, it works either way.": "Windows может спросить, разрешить ли rqbit доступ к сети: можно нажать «Отмена», работать будет в любом случае.",
-  "Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]": "Скачать rqbit {0} с github.com/ikatson/rqbit? [Д/н]",
+  "Download rqbit {0} (12.7 MB) from github.com/ikatson/rqbit? While an episode downloads it also uploads to others (at most {1} KB/s). [Y/n]": "Скачать rqbit {0} (12,7 МБ) с github.com/ikatson/rqbit? Пока серия скачивается, она заодно раздаётся другим людям (не быстрее {1} КБ/с). [Д/н]",
   "Downloading rqbit... {0}%": "Скачиваю rqbit... {0}%",
   "rqbit {0} is ready.": "rqbit {0} готов.",
   "rqbit could not be downloaded: {0}": "Не удалось скачать rqbit: {0}",

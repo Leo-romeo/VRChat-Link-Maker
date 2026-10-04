@@ -2790,8 +2790,9 @@ function Get-PinnedTool([string]$Name, [bool]$CanAsk) {
   Say (T 'Windows may ask whether rqbit may use the network: Cancel is fine, it works either way.') 'Gray'
   # (Like MediaMTX's: a one-off question Esc = no; inside a flow Esc goes back as at any of its questions. Asked on the
   # waiting screen while live, no answer in time is a no too: Invoke-Ask's TimeoutEsc, never a yes nobody gave.)
+  # (The question itself says that it uploads: the control window's strip shows only the question, not the lines above.)
   $tos = $script:AskTimeouts
-  $yes = Read-YesNoUi (T 'Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]' $script:RqbitVersion) $true -Key 'rqbit' -Esc $false
+  $yes = Read-YesNoUi (T 'Download rqbit {0} (12.7 MB) from github.com/ikatson/rqbit? While an episode downloads it also uploads to others (at most {1} KB/s). [Y/n]' $script:RqbitVersion (Get-TorrentUploadKBps)) $true -Key 'rqbit' -Esc $false
   # (Answered, it can't come again in this flow - rqbit is there, or the no holds - so a Back skips it.)
   Remove-NavTapeStep 'rqbit'
   if (-not $yes) {
