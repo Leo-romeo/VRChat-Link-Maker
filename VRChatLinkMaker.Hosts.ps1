@@ -1577,32 +1577,8 @@ function Stop-MtxProcess($h) {
 # ------------------------------------------------------------------ the exe
 function Get-MediaMtxDir { return (PathJoin (PathJoin $script:ToolDir 'bin') 'mediamtx') }
 
-function Save-MtxDownload([string]$url, [string]$dest) {
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
-  $req = [System.Net.WebRequest]::Create($url)
-  $req.Timeout = 30000
-  if ($req -is [System.Net.HttpWebRequest]) { $req.UserAgent = 'VRChatLinkMaker'; $req.ReadWriteTimeout = 30000; $req.AllowAutoRedirect = $true }
-  $resp = $req.GetResponse()
-  try {
-    $total = [double]$resp.ContentLength
-    $in = $resp.GetResponseStream()
-    $out = [System.IO.File]::Create($dest)
-    try {
-      $buf = New-Object byte[] 262144
-      $done = 0.0
-      $last = [datetime]::MinValue
-      while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
-        $out.Write($buf, 0, $n)
-        $done += $n
-        if (((Get-Date) - $last).TotalMilliseconds -ge 400) {
-          $last = Get-Date
-          if ($total -gt 0) { Show-Status (T 'Downloading MediaMTX... {0}%' ([int](100 * $done / $total))) }
-        }
-      }
-    } finally { $out.Dispose(); $in.Dispose() }
-  } finally { $resp.Close() }
-  Clear-StatusLine
-}
+# (Save-WebFile in VRChatLinkMaker.ps1: the same download with progress, also used for rqbit.)
+function Save-MtxDownload([string]$url, [string]$dest) { Save-WebFile $url $dest 'Downloading MediaMTX... {0}%' }
 
 # Path to mediamtx.exe (<ToolDir>\bin\mediamtx\), or $null. Downloads it only after asking, and only the pinned,
 # checksum-verified release.

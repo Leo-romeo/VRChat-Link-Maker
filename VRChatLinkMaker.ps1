@@ -429,6 +429,10 @@ namespace VRCLinkMaker {
       }
     }
   }
+  public static class Power {
+    // Keeps the PC awake while the stream is on the air or a torrent downloads (Update-KeepAwake).
+    [DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint flags);
+  }
   public sealed class TailReader {
     readonly object gate = new object();
     string text = "";
@@ -635,6 +639,7 @@ function Initialize-Tools {
   $script:CanSubs = ($f.Out -match '(?m)^\s*\S+\s+subtitles\s')
   $script:HasBwdif = ($f.Out -match '(?m)^\s*\S+\s+bwdif\s')
   $script:HasSetparams = ($f.Out -match '(?m)^\s*\S+\s+setparams\s')
+  $script:HasDrawtext = ($f.Out -match '(?m)^\s*\S+\s+drawtext\s')
   # The relay reports its progress 5 times a second where ffmpeg can (4.4 and newer): a resync must see the new
   # connection open within about a second (Restart-RelayForResync).
   $script:RelayStatArgs = @()
@@ -881,6 +886,7 @@ function Initialize-Slate {
   [System.IO.File]::WriteAllText((PathJoin $script:SlateDir 'paused.ass'), (New-AssText (T 'Paused - back in a moment') 40), $script:Utf8NoBom)
   [System.IO.File]::WriteAllText((PathJoin $script:SlateDir 'hold.ass'), (New-AssText (T 'Starting in a moment...') 40), $script:Utf8NoBom)
   Copy-FallbackFonts (PathJoin $script:SlateDir 'fonts')
+  try { [System.IO.File]::WriteAllText((Get-NoteFile), ' ', $script:Utf8NoBom); $script:NoteText = ' ' } catch {}
 }
 
 # Windows consoles pause a program when you click inside the window ("QuickEdit"). That would
@@ -912,7 +918,7 @@ function Set-CtrlCAsKey([bool]$on) {
 # of the tool that is running right now (another folder / data directory): leave that one alone.
 function Clear-OldTemp {
   try {
-    foreach ($d in [System.IO.Directory]::GetDirectories($script:TempRoot, 'job-*')) {
+    foreach ($d in @([System.IO.Directory]::GetDirectories($script:TempRoot, 'job-*')) + @([System.IO.Directory]::GetDirectories($script:TempRoot, 'torrent-*'))) {
       try {
         $lf = PathJoin $d 'lock'
         if ([System.IO.File]::Exists($lf)) { [System.IO.File]::Delete($lf) }
@@ -930,6 +936,15 @@ function Clear-OldTemp {
       $alive = $false
       if ($m.Success) { try { $alive = -not (Get-Process -Id ([int]$m.Groups[1].Value) -ErrorAction Stop).HasExited } catch {} }
       if (-not $alive) { try { [System.IO.File]::Delete($f) } catch {} }
+    }
+    $sd = PathJoin $script:TempRoot 'slate'
+    if ([System.IO.Directory]::Exists($sd)) {
+      foreach ($f in [System.IO.Directory]::GetFiles($sd, 'next-*.txt*')) {
+        $m = [regex]::Match([System.IO.Path]::GetFileName($f), '^next-(\d+)\.')
+        $alive = $false
+        if ($m.Success) { try { $alive = -not (Get-Process -Id ([int]$m.Groups[1].Value) -ErrorAction Stop).HasExited } catch {} }
+        if (-not $alive) { try { [System.IO.File]::Delete($f) } catch {} }
+      }
     }
     $keep = Get-HelperDllName
     foreach ($f in [System.IO.Directory]::GetFiles($script:TempRoot, 'helper-*.dll')) { if ([System.IO.Path]::GetFileName($f) -ne $keep) { try { [System.IO.File]::Delete($f) } catch {} } }
@@ -1243,17 +1258,37 @@ function Get-DefaultAudioPos($audio) {
   return -1
 }
 
+# The subtitle languages taken without asking, best first: "SubLang" in config.json (e.g. "ru,en", the default, or "en").
+function Get-SubLangOrder {
+  $v = "$(Get-Prop $script:Cfg 'SubLang')"
+  if (-not $v.Trim()) { $v = 'ru,en' }
+  return @($v -split '[,; ]+' | Where-Object { $_ } | ForEach-Object { $_.Trim().ToLowerInvariant() })
+}
+
+# Is a track tagged $lang in language $want ("ru" = "rus", "en" = "eng", ...)?
+function Test-SubLang([string]$lang, [string]$want) {
+  $l = "$lang".Trim().ToLowerInvariant(); $w = "$want".Trim().ToLowerInvariant()
+  if (-not $l -or -not $w) { return $false }
+  if ($l -eq $w) { return $true }
+  $a = $script:LangNames[$l]; $b = $script:LangNames[$w]
+  return ([bool]$a -and $a -eq $b)
+}
+
 function Get-DefaultSubPos($subs, $audioTrack) {
   if ($subs.Count -eq 0) { return -1 }
   $alang = ''
   if ($audioTrack) { $alang = "$($audioTrack.Lang)" }
-  if (Test-English $alang) {
-    # English audio: only signs/songs subtitles, if there are any
+  $order = @(Get-SubLangOrder)
+  if ((Test-English $alang) -or ($alang -and @($order | Where-Object { Test-SubLang $alang $_ }).Count -gt 0)) {
+    # English audio (or audio in a language the subtitles would be in): only signs/songs subtitles, if there are any
     for ($i = 0; $i -lt $subs.Count; $i++) { if (Test-Signs $subs[$i]) { return $i } }
     return -1
   }
   if ($alang -and $alang -notmatch '^(?i)(und|unk|zxx|mis)$') {
-    for ($i = 0; $i -lt $subs.Count; $i++) { if ((Test-English $subs[$i].Lang) -and -not (Test-Signs $subs[$i])) { return $i } }
+    # A release with subtitles in many languages: Russian first, else English ("SubLang").
+    foreach ($w in $order) {
+      for ($i = 0; $i -lt $subs.Count; $i++) { if ((Test-SubLang $subs[$i].Lang $w) -and -not (Test-Signs $subs[$i])) { return $i } }
+    }
     for ($i = 0; $i -lt $subs.Count; $i++) { if ($subs[$i].Default -and -not (Test-Signs $subs[$i])) { return $i } }
     for ($i = 0; $i -lt $subs.Count; $i++) { if (-not (Test-Signs $subs[$i])) { return $i } }
     return 0
@@ -1432,6 +1467,7 @@ function New-QueueItem([string]$kind, [string]$src) {
     ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false; IsLive = $false
     FpsFilter = $null; OutFps = 24.0; FpsNote = $null; ResumeAt = 0.0; Attempts = 0; Announced = $false
     Site = $null; Cands = $null; CandIdx = 0; Using = $null; Stream = $null; DlKind = $null; Errors = @(); Retried = $false; NoDirect = $false; DirectFails = 0; Reset = $false
+    Torrent = $null
   }
 }
 
@@ -1471,6 +1507,8 @@ function Resolve-Entries([string[]]$entries) {
     if ($null -eq $raw) { continue }
     $e = "$raw".Trim().Trim('"').Trim()
     if (-not $e) { continue }
+    # (A magnet link, a bare info hash or a .torrent file: not a title to search for, not a video file.)
+    if (Test-TorrentLink $e) { [void]$urls.Add($e); continue }
     if ($e -match '^(?i)(https?|rtmps?|rtsp|rtspt|srt|udp)://') { [void]$urls.Add($e); continue }
     if (Test-IsTitle $e) {
       if (-not (Test-CanAsk)) { Say (T '  To search while a video plays, press + (it opens a second window): {0}' $e) 'Yellow'; continue }
@@ -1508,6 +1546,11 @@ function Resolve-Entries([string[]]$entries) {
   }
   if ($subFiles.Count -gt 0 -and $sorted.Count -eq 0) { Say (T '  Subtitle files have to be dropped together with their video.') 'Yellow' }
   foreach ($u in $urls) {
+    if (Test-TorrentLink $u) {
+      try { foreach ($it in @(Expand-Torrent $u)) { if ($it) { [void]$items.Add($it) } } }
+      catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
+      continue
+    }
     if (Test-SiteLink $u) {
       try { foreach ($it in @(Expand-SiteLink $u)) { if ($it) { [void]$items.Add($it) } } }
       catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
@@ -1522,7 +1565,7 @@ function Resolve-Entries([string[]]$entries) {
 function Add-Entries([string[]]$entries, [bool]$announce, [int]$insertAt = -1) {
   # (A VPS connection code is a password: it is never searched for or printed.)
   if (Test-HostModule) {
-    $entries = @($entries | Where-Object { -not (Test-VpsCodeText "$_") -and -not ("$_" -match '^[A-Za-z0-9_-]{40,}$' -and -not [System.IO.File]::Exists("$_")) })
+    $entries = @($entries | Where-Object { -not (Test-VpsCodeText "$_") -and -not ("$_" -match '^[A-Za-z0-9_-]{40,}$' -and -not [System.IO.File]::Exists("$_") -and -not (Test-TorrentLink "$_")) })
   }
   $items = @(Resolve-Entries $entries)
   $n = 0
@@ -1579,6 +1622,7 @@ function Read-Entries {
     Say (T '  - Type a title (anime, film, series - in Russian or English) and press Enter to search for it')
   }
   Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
+  Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
   Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
   Say (T '  - or just press Enter to pick files')
   if (Test-HasTranslations) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
@@ -1668,6 +1712,10 @@ function Stop-ProcessTree($proc) {
 }
 
 function Remove-ItemFiles($item) {
+  if ($item -and $item.Kind -eq 'torrent' -and $item.Torrent -and -not $item.Torrent.Released) {
+    $item.Torrent.Released = $true
+    try { Remove-TorrentRef $item.Torrent.G } catch {}
+  }
   if ($item -and $item.JobDir) {
     if ($item.PSObject.Properties['Dl'] -and $item.Dl -and $item.Dl.Proc) {
       # (The whole tree: yt-dlp's own ffmpeg would keep the files open.)
@@ -1914,6 +1962,10 @@ function Start-StreamDownload($item, $stream) {
 
 # How much of a web video's download is done (0..1; 0 when unknown).
 function Get-DownloadFraction($item) {
+  if ($item.DlKind -eq 'torrent') {
+    if ($item.Dl -and $item.Torrent -and $item.Torrent.Bytes -gt 0) { return [Math]::Min(1.0, $item.Dl.Done / $item.Torrent.Bytes) }
+    return 0.0
+  }
   if ($item.DlKind -ne 'ffmpeg' -or -not $item.DlDir -or -not $item.Stream -or $item.Stream.Duration -le 0) { return 0.0 }
   $pr = Read-Progress (PathJoin $item.DlDir 'progress.txt')
   if (-not $pr) { return 0.0 }
@@ -1921,6 +1973,7 @@ function Get-DownloadFraction($item) {
 }
 
 function Get-DownloadText($item) {
+  if ($item.DlKind -eq 'torrent') { return (Get-TorrentDownloadText $item) }
   if ($item.DlKind -eq 'ytdlp' -and $item.DlDir) {
     # yt-dlp runs quietly: what is on disk so far.
     $mb = (Get-DirBytes $item.DlDir) / 1MB
@@ -2279,6 +2332,859 @@ if ([System.IO.File]::Exists($script:PanelFile)) { . $script:PanelFile }
 $script:UpdateFile = PathJoin $script:ToolDir 'VRChatLinkMaker.Update.ps1'
 if ([System.IO.File]::Exists($script:UpdateFile)) { . $script:UpdateFile }
 
+# ------------------------------------------------------------------ torrents (each episode downloads completely, then plays)
+# A magnet link, a bare info hash (40 hex or 32 base32 characters), a .torrent file or a link to one (also a Nyaa
+# page) is downloaded with rqbit, a small free torrent program (github.com/ikatson/rqbit, Apache-2.0), fetched once
+# after asking into bin\rqbit (one pinned, checksum-verified release, like MediaMTX). An episode plays once it is
+# complete: from then on it is a video file on this PC (tracks, subtitles, the fonts inside it).
+# While an episode downloads it also uploads to others, capped ("TorrentUploadKBps", default 32 KB/s); when the
+# episode is complete the torrent is paused, so it stops uploading ("Torrents": "seed" keeps it going). Once its
+# episodes have played, the files are deleted. "Torrents": "off" turns torrent links off.
+# rqbit runs as a child of this tool (it ends with it, see ChildJob), without a window; its web API listens on
+# 127.0.0.1 only, on a free port, with a random password (a web page could otherwise send it commands). A magnet
+# link can take up to a minute or more to find the people sharing it: that runs in the background, never on the
+# loop that feeds the stream.
+$script:RqbitVersion = 'v9.0.1'
+$script:RqbitUrl = 'https://github.com/ikatson/rqbit/releases/download/v9.0.1/rqbit.exe'
+$script:RqbitBytes = 12706816
+$script:RqbitSha256 = '2ed683203beca628e0c45f62f99feeef4242cecc3444c8422dfe5b1b6aa38cea'
+$script:PinnedChecked = @{}     # tool -> exe path whose checksum was checked this run
+$script:PinnedRefused = @{}     # tool -> $true: the person said no this run (not asked again)
+$script:PinnedNoted = $false
+$script:Rqbit = $null           # the running engine: Proc, Port, Auth, Dir, DlDir, Lock, Ready, Started, Torrents (id -> group)
+$script:RqbitStarts = 0
+$script:KeepAwake = $false
+$script:NoteText = $null        # what the waiting screen's extra line says now (see Write-ScreenNote)
+$script:NoteAt = [datetime]::MinValue
+
+# 'magnet' | 'hash' | 'file' | 'url' when $s is a torrent link (a hand-over's #vrclm=... part ignored), else $null.
+function Test-TorrentLink([string]$s) {
+  $t = ([string]$s).Trim().Trim('"').Trim()
+  $i = $t.IndexOf('#vrclm=')
+  if ($i -ge 0) { $t = $t.Substring(0, $i) }
+  if (-not $t) { return $null }
+  if ($t -match '^(?i)magnet:\?') {
+    # (A v2-only magnet, "btmh", isn't supported.)
+    if ($t -match '(?i)[?&]xt=urn:btih:(?:[0-9a-f]{40}|[a-z2-7]{32})(?:&|$)') { return 'magnet' }
+    return $null
+  }
+  # A bare hash: 40 hex, or 32 base32 in capitals (no title looks like that).
+  if ($t -cmatch '^(?:[0-9a-fA-F]{40}|[A-Z2-7]{32})$') { return 'hash' }
+  if ($t -match '^(?i)https?://') {
+    $path = ($t -split '[?#]', 2)[0]
+    if ($path -match '(?i)\.torrent$') { return 'url' }
+    if ($path -match '^(?i)https?://(?:www\.)?nyaa\.si/(?:download|view)/\d+(?:\.torrent)?/?$') { return 'url' }
+    return $null
+  }
+  if ($t -match '(?i)\.torrent$') { try { if ([System.IO.File]::Exists([System.IO.Path]::GetFullPath($t))) { return 'file' } } catch {} }
+  return $null
+}
+
+function ConvertFrom-Base32Hash([string]$s) {
+  $alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  $sb = New-Object System.Text.StringBuilder
+  $bits = 0; $val = 0
+  foreach ($c in $s.ToUpperInvariant().ToCharArray()) {
+    $n = $alpha.IndexOf($c)
+    if ($n -lt 0) { return $null }
+    $val = (($val -shl 5) -bor $n) -band 0x1FFF
+    $bits += 5
+    if ($bits -ge 8) { $bits -= 8; [void]$sb.Append((($val -shr $bits) -band 0xFF).ToString('x2')) }
+  }
+  return $sb.ToString()
+}
+
+# The info hash (40 lowercase hex) of a magnet link or a bare hash.
+function Get-TorrentHash([string]$s) {
+  $v = ([string]$s).Trim()
+  $m = [regex]::Match($v, '(?i)[?&]xt=urn:btih:([0-9a-z]+)')
+  if ($m.Success) { $v = $m.Groups[1].Value }
+  if ($v -match '^[0-9a-fA-F]{40}$') { return $v.ToLowerInvariant() }
+  if ($v -match '^[A-Za-z2-7]{32}$') { return (ConvertFrom-Base32Hash $v) }
+  return $null
+}
+
+function Get-MagnetName([string]$m) {
+  $x = [regex]::Match($m, '(?i)[?&]dn=([^&#]+)')
+  if (-not $x.Success) { return '' }
+  try { return [Uri]::UnescapeDataString($x.Groups[1].Value.Replace('+', ' ')) } catch { return '' }
+}
+
+# A Nyaa page -> its .torrent file.
+function Get-TorrentFileUrl([string]$u) {
+  $m = [regex]::Match($u, '^(?i)(https?://(?:www\.)?nyaa\.si)/(?:view|download)/(\d+)')
+  if ($m.Success) { return "$($m.Groups[1].Value)/download/$($m.Groups[2].Value).torrent" }
+  return $u
+}
+
+function Get-TorrentsSetting {
+  $v = "$(Get-Prop $script:Cfg 'Torrents')".Trim().ToLowerInvariant()
+  if ($v -match '^(off|no|false|0)$') { return 'off' }
+  if ($v -eq 'seed') { return 'seed' }
+  return 'on'
+}
+function Get-TorrentUploadKBps { return [int](Get-NumSetting 'TorrentUploadKBps' 32 8 1000000) }
+function Get-TorrentDownloadKBps { return [int](Get-NumSetting 'TorrentDownloadKBps' 0 0 10000000) }
+
+function Get-JsonVal($o, [string]$k) {
+  if ($o -is [System.Collections.Generic.IDictionary[string, object]]) { if ($o.ContainsKey($k)) { return $o[$k] }; return $null }
+  if ($o -is [System.Collections.IDictionary]) { return $o[$k] }
+  return $null
+}
+
+function Get-FileSha256([string]$path) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $fs = [System.IO.File]::OpenRead($path)
+  try { $h = $sha.ComputeHash($fs) } finally { $fs.Dispose(); $sha.Dispose() }
+  return (-join ($h | ForEach-Object { $_.ToString('x2') }))
+}
+
+# Downloads $url to $dest, showing "<$progress with {0} = percent>" on the status line (MediaMTX, rqbit).
+function Save-WebFile([string]$url, [string]$dest, [string]$progress) {
+  try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+  $req = [System.Net.WebRequest]::Create($url)
+  $req.Timeout = 30000
+  if ($req -is [System.Net.HttpWebRequest]) { $req.UserAgent = 'VRChatLinkMaker'; $req.ReadWriteTimeout = 30000; $req.AllowAutoRedirect = $true }
+  $resp = $req.GetResponse()
+  try {
+    $total = [double]$resp.ContentLength
+    $in = $resp.GetResponseStream()
+    $out = [System.IO.File]::Create($dest)
+    try {
+      $buf = New-Object byte[] 262144
+      $done = 0.0
+      $last = [datetime]::MinValue
+      while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
+        $out.Write($buf, 0, $n)
+        $done += $n
+        if (((Get-Date) - $last).TotalMilliseconds -ge 400) {
+          $last = Get-Date
+          if ($total -gt 0 -and $progress) { Show-Status (T $progress ([int](100 * $done / $total))) }
+        }
+      }
+    } finally { $out.Dispose(); $in.Dispose() }
+  } finally { $resp.Close() }
+  Clear-StatusLine
+}
+
+# Path of a small helper program this tool downloads on demand (only 'rqbit' so far), or $null. It is downloaded only
+# after asking ($CanAsk), and only the pinned release whose size and SHA-256 match.
+function Get-PinnedTool([string]$Name, [bool]$CanAsk) {
+  if ($Name -ne 'rqbit') { return $null }
+  $dir = PathJoin (PathJoin $script:ToolDir 'bin') 'rqbit'
+  $exe = PathJoin $dir 'rqbit.exe'
+  if ([System.IO.File]::Exists($exe)) {
+    if ($script:PinnedChecked[$Name] -eq $exe) { return $exe }
+    $ok = $false
+    try { $ok = ((New-Object System.IO.FileInfo($exe)).Length -eq $script:RqbitBytes -and (Get-FileSha256 $exe) -eq $script:RqbitSha256) } catch {}
+    if ($ok) { $script:PinnedChecked[$Name] = $exe; return $exe }
+    Say (T 'rqbit is missing or changed - your antivirus may have removed it.') 'Yellow'
+  }
+  if (-not $CanAsk -or $script:PinnedRefused[$Name]) {
+    if (-not $CanAsk -and -not $script:PinnedNoted) {
+      $script:PinnedNoted = $true
+      Say (T 'Torrent links need rqbit - press + to set it up (a second window can ask).') 'Yellow'
+    }
+    return $null
+  }
+  Say ''
+  Say (T 'Torrents need rqbit, a free torrent program (12.7 MB, Apache-2.0, github.com/ikatson/rqbit). Nothing is installed.') 'Cyan'
+  Say (T 'While an episode downloads it also uploads to other people, capped at {0} KB/s, and it stops uploading when the episode is complete. Only download what you are allowed to.' (Get-TorrentUploadKBps)) 'Gray'
+  Say (T 'Windows may ask whether rqbit may use the network: Cancel is fine, it works either way.') 'Gray'
+  $ans = Read-Host (T 'Download rqbit {0} from github.com/ikatson/rqbit? [Y/n]' $script:RqbitVersion)
+  if (Test-AnswerNo $ans) { $script:PinnedRefused[$Name] = $true; return $null }
+  $tmp = PathJoin $script:TempRoot 'rqbit-download.exe'
+  try {
+    if (-not [System.IO.Directory]::Exists($script:TempRoot)) { [void][System.IO.Directory]::CreateDirectory($script:TempRoot) }
+    Save-WebFile $script:RqbitUrl $tmp 'Downloading rqbit... {0}%'
+    $len = (New-Object System.IO.FileInfo($tmp)).Length
+    if ($len -ne $script:RqbitBytes -or (Get-FileSha256 $tmp) -ne $script:RqbitSha256) {
+      Say (T 'The download doesn''t match the expected checksum, so it was not used. Try again later.') 'Red'
+      return $null
+    }
+    if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+    $new = $exe + '.new'
+    if ([System.IO.File]::Exists($new)) { [System.IO.File]::Delete($new) }
+    [System.IO.File]::Move($tmp, $new)
+    if ([System.IO.File]::Exists($exe)) { [System.IO.File]::Delete($exe) }
+    [System.IO.File]::Move($new, $exe)
+    $script:PinnedChecked[$Name] = $exe
+    Say (T 'rqbit {0} is ready.' $script:RqbitVersion) 'Green'
+    return $exe
+  } catch {
+    Clear-StatusLine
+    Say (T 'rqbit could not be downloaded: {0}' $_.Exception.Message) 'Red'
+    return $null
+  } finally { try { [System.IO.File]::Delete($tmp) } catch {} }
+}
+
+# One call to rqbit's web API (also run in background runspaces: it uses nothing else of this tool). The body can be
+# text or bytes (a .torrent file). Never throws for HTTP error codes (check .Status).
+function Invoke-RqbitHttp {
+  param([int]$Port, [string]$Auth, [string]$Method, [string]$Path, $Body, [string]$ContentType, [int]$TimeoutSec)
+  $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create("http://127.0.0.1:$Port$Path")
+  $req.Method = $Method
+  $req.Proxy = $null
+  $req.KeepAlive = $false
+  $req.Timeout = [Math]::Max(1, $TimeoutSec) * 1000
+  $req.ReadWriteTimeout = $req.Timeout
+  if ($Auth) { $req.Headers['Authorization'] = 'Basic ' + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Auth)) }
+  if ($Method -ne 'GET') {
+    $bytes = New-Object byte[] 0
+    if ($Body -is [byte[]]) { $bytes = $Body } elseif ($null -ne $Body) { $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Body) }
+    if ($ContentType) { $req.ContentType = $ContentType }
+    $req.ContentLength = $bytes.Length
+    if ($bytes.Length -gt 0) {
+      $rs = $req.GetRequestStream()
+      try { $rs.Write($bytes, 0, $bytes.Length) } finally { $rs.Dispose() }
+    }
+  }
+  $resp = $null
+  try { $resp = $req.GetResponse() }
+  catch [System.Net.WebException] { if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw } }
+  try {
+    $ms = New-Object System.IO.MemoryStream
+    $st = $resp.GetResponseStream()
+    try { $st.CopyTo($ms) } finally { $st.Dispose() }
+    return [pscustomobject]@{ Status = [int]$resp.StatusCode; Text = [System.Text.Encoding]::UTF8.GetString($ms.ToArray()) }
+  } finally { $resp.Close() }
+}
+
+# GET -> the answer's bytes (a .torrent file from Nyaa): the browser user agent and the session's cookies, like Invoke-Web.
+function Invoke-WebBytes {
+  param([string]$Url, [string]$UA, $Cookies, [int]$TimeoutSec = 30)
+  $req = [System.Net.HttpWebRequest][System.Net.WebRequest]::Create($Url)
+  $req.UserAgent = $UA
+  $req.Accept = '*/*'
+  if ($Cookies) { $req.CookieContainer = $Cookies }
+  $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+  $req.Timeout = $TimeoutSec * 1000
+  $req.ReadWriteTimeout = $TimeoutSec * 1000
+  $req.AllowAutoRedirect = $true
+  $resp = $null
+  try { $resp = $req.GetResponse() }
+  catch [System.Net.WebException] { if ($_.Exception.Response) { $resp = $_.Exception.Response } else { throw } }
+  try {
+    $ms = New-Object System.IO.MemoryStream
+    $st = $resp.GetResponseStream()
+    try { $st.CopyTo($ms) } finally { $st.Dispose() }
+    return [pscustomobject]@{ Status = [int]$resp.StatusCode; Bytes = $ms.ToArray() }
+  } finally { $resp.Close() }
+}
+
+function Invoke-Rqbit([string]$Method, [string]$Path, $Body = $null, [string]$ContentType = '', [int]$TimeoutSec = 5) {
+  $e = $script:Rqbit
+  if (-not $e) { throw (T 'rqbit isn''t running') }
+  return (Invoke-RqbitHttp -Port $e.Port -Auth $e.Auth -Method $Method -Path $Path -Body $Body -ContentType $ContentType -TimeoutSec $TimeoutSec)
+}
+
+# rqbit's error answer -> one short line.
+function Get-RqbitError([string]$text) {
+  $m = [regex]::Match([string]$text, '"(?:human_readable|error)"\s*:\s*"((?:[^"\\]|\\.)*)"')
+  if ($m.Success) { return (Get-ShortText ($m.Groups[1].Value -replace '\\"', '"') 120) }
+  return (Get-ShortText ([string]$text).Trim() 120)
+}
+
+# Starts rqbit (one per run of this tool) without waiting for it: Test-TorrentEngine says when its API answers.
+function Start-TorrentEngine {
+  if ($script:Rqbit) {
+    $alive = $false
+    try { $alive = -not $script:Rqbit.Proc.HasExited } catch {}
+    if ($alive) { return $script:Rqbit }
+    Stop-TorrentEngine
+  }
+  $exe = Get-PinnedTool 'rqbit' (Test-CanAsk)
+  if (-not $exe) { throw (T 'torrents need rqbit, which isn''t set up') }
+  $script:RqbitStarts++
+  $dir = PathJoin $script:TempRoot "torrent-$PID"
+  try { if ([System.IO.Directory]::Exists($dir)) { [System.IO.Directory]::Delete($dir, $true) } } catch {}
+  $dl = PathJoin $dir 'dl'
+  [void][System.IO.Directory]::CreateDirectory($dl)
+  # Held open while this copy of the tool runs, so another copy's clean-up (Clear-OldTemp) skips the folder.
+  $lock = $null
+  try { $lock = New-Object System.IO.FileStream((PathJoin $dir 'lock'), [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None) } catch {}
+  $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+  $l.Start()
+  $port = $l.LocalEndpoint.Port
+  $l.Stop()
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  $raw = New-Object byte[] 16
+  $rng.GetBytes($raw)
+  $secret = -join ($raw | ForEach-Object { $_.ToString('x2') })
+  $argv = New-Object System.Collections.Generic.List[string]
+  # (No listening port: outgoing connections only, nothing on the LAN or the router. Several copies of the tool can
+  # each run one: no DHT state is kept.)
+  foreach ($x in @('-v', 'warn', '-i', '300s', '--http-api-listen-addr', "127.0.0.1:$port", '--disable-tcp-listen', '--disable-upnp-port-forward',
+      '--disable-lsd', '--disable-dht-persistence', '--ratelimit-upload', [string]((Get-TorrentUploadKBps) * 1024))) { $argv.Add($x) }
+  $dk = Get-TorrentDownloadKBps
+  if ($dk -gt 0) { $argv.Add('--ratelimit-download'); $argv.Add([string]($dk * 1024)) }
+  foreach ($x in @('server', 'start', $dl, '--disable-persistence')) { $argv.Add($x) }
+  $psi = New-StartInfo $exe $argv.ToArray() $dir
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.RedirectStandardInput = $true
+  $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+  # (Only in rqbit's own environment: it has no command-line option for it, and this tool's other programs don't need it.)
+  $psi.EnvironmentVariables['RQBIT_HTTP_BASIC_AUTH_USERPASS'] = "vrclm:$secret"
+  $p = Start-Child $psi
+  try { $p.StandardInput.Close() } catch {}
+  $script:Rqbit = [pscustomobject]@{
+    Proc = $p; Port = $port; Auth = "vrclm:$secret"; Dir = $dir; DlDir = $dl; Lock = $lock; Ready = $false; Started = (Get-Date)
+    NextCheck = [datetime]::MinValue; Out = $p.StandardOutput.ReadToEndAsync(); Err = $p.StandardError.ReadToEndAsync(); Torrents = @{}
+  }
+  return $script:Rqbit
+}
+
+# $true once rqbit's API answers (and refuses a caller without the password), $false while it starts; throws when it
+# can't be used.
+function Test-TorrentEngine {
+  $e = $script:Rqbit
+  if (-not $e) { return $false }
+  if ($e.Ready) { return $true }
+  $dead = $true
+  try { $dead = $e.Proc.HasExited } catch {}
+  if ($dead) {
+    $why = ''
+    try { if ($e.Err.Wait(1000)) { $why = Get-LastLines ("$($e.Out.Result)`n$($e.Err.Result)") 1 } } catch {}
+    $early = ((Get-Date) - $e.Started).TotalSeconds -lt 3
+    Stop-TorrentEngine
+    # (Another program took the port in the meantime: once more on another one.)
+    if ($early -and $script:RqbitStarts -lt 3) { return $false }
+    if (-not $why) { $why = '?' }
+    throw (T 'rqbit stopped ({0})' (Get-ShortText $why 100))
+  }
+  if (((Get-Date) - $e.Started).TotalSeconds -gt 20) { Stop-TorrentEngine; throw (T 'rqbit didn''t start') }
+  if ((Get-Date) -lt $e.NextCheck) { return $false }
+  $e.NextCheck = (Get-Date).AddMilliseconds(200)
+  # (Only once its port listens: a connection to a port nobody listens on can take a second to fail on Windows.)
+  $up = $false
+  try { $up = @([System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq $e.Port }).Count -gt 0 } catch { $up = $true }
+  if (-not $up) { return $false }
+  $r = $null
+  try { $r = Invoke-Rqbit 'GET' '/' $null '' 1 } catch { return $false }
+  if ($r.Status -ne 200 -or $r.Text -notmatch '"server"\s*:\s*"rqbit"') { return $false }
+  $r2 = $null
+  try { $r2 = Invoke-RqbitHttp -Port $e.Port -Auth '' -Method 'GET' -Path '/' -Body $null -ContentType '' -TimeoutSec 2 } catch {}
+  if (-not $r2 -or $r2.Status -ne 401) { Stop-TorrentEngine; throw (T 'rqbit started without a password - not used') }
+  $e.Ready = $true
+  return $true
+}
+
+# The engine when it is ready, $null while it starts (started here when needed); throws when it can't be used.
+function Get-TorrentEngine {
+  if (-not $script:Rqbit) { [void](Start-TorrentEngine) }
+  if (Test-TorrentEngine) { return $script:Rqbit }
+  return $null
+}
+
+# Stops rqbit and deletes everything it downloaded (when this tool ends).
+function Stop-TorrentEngine {
+  $e = $script:Rqbit
+  if (-not $e) { return }
+  $script:Rqbit = $null
+  if ($e.Ready) {
+    foreach ($id in @($e.Torrents.Keys)) { try { [void](Invoke-RqbitHttp -Port $e.Port -Auth $e.Auth -Method 'POST' -Path "/torrents/$id/delete" -Body $null -ContentType '' -TimeoutSec 1) } catch {} }
+  }
+  try { if (-not $e.Proc.HasExited) { $e.Proc.Kill() } } catch {}
+  try { [void]$e.Proc.WaitForExit(3000) } catch {}
+  if ($e.Lock) { try { $e.Lock.Dispose() } catch {} }
+  try { [System.IO.Directory]::Delete($e.Dir, $true) } catch {}
+  if ([System.IO.Directory]::Exists($e.Dir)) { [void]$script:PendingDirs.Add($e.Dir) }
+}
+
+# One torrent (shared by the queue items of its episodes): what to send rqbit (Body: magnet text or .torrent bytes;
+# BodyUrl: a .torrent still to fetch), its files once known, its id in rqbit once added, the files it downloads now.
+function New-TorrentGroup([string]$link, [string]$kind) {
+  $g = [pscustomobject]@{
+    Link = $link; Kind = $kind; Body = $null; BodyUrl = $null; Hash = $null; Name = ''; Files = $null; Id = $null; OutDir = $null
+    Want = (New-Object System.Collections.Generic.List[int]); Job = $null; Error = $null; Refs = 0; Paused = $false; RetryAt = [datetime]::MinValue
+  }
+  if ($kind -eq 'magnet') { $g.Body = $link; $g.Hash = Get-TorrentHash $link; $g.Name = Get-MagnetName $link }
+  elseif ($kind -eq 'hash') { $g.Hash = Get-TorrentHash $link; $g.Body = "magnet:?xt=urn:btih:$($g.Hash)" }
+  elseif ($kind -eq 'file') {
+    $full = [System.IO.Path]::GetFullPath($link)
+    $g.Link = $full
+    $g.Body = [System.IO.File]::ReadAllBytes($full)
+    $g.Name = [System.IO.Path]::GetFileNameWithoutExtension($full)
+  } else {
+    $g.BodyUrl = Get-TorrentFileUrl $link
+    # (Named after the file until its own name is known: "BigBuckBunny_124_archive", or "torrent 2115493" for a Nyaa id.)
+    $n = [System.IO.Path]::GetFileNameWithoutExtension((($g.BodyUrl -split '[?#]', 2)[0]).TrimEnd('/'))
+    if ($n -match '^\d+$') { $n = T 'torrent {0}' $n }
+    $g.Name = $n
+  }
+  return $g
+}
+
+function New-TorrentItem($g, [string]$number) {
+  $it = New-QueueItem 'torrent' $g.Link
+  $it.Torrent = [pscustomobject]@{ G = $g; Number = $number; Idx = -1; Bytes = [long]0; Rel = $null; Released = $false }
+  $name = $g.Name
+  if (-not $name -and $g.Hash) { $name = T 'torrent {0}' $g.Hash.Substring(0, 8) }
+  if (-not $name) { $name = Get-ShortText $g.Link 70 }
+  if ($number) { $name += ' - ' + $number }
+  $it.Name = $name
+  $g.Refs++
+  return $it
+}
+
+# An episode number from a file name ("S01E05", "Show - 05 (720p)", "E05"), as text ("5", "12.5"), or $null.
+function Get-FileEpisodeNumber([string]$name) {
+  $b = [System.IO.Path]::GetFileNameWithoutExtension($name)
+  foreach ($rx in @('(?i)\bS\d+\s*E(\d+)', ' - (\d+(?:\.\d+)?)(?:v\d+)?(?: |$|[\[(])', '(?i)\b(?:E|EP|Episode)\s?(\d+)\b')) {
+    $m = [regex]::Match($b, $rx)
+    if ($m.Success) { return (Format-Num ([double]::Parse($m.Groups[1].Value, $script:Inv))) }
+  }
+  return $null
+}
+
+# A torrent's video files, in natural order, each with .Idx (rqbit's file id), .Name, .Rel, .Length and .Number
+# (from the file names; by position when they don't tell or repeat).
+function Get-TorrentEpisodes($files) {
+  $list = New-Object System.Collections.ArrayList
+  $i = 0
+  foreach ($f in @($files)) {
+    $comp = @(Get-JsonVal $f 'components' | ForEach-Object { [string]$_ })
+    if ($comp.Count -eq 0) { $comp = @([string](Get-JsonVal $f 'name')) }
+    $n = $comp[$comp.Count - 1]
+    if ($script:MediaExts -contains [System.IO.Path]::GetExtension($n).ToLowerInvariant()) {
+      [void]$list.Add([pscustomobject]@{ Idx = $i; Name = $n; Rel = ($comp -join '\'); Length = [long](Get-JsonVal $f 'length'); Number = $null })
+    }
+    $i++
+  }
+  $sorted = @($list | Sort-Object { Get-NaturalKey $_.Rel })
+  $seen = @{}
+  $byName = $true
+  foreach ($ep in $sorted) {
+    $n = Get-FileEpisodeNumber $ep.Name
+    if (-not $n -or $seen.ContainsKey($n)) { $byName = $false; break }
+    $seen[$n] = $true
+    $ep.Number = $n
+  }
+  if (-not $byName) { for ($k = 0; $k -lt $sorted.Count; $k++) { $sorted[$k].Number = [string]($k + 1) } }
+  return $sorted
+}
+
+function Set-TorrentItemFile($it, $ep) {
+  $it.Torrent.Idx = $ep.Idx
+  $it.Torrent.Bytes = $ep.Length
+  $it.Torrent.Rel = $ep.Rel
+  $it.Torrent.Number = $ep.Number
+  $it.Name = [System.IO.Path]::GetFileNameWithoutExtension($ep.Name)
+}
+
+# Sends one request to rqbit in a runspace of its own (adding a magnet waits until the people sharing it sent its file
+# list). $g.BodyUrl: the .torrent file is fetched first. Poll $g.Job.H.IsCompleted, then Complete-TorrentJob.
+function Start-TorrentJob($g, [string]$path, [int]$sec, $want = $null) {
+  $e = $script:Rqbit
+  $defs = @(foreach ($n in @('Invoke-RqbitHttp', 'Invoke-WebBytes')) { "function $n {`n" + (Get-Item "function:$n").ScriptBlock.ToString() + "`n}" }) -join "`n"
+  $ps = [powershell]::Create()
+  [void]$ps.AddScript({
+      param($defs, $port, $auth, $path, $body, $bodyUrl, $ua, $cookies, $sec)
+      . ([scriptblock]::Create($defs))
+      $fetched = $null
+      try {
+        if ($bodyUrl) {
+          $w = Invoke-WebBytes -Url $bodyUrl -UA $ua -Cookies $cookies -TimeoutSec 30
+          # (A .torrent file is a bencoded dictionary: it starts with "d".)
+          if ($w.Status -ne 200 -or $w.Bytes.Length -lt 20 -or $w.Bytes[0] -ne 100) { return [pscustomobject]@{ Status = 0; Text = ''; Error = $null; Fetch = $w.Status; Body = $null } }
+          $fetched = $w.Bytes
+          $body = $fetched
+        }
+        $r = Invoke-RqbitHttp -Port $port -Auth $auth -Method 'POST' -Path $path -Body $body -ContentType '' -TimeoutSec $sec
+        return [pscustomobject]@{ Status = $r.Status; Text = $r.Text; Error = $null; Fetch = 0; Body = $fetched }
+      } catch {
+        $x = $_.Exception
+        if ($x.InnerException) { $x = $x.InnerException }
+        return [pscustomobject]@{ Status = 0; Text = ''; Error = $x.Message; Fetch = 0; Body = $fetched }
+      }
+    }).AddArgument($defs).AddArgument($e.Port).AddArgument($e.Auth).AddArgument($path).AddArgument($g.Body).AddArgument($g.BodyUrl).AddArgument($script:WebUA).AddArgument($script:WebCookies).AddArgument($sec)
+  $g.Job = [pscustomobject]@{ Ps = $ps; H = $ps.BeginInvoke(); Started = (Get-Date); Sec = $sec; Want = @($want) }
+}
+
+function Stop-TorrentJob($g) {
+  if (-not $g.Job) { return }
+  try { [void]$g.Job.Ps.BeginStop($null, $null) } catch {}
+  $g.Job = $null
+}
+
+# Reads what rqbit answered: the file list, and the torrent's id when it was added (not just listed).
+function Complete-TorrentJob($g) {
+  $j = $g.Job
+  $g.Job = $null
+  $r = $null
+  try { $res = @($j.Ps.EndInvoke($j.H)); if ($res.Count -gt 0) { $r = $res[0] } } catch {}
+  try { $j.Ps.Dispose() } catch {}
+  if (-not $r) { $g.Error = T 'rqbit didn''t answer'; return }
+  if ($r.Body) { $g.Body = [byte[]]$r.Body; $g.BodyUrl = $null }
+  if ($r.Fetch) { $g.Error = T 'the .torrent file didn''t download (HTTP {0})' $r.Fetch; return }
+  if ($r.Error) {
+    if ($r.Error -match '(?i)time') { $g.Error = T 'no one is sharing this torrent right now (no file list after {0} s)' $j.Sec }
+    else { $g.Error = T 'rqbit: {0}' (Get-ShortText $r.Error 120) }
+    return
+  }
+  if ($r.Status -ne 200) {
+    $why = Get-RqbitError $r.Text
+    if ($why -match '(?i)timed? ?out|timeout') { $g.Error = T 'no one is sharing this torrent right now (no file list after {0} s)' $j.Sec }
+    else { $g.Error = T 'rqbit refused it: {0}' $why }
+    return
+  }
+  $a = ConvertFrom-JsonDict $r.Text
+  $d = Get-JsonVal $a 'details'
+  $files = Get-JsonVal $d 'files'
+  if ($null -eq $files) { $g.Error = T 'rqbit: {0}' (T 'unexpected answer'); return }
+  $g.Files = @($files)
+  $h = [string](Get-JsonVal $d 'info_hash')
+  if ($h -match '^[0-9a-fA-F]{40}$') { $g.Hash = $h.ToLowerInvariant() }
+  if (-not $g.Name) { $g.Name = [string](Get-JsonVal $d 'name') }
+  $id = Get-JsonVal $a 'id'
+  if ($null -ne $id) {
+    $g.Id = [string]$id
+    $g.OutDir = [string](Get-JsonVal $d 'output_folder')
+    if (-not $g.OutDir) { $g.OutDir = [string](Get-JsonVal $a 'output_folder') }
+    if ($script:Rqbit) { $script:Rqbit.Torrents[$g.Id] = $g }
+    $g.Want.Clear()
+    foreach ($x in @($j.Want)) { if ($null -ne $x) { $g.Want.Add([int]$x) } }
+    $g.Paused = $false
+  }
+}
+
+# The file list right now (this window may ask, so it may wait): up to a minute for a magnet / hash.
+function Get-TorrentFileList($g) {
+  $t0 = Get-Date
+  while (-not (Get-TorrentEngine)) {
+    if (((Get-Date) - $t0).TotalSeconds -gt 25) { throw (T 'rqbit didn''t start') }
+    Wait-Pump 0.2
+  }
+  $magnet = ($g.Body -is [string])
+  $q = '/torrents?list_only=true&overwrite=true'
+  if ($magnet) { $q += '&timeout_ms=60000' }
+  Start-TorrentJob $g $q 65
+  $said = $false
+  while (-not $g.Job.H.IsCompleted) {
+    $el = ((Get-Date) - $g.Job.Started).TotalSeconds
+    if (-not $said -and $el -gt 1) {
+      $said = $true
+      if ($magnet) { Say (T 'Getting the file list from the people sharing it (up to a minute)...') 'Gray' }
+    }
+    if ($el -gt 75) { Stop-TorrentJob $g; throw (T 'no one is sharing this torrent right now (no file list after {0} s)' 60) }
+    Wait-Pump 0.2
+  }
+  Complete-TorrentJob $g
+  if ($g.Error) { $e = $g.Error; $g.Error = $null; throw $e }
+}
+
+# A torrent link -> queue items, one per episode (video file) chosen. A window that may ask gets the file list now
+# and asks which episodes; otherwise the items are placeholders that find their files when it is their turn (the
+# episodes handed over by a second window: #vrclm=eps=1,2; else every episode, at most 25).
+function Expand-Torrent([string]$link) {
+  $eps = $null
+  $i = $link.IndexOf('#vrclm=')
+  if ($i -ge 0) {
+    $m = [regex]::Match($link.Substring($i), '[=&]eps=([^&]*)')
+    if ($m.Success) { $eps = @(([Uri]::UnescapeDataString($m.Groups[1].Value)) -split ',' | Where-Object { $_ }) }
+    $link = $link.Substring(0, $i)
+  }
+  if (-not $eps -and $script:SiteChoice -and $script:SiteChoice.Eps) { $eps = @($script:SiteChoice.Eps) }
+  $link = $link.Trim().Trim('"').Trim()
+  $kind = Test-TorrentLink $link
+  if (-not $kind) { return @() }
+  if ((Get-TorrentsSetting) -eq 'off') { Say (T '  Torrents are off ("Torrents": "off" in config.json): {0}' (Get-ShortText $link 70)) 'Yellow'; return @() }
+  $g = New-TorrentGroup $link $kind
+  if ($kind -eq 'hash') { Say (T '  A bare hash finds the people sharing it only through DHT: a magnet link or a .torrent file is faster.') 'DarkGray' }
+  $items = New-Object System.Collections.ArrayList
+  if (Test-CanAsk) {
+    Get-TorrentFileList $g
+    $list = @(Get-TorrentEpisodes $g.Files)
+    if ($list.Count -eq 0) { throw (T 'there is no video in this torrent') }
+    if ($g.Name) { Say (T 'Torrent: {0} ({1} videos)' $g.Name $list.Count) 'White' }
+    $pick = @($list)
+    if (Get-Command Select-SiteEpisodes -CommandType Function -ErrorAction SilentlyContinue) {
+      $saved = $script:SiteChoice
+      if ($eps) { $script:SiteChoice = [pscustomobject]@{ Dub = $null; Eps = $eps; Start = 0.0; Part = $null; Player = $null } }
+      try { $pick = @(Select-SiteEpisodes $list 0 $true) } finally { $script:SiteChoice = $saved }
+    }
+    foreach ($ep in $pick) { $it = New-TorrentItem $g $null; Set-TorrentItemFile $it $ep; [void]$items.Add($it) }
+  } elseif ($eps) {
+    foreach ($n in $eps) { [void]$items.Add((New-TorrentItem $g ([string]$n))) }
+  } else {
+    [void]$items.Add((New-TorrentItem $g $null))
+  }
+  return $items.ToArray()
+}
+
+# What a second window hands over for torrent items: the link (a bare hash as a magnet link, a file with its full path)
+# with the chosen episodes. Never anything secret: rqbit's password stays in each window.
+function Get-TorrentHandover($items, [string]$link) {
+  $i = $link.IndexOf('#vrclm=')
+  if ($i -ge 0) { $link = $link.Substring(0, $i) }
+  $link = $link.Trim().Trim('"').Trim()
+  $kind = Test-TorrentLink $link
+  if ($kind -eq 'hash') { $link = 'magnet:?xt=urn:btih:' + (Get-TorrentHash $link) }
+  elseif ($kind -eq 'file') { $link = [System.IO.Path]::GetFullPath($link) }
+  $nums = @($items | Where-Object { $_ -and $_.Torrent -and $_.Torrent.Number } | ForEach-Object { [string]$_.Torrent.Number })
+  if ($nums.Count -gt 0) { $link += '#vrclm=eps=' + [Uri]::EscapeDataString(($nums -join ',')) }
+  return $link
+}
+
+# A placeholder item finds its file now that the file list is known (more episodes become items of their own, right
+# after it in the queue).
+function Resolve-TorrentItem($item) {
+  $t = $item.Torrent
+  $g = $t.G
+  $list = @(Get-TorrentEpisodes $g.Files)
+  if ($list.Count -eq 0) { throw (T 'there is no video in this torrent') }
+  if ($t.Number) {
+    $ep = @($list | Where-Object { [string]$_.Number -eq [string]$t.Number }) | Select-Object -First 1
+    if (-not $ep) { throw (T 'episode {0} isn''t in this torrent' $t.Number) }
+    Set-TorrentItemFile $item $ep
+    return
+  }
+  $max = 25
+  if ($script:MaxUnasked) { $max = [int]$script:MaxUnasked }
+  $pick = @($list)
+  if ($pick.Count -gt $max) {
+    Say (T '  (queued the next {0} of {1} episodes - drop the link on the .bat to choose others)' $max $pick.Count) 'Gray'
+    $pick = @($pick[0..($max - 1)])
+  }
+  Set-TorrentItemFile $item $pick[0]
+  if ($pick.Count -gt 1) {
+    $pos = $script:Queue.IndexOf($item)
+    for ($k = 1; $k -lt $pick.Count; $k++) {
+      $it = New-TorrentItem $g $null
+      Set-TorrentItemFile $it $pick[$k]
+      if ($pos -ge 0) { $script:Queue.Insert($pos + $k, $it) }
+    }
+    if ($pos -ge 0) { Say (T '  + {0} more episodes of this torrent queued after it.' ($pick.Count - 1)) 'Green' }
+  }
+}
+
+function Assert-TorrentSpace([long]$bytes) {
+  $free = [long]-1
+  try { $free = (New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($script:TempRoot))).AvailableFreeSpace } catch {}
+  $need = [long]($bytes * 1.1) + 2GB
+  if ($free -ge 0 -and $free -lt $need) { throw (T 'not enough disk space (needs {0} GB)' ([Math]::Ceiling($need / 1GB))) }
+}
+
+# Step-Prep for a torrent item: engine -> file list -> added (only this episode's file) -> downloading -> 'probe'
+# (from there on it is a file on this PC). Never waits: every step that can take long runs in the background.
+function Step-TorrentPrep($item) {
+  $t = $item.Torrent
+  $g = $t.G
+  if ((Get-TorrentsSetting) -eq 'off') { throw (T 'torrents are off ("Torrents": "off" in config.json)') }
+  if ($g.Error) { throw $g.Error }
+  if ($item.State -eq 'downloading') { Update-TorrentDownload $item; return }
+  $item.State = 'torrent-meta'
+  if (-not (Get-TorrentEngine)) { return }
+  if ($g.Job) {
+    if (-not $g.Job.H.IsCompleted) {
+      if (((Get-Date) - $g.Job.Started).TotalSeconds -lt $g.Job.Sec + 10) { return }
+      $sec = $g.Job.Sec
+      Stop-TorrentJob $g
+      $g.Error = T 'no one is sharing this torrent right now (no file list after {0} s)' $sec
+    } else { Complete-TorrentJob $g }
+    if ($g.Error) { throw $g.Error }
+  }
+  $magnet = ($g.Body -is [string])
+  if (-not $g.Files) {
+    if ($magnet) {
+      # (Added at once with just its first file: one wait for the people sharing it, then the right files.)
+      Start-TorrentJob $g ('/torrents?overwrite=true&only_files=0&sub_folder=' + $g.Hash + '&timeout_ms=90000') 90 @(0)
+    } else { Start-TorrentJob $g '/torrents?list_only=true&overwrite=true' 40 }
+    return
+  }
+  if ($t.Idx -lt 0) { Resolve-TorrentItem $item }
+  if (-not $g.Id) {
+    Assert-TorrentSpace $t.Bytes
+    $q = '/torrents?overwrite=true&only_files=' + $t.Idx + '&sub_folder=' + $g.Hash
+    if ($magnet) { $q += '&timeout_ms=90000' }
+    Start-TorrentJob $g $q 90 @($t.Idx)
+    return
+  }
+  # (Just added, rqbit still checks what is on disk: it takes no changes until then.)
+  if ((Get-Date) -lt $g.RetryAt) { return }
+  # Only the files being downloaded now (rqbit takes them in order); finished ones stay on disk until played.
+  $want = @($t.Idx) + @($script:Queue | Where-Object { $_ -ne $item -and $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' } | ForEach-Object { $_.Torrent.Idx })
+  $want = @($want | Sort-Object -Unique)
+  if (($want -join ',') -ne (@($g.Want | Sort-Object -Unique) -join ',')) {
+    if (-not $g.Want.Contains($t.Idx)) { Assert-TorrentSpace $t.Bytes }
+    $r = Invoke-Rqbit 'POST' "/torrents/$($g.Id)/update_only_files" ('{"only_files":[' + ($want -join ',') + ']}') 'application/json' 5
+    if ($r.Status -ne 200 -and (Get-RqbitError $r.Text) -match '(?i)initiali') { $g.RetryAt = (Get-Date).AddSeconds(1); return }
+    if ($r.Status -ne 200) { throw (T 'rqbit refused it: {0}' (Get-RqbitError $r.Text)) }
+    $g.Want.Clear()
+    foreach ($x in $want) { $g.Want.Add([int]$x) }
+  }
+  if ($g.Paused) {
+    $r = Invoke-Rqbit 'POST' "/torrents/$($g.Id)/start" $null '' 5
+    if ($r.Status -ne 200 -and (Get-RqbitError $r.Text) -match '(?i)initiali') { $g.RetryAt = (Get-Date).AddSeconds(1); return }
+    if ($r.Status -ne 200) { throw (T 'rqbit refused it: {0}' (Get-RqbitError $r.Text)) }
+    $g.Paused = $false
+  }
+  $now = Get-Date
+  $item.Dl = [pscustomobject]@{ Started = $now; NextPoll = $now; LastPoll = $now; LastBytes = [long]-1; MovedAt = $now; Done = [long]0; Speed = 0.0; Peers = 0; Eta = -1.0; WokeAt = $null; Kicked = $false }
+  $item.DlKind = 'torrent'
+  $item.State = 'downloading'
+  Update-TorrentDownload $item
+}
+
+# Looks at a downloading episode every 2 s (rqbit's stats; a loopback call of a few ms).
+function Update-TorrentDownload($item) {
+  $dl = $item.Dl
+  $t = $item.Torrent
+  $g = $t.G
+  $now = Get-Date
+  if ($now -lt $dl.NextPoll) { return }
+  # (A long gap = this PC was asleep: its connections are gone. Not the torrent's fault.)
+  if (($now - $dl.LastPoll).TotalSeconds -gt 30) { $dl.WokeAt = $now; $dl.MovedAt = $now; $dl.Kicked = $false }
+  $dl.LastPoll = $now
+  $dl.NextPoll = $now.AddSeconds(2)
+  $r = $null
+  try { $r = Invoke-Rqbit 'GET' "/torrents/$($g.Id)/stats/v1" $null '' 3 } catch { return }
+  if ($r.Status -ne 200) { return }
+  $j = $null
+  try { $j = ConvertFrom-JsonDict $r.Text } catch { return }
+  if ([string](Get-JsonVal $j 'state') -eq 'error') { throw (T 'rqbit: {0}' (Get-ShortText ([string](Get-JsonVal $j 'error')) 120)) }
+  $fp = @(Get-JsonVal $j 'file_progress')
+  $done = [long]0
+  if ($t.Idx -lt $fp.Count) { $done = [long]$fp[$t.Idx] }
+  $speed = 0.0; $peers = 0; $eta = -1.0
+  $live = Get-JsonVal $j 'live'
+  if ($live) {
+    $ds = Get-JsonVal $live 'download_speed'
+    if ($ds) { $speed = [double](Get-JsonVal $ds 'mbps') * 1MB }   # (mbps = MiB per second)
+    $pst = Get-JsonVal (Get-JsonVal $live 'snapshot') 'peer_stats'
+    if ($pst) { $peers = [int](Get-JsonVal $pst 'live') }
+    $tr = Get-JsonVal $live 'time_remaining'
+    if ($tr) { $du = Get-JsonVal $tr 'duration'; if ($du) { $eta = [double](Get-JsonVal $du 'secs') } }
+  }
+  if ($eta -lt 0 -and $speed -gt 0) { $eta = ($t.Bytes - $done) / $speed }
+  $dl.Done = $done; $dl.Speed = $speed; $dl.Peers = $peers; $dl.Eta = $eta
+  if ($done -ne $dl.LastBytes) { $dl.LastBytes = $done; $dl.MovedAt = $now }
+  if ($t.Bytes -gt 0 -and $done -ge $t.Bytes) { Complete-TorrentDownload $item; return }
+  # Nothing came for a minute after the PC woke up: pause + start makes rqbit reconnect and ask the trackers again.
+  if ($dl.WokeAt -and -not $dl.Kicked -and ($now - $dl.WokeAt).TotalSeconds -ge 60 -and $dl.MovedAt -le $dl.WokeAt) {
+    $dl.Kicked = $true
+    try { [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/pause" $null '' 3); [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/start" $null '' 3) } catch {}
+  }
+  if (($now - $dl.MovedAt).TotalSeconds -ge 300 -and $peers -eq 0) { throw (T 'stalled: nobody shared it for {0} minutes' 5) }
+}
+
+function Complete-TorrentDownload($item) {
+  $t = $item.Torrent
+  $g = $t.G
+  $p = $null
+  if ($g.OutDir) { $p = PathJoin $g.OutDir $t.Rel }
+  if (-not $p -or -not [System.IO.File]::Exists($p)) {
+    # (Where rqbit put it after all: the file's name and size.)
+    $p = $null
+    $leaf = [System.IO.Path]::GetFileName($t.Rel)
+    try {
+      foreach ($f in [System.IO.Directory]::GetFiles($script:Rqbit.DlDir, $leaf, [System.IO.SearchOption]::AllDirectories)) {
+        if ((New-Object System.IO.FileInfo($f)).Length -eq $t.Bytes) { $p = $f; break }
+      }
+    } catch {}
+  }
+  if (-not $p) { throw (T 'the downloaded file isn''t there') }
+  $item.Path = $p
+  # Complete: no more uploading (unless "Torrents": "seed", or another episode of it still downloads).
+  $busy = @($script:Queue | Where-Object { $_ -ne $item -and $_.Kind -eq 'torrent' -and $_.Torrent -and $_.Torrent.G -eq $g -and $_.State -eq 'downloading' }).Count -gt 0
+  if ((Get-TorrentsSetting) -ne 'seed' -and -not $busy -and -not $g.Paused) {
+    try { $r = Invoke-Rqbit 'POST' "/torrents/$($g.Id)/pause" $null '' 5; if ($r.Status -eq 200) { $g.Paused = $true } } catch {}
+  }
+  $item.State = 'probe'
+}
+
+# An episode played (or was skipped / dropped): when none of its torrent's episodes is left, rqbit deletes the files.
+function Remove-TorrentRef($g) {
+  $g.Refs--
+  if ($g.Refs -gt 0) { return }
+  Stop-TorrentJob $g
+  $e = $script:Rqbit
+  if ($g.Id -and $e -and $e.Ready) {
+    try { [void](Invoke-Rqbit 'POST' "/torrents/$($g.Id)/delete" $null '' 5) } catch {}
+    [void]$e.Torrents.Remove($g.Id)
+  }
+  $g.Id = $null
+}
+
+function Format-Bytes([double]$b) {
+  if ($b -ge 1GB) { return (T '{0} GB' ([Math]::Round($b / 1GB, 1).ToString('0.0', $script:Inv))) }
+  if ($b -lt 10MB) { return (T '{0} MB' ([Math]::Round($b / 1MB, 1).ToString('0.0', $script:Inv))) }
+  return (T '{0} MB' ([Math]::Round($b / 1MB).ToString('0', $script:Inv)))
+}
+
+function Format-Eta([double]$sec) {
+  if ($sec -lt 90) { return (T '1 min') }
+  if ($sec -lt 3600) { return (T '{0} min' ([Math]::Round($sec / 60))) }
+  return (T '{0} h {1} min' ([Math]::Floor($sec / 3600)) ([Math]::Round(($sec % 3600) / 60)))
+}
+
+function Get-TorrentDownloadText($item) {
+  $dl = $item.Dl
+  if (-not $dl -or $dl.LastBytes -lt 0) { return (T 'starting the download') }
+  $t = $item.Torrent
+  $pct = 0
+  if ($t.Bytes -gt 0) { $pct = [int][Math]::Min(99, [Math]::Floor(100.0 * $dl.Done / $t.Bytes)) }
+  if ($dl.Eta -ge 0) { return (T 'downloading {0}% of {1}, {2}/s, {3} peers, about {4}' $pct (Format-Bytes $t.Bytes) (Format-Bytes $dl.Speed) $dl.Peers (Format-Eta $dl.Eta)) }
+  return (T 'downloading {0}% of {1}, {2} peers' $pct (Format-Bytes $t.Bytes) $dl.Peers)
+}
+
+# The extra line under the waiting screen's text: how far the next episode's download is (viewers see it too).
+function Get-ScreenNoteText {
+  if ($script:Idx -ge $script:Queue.Count) { return '' }
+  $nx = $script:Queue[$script:Idx]
+  if ($nx.Kind -ne 'torrent') { return '' }
+  if ($nx.State -eq 'downloading' -and $nx.Dl -and $nx.Dl.LastBytes -ge 0 -and $nx.Torrent.Bytes -gt 0) {
+    $pct = [int][Math]::Min(99, [Math]::Floor(100.0 * $nx.Dl.Done / $nx.Torrent.Bytes))
+    if ($nx.Dl.Eta -ge 0) { return (T 'Downloading the next episode: {0}% of {1}, about {2}' $pct (Format-Bytes $nx.Torrent.Bytes) (Format-Eta $nx.Dl.Eta)) }
+    return (T 'Downloading the next episode: {0}% of {1}' $pct (Format-Bytes $nx.Torrent.Bytes))
+  }
+  if ($nx.State -eq 'new' -or $nx.State -eq 'torrent-meta' -or $nx.State -eq 'downloading') { return (T 'Looking for people sharing the next episode...') }
+  return ''
+}
+
+# The waiting screen reads its extra line from this file (ffmpeg's drawtext, every frame). The file is replaced in one
+# step, never deleted or half-written: a read that failed would stop the waiting screen.
+function Get-NoteFile { return (PathJoin $script:SlateDir "next-$PID.txt") }
+function Write-ScreenNote([string]$text) {
+  if (-not $script:SlateDir) { return }
+  if (-not $text) { $text = ' ' }
+  if ($text -eq $script:NoteText) { return }
+  $f = Get-NoteFile
+  $tmp = $f + '.tmp'
+  try {
+    [System.IO.File]::WriteAllText($tmp, $text, $script:Utf8NoBom)
+    if ([System.IO.File]::Exists($f)) { [System.IO.File]::Replace($tmp, $f, [System.Management.Automation.Language.NullString]::Value) } else { [System.IO.File]::Move($tmp, $f) }
+    $script:NoteText = $text
+  } catch { try { [System.IO.File]::Delete($tmp) } catch {} }
+}
+
+# Called every 2 s while a screen or video plays: at most every 5 s.
+function Update-ScreenNote {
+  if (((Get-Date) - $script:NoteAt).TotalSeconds -lt 5) { return }
+  $script:NoteAt = Get-Date
+  Write-ScreenNote (Get-ScreenNoteText)
+}
+
+# Keeps this PC from going to sleep while the stream is on the air or a torrent downloads (the screen may still turn
+# off). The setting belongs to the thread that made it: only this window's main thread calls this.
+function Update-KeepAwake([bool]$off = $false) {
+  $want = $false
+  if (-not $off) {
+    $want = (Test-RelayAlive) -or (@($script:Queue | Where-Object { $_.Kind -eq 'torrent' -and ($_.State -eq 'downloading' -or $_.State -eq 'torrent-meta') }).Count -gt 0)
+  }
+  if ($want -eq $script:KeepAwake) { return }
+  try {
+    if (Initialize-Helper) {
+      $flags = [uint32]2147483648                  # ES_CONTINUOUS (alone: back to normal)
+      if ($want) { $flags = [uint32]2147483649 }   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+      [void][VRCLinkMaker.Power]::SetThreadExecutionState($flags)
+      $script:KeepAwake = $want
+    }
+  } catch {}
+}
+
 # ------------------------------------------------------------------ preparing an item (probe, subtitles, downloads)
 $script:JobLocks = @{}
 function New-JobDir {
@@ -2495,6 +3401,12 @@ function Step-Prep($item) {
   if (-not $item) { return }
   if ($item.State -eq 'ready' -or $item.State -eq 'failed') { return }
   try {
+    if ($item.Kind -eq 'torrent' -and ($item.State -eq 'new' -or $item.State -eq 'torrent-meta' -or $item.State -eq 'downloading')) {
+      # (Downloaded completely first; then it is a file on this PC: probe, tracks, subtitles as for any file.)
+      if (-not $item.JobDir) { $item.JobDir = New-JobDir }
+      Step-TorrentPrep $item
+      if ($item.State -ne 'probe') { return }
+    }
     if ($item.State -eq 'new') {
       if (-not $item.JobDir) { $item.JobDir = New-JobDir }
       if ($item.Kind -eq 'site') {
@@ -2646,6 +3558,7 @@ function Wait-Prep($item) {
     if ($item.State -eq 'ready' -or $item.State -eq 'failed') { break }
     if (-not $shown -and ((Get-Date) - $t0).TotalSeconds -gt 1.5) { Say (T 'Getting {0} ready...' $item.Name) 'Gray'; $shown = $true }
     if ($item.State -eq 'downloading') { Show-Status (T '  {0}   (Ctrl+C = stop)' (Get-DownloadText $item)) }
+    Update-KeepAwake
     Wait-Pump 0.2
   }
   Clear-StatusLine
@@ -2657,7 +3570,7 @@ function Update-Prep {
   for ($i = $script:Idx; $i -le $last; $i++) {
     $it = $script:Queue[$i]
     if ($i -gt $script:Idx) { Step-Prep $it }
-    if ($it.State -eq 'downloading' -or ($i -eq $script:Idx -and $it.State -eq 'new')) { break }
+    if ($it.State -eq 'downloading' -or $it.State -eq 'torrent-meta' -or ($i -eq $script:Idx -and $it.State -eq 'new')) { break }
     # (A link still looked at in the background may turn into a download: the ones after it wait, to keep the order.)
     $bgBusy = ($it.PSObject.Properties['PickBg'] -and $it.PickBg) -or ($it.PSObject.Properties['ProbeBg'] -and $it.ProbeBg)
     if ($bgBusy -and ($it.State -eq 'new' -or $it.State -eq 'probe')) { break }
@@ -2829,7 +3742,17 @@ function Get-SlateArgs([double]$off, [string]$assFile = 'slate.ass', [bool]$prev
   foreach ($x in @('-hide_banner', '-y', '-v', 'error', '-nostats', '-progress', 'progress.txt', '-re', '-f', 'lavfi', '-i', "color=c=black:s=$($W)x$($H):r=$($script:StreamFps)",
       '-re', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo')) { $a.Add($x) }
   $vChain = "format=$pix"
-  if ($script:CanSubs -and -not $script:SlateNoText) { $vChain = "subtitles=filename=$($assFile):fontsdir=fonts,format=$pix" }
+  if ($script:CanSubs -and -not $script:SlateNoText) {
+    $vChain = "subtitles=filename=$($assFile):fontsdir=fonts"
+    # The waiting screen gets one more line while the next episode downloads (how far it got, see Write-ScreenNote).
+    # Only the picture changes: the encoder settings, and so the H.264 header, stay the same.
+    $nf = Get-NoteFile
+    if ($assFile -eq 'slate.ass' -and $script:HasDrawtext -and [System.IO.File]::Exists($nf) -and [System.IO.File]::Exists((PathJoin $script:SlateDir 'fonts\arialbd.ttf'))) {
+      $fs = [Math]::Max(12, [int]($H / 26))
+      $vChain += ",drawtext=fontfile=fonts/arialbd.ttf:textfile=$([System.IO.Path]::GetFileName($nf)):reload=1:expansion=none:fontsize=$($fs):fontcolor=white@0.8:x=(w-tw)/2:y=h*0.62"
+    }
+    $vChain += ",format=$pix"
+  }
   $ct = Get-ColourTagFilter
   if ($ct) { $vChain += ",$ct" }
   $vOff = Get-OffsetFilter 'v' $off
@@ -4149,6 +5072,7 @@ function Invoke-Source {
   if ($src -and $src.Adopt -and $src.Kind -eq $Kind) { try { $alive = -not $src.Proc.HasExited } catch {} }
   if (-not $alive) {
     if ($script:Src) { [void](Stop-Source $script:Src -Now) }
+    if ($Kind -eq 'waiting') { $script:NoteAt = [datetime]::MinValue; Update-ScreenNote }
     $src = Start-Source $Kind $Media $Start
   }
   $src.Adopt = $false
@@ -4334,6 +5258,8 @@ function Invoke-Source {
       $nextPoll = $now.AddSeconds(2)
       Receive-QueueFile
       Update-Prep
+      Update-KeepAwake
+      if ($Kind -eq 'waiting') { Update-ScreenNote }
       if ($script:PendingDirs.Count -gt 0) { Remove-PendingDirs }
       try { Update-UpnpLeases } catch {}
       # (Finished background programs: their handles and output aren't needed any more.)
@@ -5233,11 +6159,15 @@ function Stop-Everything {
   # Downloads first, as whole trees (yt-dlp's own ffmpeg would go on recording once yt-dlp is gone).
   foreach ($it in $script:Queue) { if ($it.Dl -and $it.Dl.Proc) { try { if (-not $it.Dl.Proc.HasExited) { Stop-ProcessTree $it.Dl.Proc } } catch {} } }
   foreach ($bg in $script:BgProcs) { Stop-Proc $bg.Proc }
+  # rqbit deletes what it downloaded, then ends (before the item folders go).
+  try { Stop-TorrentEngine } catch {}
   Close-Relay
   Start-Sleep -Milliseconds 300
   try { [System.IO.File]::Delete((Get-RelayProgPath)) } catch {}
   foreach ($it in $script:Queue) { Remove-ItemFiles $it }
   if ($script:PendingDirs.Count -gt 0) { Start-Sleep -Milliseconds 500; Remove-PendingDirs }
+  Update-KeepAwake $true
+  if ($script:SlateDir) { try { [System.IO.File]::Delete((Get-NoteFile)) } catch {} }
   if ($script:MutexOwned) { try { $script:Mutex.ReleaseMutex() } catch {} }
   if ($script:LogWriter) { try { $script:LogWriter.Dispose() } catch {}; $script:LogWriter = $null }
 }
@@ -5259,6 +6189,17 @@ function Main {
     $abs = @()
     foreach ($e in $entries) {
       $t = "$e".Trim().Trim('"')
+      if (Test-TorrentLink $t) {
+        # A torrent (magnet, bare hash, .torrent file or link): its file list and which episodes are asked here; the
+        # streaming window gets the link with the episodes (a bare hash as a magnet link, a file with its full path).
+        if ($script:Interactive) {
+          try {
+            $its = @(Expand-Torrent $t)
+            if ($its.Count -gt 0) { $abs += (Get-TorrentHandover $its $t) }
+          } catch { if ($script:CtrlCQuit) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow' }
+        } else { $abs += (Get-TorrentHandover @() $t) }
+        continue
+      }
       if ($script:Interactive -and $t -notmatch '^(?i)[a-z][a-z0-9+.-]*://' -and (Test-IsTitle $t)) {
         # A title: search, pick, answer the questions here; the streaming window gets the link with the answers.
         $script:LastSearchLink = $null

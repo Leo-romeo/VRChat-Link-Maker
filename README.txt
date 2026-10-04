@@ -106,6 +106,37 @@ just type a title (Russian or English) instead of a link and press Enter.
   dub), that one can be picked too.
 - This works on the start screen, while something streams, and in the search
   window that + opens (there you can "play now" or add to the queue).
+- English anime: SubsPlease and Nyaa (trusted uploads only) are searched too.
+  Their rows come last and are marked [EN]; they are torrents (see below).
+
+
+TORRENTS (MAGNET LINKS, .TORRENT FILES, ENGLISH ANIME)
+------------------------------------------------------
+Paste a magnet link, a .torrent file (or a link to one, also a Nyaa page) or
+a bare info hash, or pick an [EN] search result. Each episode is downloaded
+completely first and then played like a video file on your PC (its own
+subtitles and fonts included). Meanwhile the waiting screen shows viewers how
+far the download got ("Downloading the next episode: 45% of 700 MB, about
+1 min").
+
+- Only download what you are allowed to. The tool ships no trackers and no
+  lists; what you download is your own responsibility.
+- The first time, it asks to download rqbit, a small free torrent program
+  (12.7 MB, Apache-2.0, from github.com/ikatson/rqbit) into the bin\rqbit
+  folder. Nothing is installed. Its checksum is verified.
+- While an episode downloads it also uploads to other people (that's how
+  torrents work), capped at 32 KB/s. When the episode is complete, it stops
+  uploading.
+- Episodes are deleted after they have played (and when the tool closes).
+- Windows may ask whether rqbit may use the network: Cancel is fine, it works
+  either way.
+- A magnet link or a bare hash first needs the file list from the people
+  sharing it (up to a minute). A bare hash is the slowest: a magnet link or a
+  .torrent file is faster.
+- The PC is kept awake while a torrent downloads (and while the stream is on
+  the air).
+- Releases with subtitles in many languages (e.g. Erai-raws "MultiSub") get
+  Russian subtitles if they have them, else English ("SubLang" below).
 
 
 WHILE IT'S STREAMING
@@ -479,6 +510,13 @@ All of these are optional.
   YummyAppToken  empty (the default). YummyAnime works without one today; if
               it starts asking for an app token, make one on its site
               (yummyani.me/dev/applications) and put it here.
+  Torrents    "on" (the default), "off" (torrent links are ignored) or
+              "seed" (keeps uploading after an episode is complete).
+  TorrentUploadKBps    32. The upload cap while an episode downloads (at
+              least 8).
+  TorrentDownloadKBps  0 = no cap. A number caps the download speed (KB/s).
+  SubLang     "ru,en" (the default): subtitle languages taken without asking,
+              best first. "en" = English first.
 Delete config.json to get a brand-new link.
 
 
