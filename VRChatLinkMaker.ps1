@@ -1251,8 +1251,15 @@ function Select-Tracks($item) {
   $audio = @($item.Info.Audio)
   $subs = @()
   if ($script:CanSubs -and -not $item.IsDirectUrl) { $subs = @($item.Info.Subs) + @($item.ExtraSubs) }
-  else { $subs = @($item.Info.Subs | Where-Object { $_.Kind -eq 'bitmap' }) }  # text subs would mean reading the whole file first
+  else {
+    $subs = @($item.Info.Subs | Where-Object { $_.Kind -eq 'bitmap' })  # text subs inside it would mean reading the whole file first
+    # Subtitle files already on this PC are fine (a web video's own subtitle file, see Add-SiteSubtitle).
+    if ($script:CanSubs) { $subs += @($item.ExtraSubs | Where-Object { $_ -and $_.Kind -eq 'external' -and $_.Path -and [System.IO.File]::Exists($_.Path) }) }
+  }
   $subs = @($subs | Where-Object { $_ })
+  # (A translation that is subtitles only: its subtitle file is the translation, see Add-SiteSubtitle.)
+  $sitePos = -1
+  for ($i = 0; $i -lt $subs.Count; $i++) { if ($subs[$i].PSObject.Properties['FromSite']) { $sitePos = $i; break } }
   $aPos = Get-DefaultAudioPos $audio
   $sPos = -1
   $canAsk = (Test-CanAsk) -and ($null -eq $script:TrackPref)
@@ -1266,6 +1273,7 @@ function Select-Tracks($item) {
     $aTrack = $null
     if ($aPos -ge 0) { $aTrack = $audio[$aPos] }
     $sPos = Get-DefaultSubPos $subs $aTrack
+    if ($sPos -lt 0) { $sPos = $sitePos }
     if ($subs.Count -gt 0) {
       $labels = @($subs | ForEach-Object { Get-TrackLabel $_ })
       $sPos = Read-Choice (T 'Which subtitles? (they get drawn into the picture)') $labels $sPos $true
@@ -1297,6 +1305,8 @@ function Select-Tracks($item) {
     if ($aPos -ge 0) { $aTrack = $audio[$aPos] }
     $sPos = Get-DefaultSubPos $subs $aTrack
   }
+  # (Whatever language the sound is tagged with, unless "no subtitles" was picked.)
+  if ($sPos -lt 0 -and $sitePos -ge 0 -and -not ($script:TrackPref -and $script:TrackPref.SNone)) { $sPos = $sitePos }
   $item.AudioTrack = $null
   if ($aPos -ge 0 -and $aPos -lt $audio.Count) { $item.AudioTrack = $audio[$aPos] }
   $item.SubTrack = $null
@@ -1323,7 +1333,7 @@ function New-QueueItem([string]$kind, [string]$src) {
   return [pscustomobject]@{
     Kind = $kind; Source = $src; Path = $path; Name = $name; State = 'new'; Error = $null
     JobDir = $null; Info = $null; AudioTrack = $null; SubTrack = $null; SubFile = $null; SubIsSrt = $false; SubWarn = $null
-    ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false
+    ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false; IsLive = $false
     FpsFilter = $null; OutFps = 24.0; FpsNote = $null; ResumeAt = 0.0; Attempts = 0; Announced = $false
     Site = $null; Cands = $null; CandIdx = 0; Using = $null; Stream = $null; DlKind = $null; Errors = @(); Retried = $false; NoDirect = $false; DirectFails = 0; Reset = $false
   }
@@ -1796,6 +1806,12 @@ function Get-DownloadFraction($item) {
 }
 
 function Get-DownloadText($item) {
+  if ($item.DlKind -eq 'ytdlp' -and $item.DlDir) {
+    # yt-dlp runs quietly: what is on disk so far.
+    $mb = (Get-DirBytes $item.DlDir) / 1MB
+    if ($mb -lt 0.1) { return (T 'starting the download') }
+    return (T 'downloaded {0} MB' ([Math]::Round($mb, 1).ToString('0.0', $script:Inv)))
+  }
   if ($item.DlKind -ne 'ffmpeg' -or -not $item.DlDir) { return (T 'downloading') }
   $pr = Read-Progress (PathJoin $item.DlDir 'progress.txt')
   if (-not $pr -or $pr.Time -le 0) { return (T 'starting the download') }
@@ -1853,7 +1869,7 @@ function Get-ShowKey($item) {
     'animelib' { return "al:$($s.Sid):$(@($s.Names)[0]):$($s.DubName)" }
     'shikimori' { return "sh:$($s.Sid):$($s.DubName)" }
     # A release with its own player and a backup (AniLiberty: its HLS + Kodik): one show per release.
-    'player' { if (@($s.Cands).Count -gt 1) { return "pl:$($item.Source -replace '#.*$', ''):$(@($s.Cands)[0].Dub)" } }
+    'player' { if (@($s.Cands | Where-Object { -not $_.PSObject.Properties['Backup'] }).Count -gt 1) { return "pl:$($item.Source -replace '#.*$', ''):$(@($s.Cands)[0].Dub)" } }
   }
   return $null
 }
@@ -1943,7 +1959,8 @@ function Get-ResolvedStream($c) {
 # "auto": looks up every player with the chosen voice-over, reads the real picture size of each with ffprobe (all at
 # once), then puts them in order: tallest real picture, then higher bitrate, then the usual order.
 function Invoke-AutoPick($item) {
-  $same = @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly } | Select-Object -First 4)
+  # (A Backup candidate is the same player's file in another quality, see Expand-Animevost: nothing to compare.)
+  $same = @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly -and -not $_.PSObject.Properties['Backup'] } | Select-Object -First 4)
   if ($same.Count -lt 2) { Set-AutoWinner $item ''; return }
   Say (T '  Checking {0} players for the sharpest picture...' $same.Count) 'Gray'
   $jobs = New-Object System.Collections.ArrayList
@@ -2050,7 +2067,7 @@ function Start-NextSource($item) {
       # No checking while a video streams (it would hold up this window). A show not checked yet waits for its turn:
       # getting it ready now meant taking the first player in the list (Kodik), whatever "auto" would have picked.
       $won = Get-AutoWinner $item
-      if ($null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly }).Count -ge 2) { return }
+      if ($null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly -and -not $_.PSObject.Properties['Backup'] }).Count -ge 2) { return }
     }
     $item | Add-Member -NotePropertyName PlayerPicked -NotePropertyValue $true
     if ($pref -ne 'auto') { Set-CandFirst $item $pref }
@@ -2099,12 +2116,17 @@ function Complete-StreamDownload($item) {
     return $true
   }
   $why = Get-LastLines (Get-BgText $item.Dl) 2
-  if ($short -and $null -ne $got -and $item.Stream.Duration -gt 0) { $why = T 'it stopped at {0} of {1}' (Format-Time $got) (Format-Time $item.Stream.Duration) }
+  $stalled = [bool]($item.Dl.PSObject.Properties['Stalled'] -and $item.Dl.Stalled)
+  if ($stalled) {
+    $why = T 'no progress for {0} seconds' $script:DlStallSec
+    $item.Retried = $true   # (not the same source once more: on to the next one)
+  } elseif ($short -and $null -ne $got -and $item.Stream.Duration -gt 0) { $why = T 'it stopped at {0} of {1}' (Format-Time $got) (Format-Time $item.Stream.Duration) }
   elseif ($short) { $why = T 'the connection was cut off' }
   if (-not $why) { $why = T 'ffmpeg error {0}' $exit }
   $item.Errors = @($item.Errors) + @("$($item.Using.Label): " + (T 'download failed ({0})' $why))
-  if (-not $item.Retried) {
-    # Try the same source once more (links can expire or a server can hiccup), then the others.
+  if (-not $item.Retried -and $why -notmatch '(?i)\b404\b') {
+    # Try the same source once more (links can expire or a server can hiccup), then the others. (A file that isn't
+    # there, HTTP 404, won't be there a second later.)
     $item.Retried = $true
     $item.CandIdx = [Math]::Max(0, $item.CandIdx - 1)
   }
@@ -2193,6 +2215,62 @@ function Find-DownloadedFile([string]$dir) {
   return $best
 }
 
+# A link straight to a video file or an HLS playlist (by the end of its path; a ?query doesn't count): the extension
+# ('mp4', 'm3u8', ...), else ''. Such links are played as they are, not handed to yt-dlp.
+function Get-UrlMediaExt([string]$u) {
+  if ($u -notmatch '^(?i)https?://') { return '' }
+  $m = [regex]::Match(($u -split '[?#]', 2)[0], '(?i)\.(mp4|mkv|webm|m4v|mov|ts|m3u8)$')
+  if ($m.Success) { return $m.Groups[1].Value.ToLowerInvariant() }
+  return ''
+}
+
+# A link that was to be played as it is goes to yt-dlp after all (it can't be read as it is, or it needs the whole
+# file), when yt-dlp is installed (no question about installing it here). $true = its download started.
+function Switch-UrlToDownload($item) {
+  if ($item.Kind -ne 'url' -or $item.NoDirect -or $item.Source -notmatch '^(?i)https?://') { return $false }
+  $yt = $script:YtDlp
+  if (-not $yt) { $yt = Find-Exe 'yt-dlp'; $script:YtDlp = $yt }
+  if (-not $yt) { return $false }
+  $item.NoDirect = $true
+  $item.IsDirectUrl = $false; $item.IsLive = $false; $item.Info = $null; $item.Path = $null
+  Start-Download $item $yt
+  return $true
+}
+
+# The bytes of video in a folder (a download's progress: yt-dlp's .part files, ffmpeg's video.mkv). Not progress.txt:
+# ffmpeg adds to it every half second even while nothing arrives.
+function Get-DirBytes([string]$dir) {
+  $n = [long]0
+  try {
+    foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
+      if ([System.IO.Path]::GetFileName($f) -eq 'progress.txt') { continue }
+      try { $n += (New-Object System.IO.FileInfo($f)).Length } catch {}
+    }
+  } catch {}
+  return $n
+}
+
+# A download that hasn't moved for this long is given up (a server that stopped sending, a hung yt-dlp).
+$script:DlStallSec = 120
+function Test-DownloadStalled($item) {
+  $dl = $item.Dl
+  if (-not $dl -or -not $item.DlDir) { return $false }
+  $now = Get-Date
+  if (-not $dl.PSObject.Properties['MovedAt']) {
+    $dl | Add-Member -Force -NotePropertyName Bytes -NotePropertyValue ([long]-1)
+    $dl | Add-Member -Force -NotePropertyName MovedAt -NotePropertyValue $now
+    $dl | Add-Member -Force -NotePropertyName CheckAt -NotePropertyValue $now
+  }
+  if ($now -lt $dl.CheckAt) { return $false }
+  # (A look at the folder every 2 s. A long gap since the last look = this PC was asleep: not the download's fault.)
+  if (($now - $dl.CheckAt).TotalSeconds -gt 30) { $dl.MovedAt = $now }
+  $dl.CheckAt = $now.AddSeconds(2)
+  $b = Get-DirBytes $item.DlDir
+  if ($b -ne $dl.Bytes) { $dl.Bytes = $b; $dl.MovedAt = $now; return $false }
+  return (($now - $dl.MovedAt).TotalSeconds -ge $script:DlStallSec)
+}
+
+# yt-dlp downloads in the background (also before the stream starts: Wait-Prep shows how far it got).
 function Start-Download($item, [string]$yt) {
   $dl = PathJoin $item.JobDir 'dl'
   [void][System.IO.Directory]::CreateDirectory($dl)
@@ -2200,16 +2278,16 @@ function Start-Download($item, [string]$yt) {
   $argv = @('--no-playlist', '--no-mtime', '--ffmpeg-location', $script:FFmpegDir,
     '-f', 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b', '--merge-output-format', 'mkv',
     '-P', $dl, '-o', '%(title).80B.%(ext)s', $item.Source)
+  # (A link that wants its server's headers, a WPARTY room's video: yt-dlp sends them too.)
+  if ($item.Stream -and $item.Stream.Headers) {
+    foreach ($k in @($item.Stream.Headers.Keys)) { $argv = @('--add-header', "$($k):$($item.Stream.Headers[$k])") + $argv }
+  }
   if (-not (Test-RelayAlive)) {
     Say ''
     Say (T 'Downloading: {0}' $item.Source) 'Cyan'
-    $psi = New-StartInfo $yt $argv $dl
-    $p = Start-Child $psi
-    $p.WaitForExit()
-    $item.Dl = [pscustomobject]@{ Proc = $p; Out = $null; Err = $null; Started = Get-Date }
-  } else {
-    $item.Dl = Start-Background $yt (@('--no-progress') + $argv) $dl
   }
+  $item.Dl = Start-Background $yt (@('--no-progress') + $argv) $dl
+  $item.DlKind = 'ytdlp'
   $item.State = 'downloading'
 }
 
@@ -2266,6 +2344,38 @@ function Complete-Extract($item) {
   }
 }
 
+# A web video whose subtitles come as a file of their own (an AnimeLib or Collaps translation with subtitles only: the
+# stream's .Subtitle, see Resolve-Candidate). Saved into the job folder once and offered like a subtitle file next to a
+# video, so it gets drawn into the picture. If it can't be fetched, the video plays without it (said once, as a note
+# under "Now streaming").
+function Add-SiteSubtitle($item) {
+  $item.ExtraSubs = @($item.ExtraSubs | Where-Object { $_ -and -not $_.PSObject.Properties['FromSite'] })
+  $st = $item.Stream
+  if ($item.Kind -ne 'site' -or -not $st -or -not $st.PSObject.Properties['Subtitle'] -or -not $st.Subtitle -or -not $script:CanSubs) { return }
+  $s = $st.Subtitle
+  $failText = T 'the subtitles didn''t download, so it plays without them'
+  if (-not $s.PSObject.Properties['Path']) {
+    $s | Add-Member -Force -NotePropertyName Path -NotePropertyValue $null
+    $ext = '.' + "$($s.Format)".ToLowerInvariant()
+    if ($script:SubExts -notcontains $ext) { $ext = '.vtt' }
+    $path = PathJoin $item.JobDir ('site-sub' + $ext)
+    try {
+      if ($s.Provider -eq 'collaps') { [void](Save-CollapsSubtitle $s.Url $path) } else { [void](Save-AnimelibSubtitle $s.Url $path) }
+      # (Only a real subtitle file: a server can answer with an error page, and ffmpeg wouldn't start with that.)
+      $txt = ''
+      if ([System.IO.File]::Exists($path)) { $txt = ([System.IO.File]::ReadAllText($path)).TrimStart() }
+      if ($txt -and -not $txt.StartsWith('<') -and $txt -match '(?m)^\[Script Info\]|^\[Events\]|^WEBVTT|-->') { $s.Path = $path }
+    } catch {}
+  }
+  if (-not $s.Path) { $item.SubWarn = $failText; return }
+  if ($item.SubWarn -eq $failText) { $item.SubWarn = $null }
+  $t = New-ExternalSubTrack $s.Path
+  if ("$($s.Lang)" -match '^[A-Za-z]{2,3}$') { $t.Lang = "$($s.Lang)".ToLowerInvariant() }
+  if ($s.Label) { $t.Title = [string]$s.Label } else { $t.Title = T 'subtitles from the site' }
+  $t | Add-Member -Force -NotePropertyName FromSite -NotePropertyValue $true
+  $item.ExtraSubs = @($t) + @($item.ExtraSubs)
+}
+
 function Step-Prep($item) {
   if (-not $item) { return }
   if ($item.State -eq 'ready' -or $item.State -eq 'failed') { return }
@@ -2276,16 +2386,39 @@ function Step-Prep($item) {
         Start-NextSource $item
         if ($item.State -ne 'probe') { return }
       } elseif ($item.Kind -eq 'url') {
+        # A link straight to a video file / playlist plays as it is (also with yt-dlp installed); a link with the
+        # server's headers (a WPARTY room's video) too; any other web page goes to yt-dlp.
         $yt = $null
-        if ($item.Source -match '^(?i)https?://') { $yt = Get-YtDlp }
+        $ext = Get-UrlMediaExt $item.Source
+        if ($item.Source -match '^(?i)https?://' -and -not $ext -and -not $item.Stream) { $yt = Get-YtDlp }
         if ($yt) { Start-Download $item $yt; return }
+        # An HLS playlist may list several qualities: the one that fits the picture we send (ffmpeg alone would take
+        # the first one listed, often the smallest).
+        $hls = $item.Stream
+        if (-not $hls -and $ext -eq 'm3u8') { $hls = New-Stream $item.Source 'hls' @{} }
+        if ($hls -and $hls.Kind -eq 'hls' -and -not $hls.PSObject.Properties['Checked']) {
+          $st = $null
+          try { $st = Complete-HlsStream (New-Stream $hls.Url 'hls' $hls.Headers) } catch {}
+          if ($st -and $st.Program -ge 0 -and (Switch-UrlToDownload $item)) { return }   # (its sound can't be picked out)
+          if ($st -and $st.Program -lt 0) { $hls = $st }
+          $hls | Add-Member -Force -NotePropertyName Checked -NotePropertyValue $true
+          $item.Stream = $hls
+        }
         $item.IsDirectUrl = $true
         $item.Path = $item.Source
+        if ($item.Stream) { $item.Path = $item.Stream.Url }
       }
       $item.State = 'probe'
     }
     if ($item.State -eq 'downloading') {
-      if (-not $item.Dl.Proc.HasExited) { return }
+      if (-not $item.Dl.Proc.HasExited) {
+        if (-not (Test-DownloadStalled $item)) { return }
+        # No progress for minutes: give it up (and go on with the next source, or the next video).
+        Stop-ProcessTree $item.Dl.Proc   # (yt-dlp's own ffmpeg too)
+        $item.Dl | Add-Member -Force -NotePropertyName Stalled -NotePropertyValue $true
+        Say (T '  The download of {0} made no progress for {1} seconds, so it was stopped.' $item.Name $script:DlStallSec) 'Yellow'
+        if ($item.DlKind -ne 'ffmpeg') { throw (T 'the download made no progress for {0} seconds' $script:DlStallSec) }
+      }
       if ($item.DlKind -eq 'ffmpeg') {
         if (-not (Complete-StreamDownload $item)) { return }
       } else {
@@ -2298,8 +2431,33 @@ function Step-Prep($item) {
       if ($item.IsDirectUrl) { $st = $item.Stream }
       try {
         if ($st -and $st.PSObject.Properties['Probe'] -and $st.Probe) { $item.Info = $st.Probe; $st.Probe = $null }   # (read by the quality check)
+        elseif ($item.Kind -eq 'url' -and $item.IsDirectUrl -and -not ($st -and $st.AudioUrl) -and (Test-RelayAlive)) {
+          # A link read over the network while the stream is on (the next video, or this one behind the waiting
+          # screen): ffprobe runs in the background, so the window keeps answering meanwhile.
+          $pb = $null
+          if ($item.PSObject.Properties['ProbeBg'] -and $item.ProbeBg -and $item.ProbeBg.Path -eq $item.Path) { $pb = $item.ProbeBg }
+          if (-not $pb) {
+            $bg = Start-Background $script:FFprobe (Get-MediaInfoArgs $item.Path $true $st)
+            $item | Add-Member -Force -NotePropertyName ProbeBg -NotePropertyValue ([pscustomobject]@{ Bg = $bg; Path = $item.Path })
+            return
+          }
+          if (-not $pb.Bg.Proc.HasExited) {
+            if (((Get-Date) - $pb.Bg.Started).TotalSeconds -lt 90) { return }
+            $item.ProbeBg = $null
+            Stop-Proc $pb.Bg.Proc
+            throw (T 'can''t read it ({0})' 'timeout')
+          }
+          $item.ProbeBg = $null
+          $item.Info = ConvertFrom-ProbeOutput ([pscustomobject]@{ ExitCode = $pb.Bg.Proc.ExitCode; Out = $pb.Bg.Out.Result; Err = $pb.Bg.Err.Result })
+        }
         else { $item.Info = Get-MediaInfo $item.Path $item.IsDirectUrl $st }
       } catch {
+        # A link to a video file that can't be read as it is (a share page, a server that wants a browser): yt-dlp
+        # gets it instead, when it is installed.
+        if ($item.Kind -eq 'url' -and $item.IsDirectUrl) {
+          $why = $_.Exception.Message
+          if (Switch-UrlToDownload $item) { $item.Errors = @($item.Errors) + @($why); return }
+        }
         # Playing straight from the site didn't work out: another player, else download it (or try the next source).
         if (-not ($item.Kind -eq 'site' -and $item.IsDirectUrl)) { throw }
         $item.Errors = @($item.Errors) + @("$($item.Using.Label): $($_.Exception.Message)")
@@ -2311,10 +2469,18 @@ function Step-Prep($item) {
         return
       }
       if (-not $item.Info.Video -and $item.Info.Audio.Count -eq 0) { throw (T 'no video or audio found in it') }
+      # A link to a live stream (an HLS playlist that keeps growing has no length): it plays from where the stream
+      # is now, and can't be skipped back or forward. (Only HLS: another file without a length is still a file.)
+      $isHls = ((Get-UrlMediaExt $item.Source) -eq 'm3u8') -or ($item.Stream -and $item.Stream.Kind -eq 'hls')
+      $item.IsLive = ($item.Kind -eq 'url' -and $item.IsDirectUrl -and $isHls -and $item.Info.Duration -le 0)
+      # Subtitles written as text inside the file can only be drawn in from a downloaded copy: yt-dlp downloads it.
+      if ($item.Kind -eq 'url' -and $item.IsDirectUrl -and -not $item.IsLive -and $script:CanSubs -and
+        @($item.Info.Subs | Where-Object { $_.Kind -eq 'text' }).Count -gt 0 -and (Switch-UrlToDownload $item)) { return }
       if (-not $item.IsDirectUrl) {
         $have = @($item.ExtraSubs | ForEach-Object { $_.Path })
         foreach ($sc in @(Get-SidecarSubs $item.Path)) { if ($have -notcontains $sc.Path) { $item.ExtraSubs = @($item.ExtraSubs) + @($sc) } }
       }
+      Add-SiteSubtitle $item
       Select-Tracks $item
       Set-FpsPlan $item
       Start-Extract $item
@@ -2343,7 +2509,7 @@ function Wait-Prep($item) {
     Step-Prep $item
     if ($item.State -eq 'ready' -or $item.State -eq 'failed') { break }
     if (-not $shown -and ((Get-Date) - $t0).TotalSeconds -gt 1.5) { Say (T 'Getting {0} ready...' $item.Name) 'Gray'; $shown = $true }
-    if ($item.State -eq 'downloading' -and $item.DlKind -eq 'ffmpeg') { Show-Status (T '  {0}   (Ctrl+C = stop)' (Get-DownloadText $item)) }
+    if ($item.State -eq 'downloading') { Show-Status (T '  {0}   (Ctrl+C = stop)' (Get-DownloadText $item)) }
     Wait-Pump 0.2
   }
   Clear-StatusLine
@@ -2449,6 +2615,7 @@ function Add-PreviewOutput($a, [ref]$graph) {
 function Get-ContentArgs($item, [double]$start, [double]$off, [bool]$preview = $false) {
   $W = $script:OutW; $H = $script:OutH
   $info = $item.Info
+  if ($item.IsLive) { $start = 0.0 }   # (a live stream always goes on from where it is now)
   $a = New-Object System.Collections.Generic.List[string]
   foreach ($x in @('-hide_banner', '-y', '-v', 'error', '-nostats', '-progress', 'progress.txt')) { $a.Add($x) }
   if ($start -gt 0.5) { $a.Add('-ss'); $a.Add((Format-Num $start)) }
@@ -3775,7 +3942,7 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $qtip = T 'What the stream carries: picture size, frames per second, video bitrate, server.'
     if ($ql.Low) { $qtip += ' ' + (T 'Orange: too few bits for this picture size, so it looks blocky. A smaller picture size (Settings > Picture size) looks sharper.') }
     $script:PanelState = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up
-      Link = $script:ShownLink; Clock = $script:ClockOn; CanSeek = ($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold')
+      Link = $script:ShownLink; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
       Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip }
     Update-ControlPanel $script:PanelState
   } catch { $script:PanelShown = $false }
@@ -3838,6 +4005,11 @@ function Invoke-Source {
       if ($requested -eq 'seek') { $target += (Get-QueuedSeek) }
     } else {
       $c = Get-NextCmd $Kind
+      if ($c -and $Media -and $Media.IsLive -and ($c.Cmd -eq 'seek' -or $c.Cmd -eq 'seekto')) {
+        [void](Get-QueuedSeek)
+        Say (T '  This is a live stream: it can''t go back or forward.') 'Gray'
+        $c = $null
+      }
       if ($c) {
         $cur = $Start + $pos
         $pr = Read-Progress $progFile
@@ -3930,15 +4102,21 @@ function Invoke-Source {
       elseif (($now - $markTime).TotalSeconds -ge 10) {
         $speed = ($pos - $markPos) / ($now - $markTime).TotalSeconds
         $markTime = $now; $markPos = $pos
-        if ($Kind -eq 'content' -and -not $slowWarned -and ($now - $t0).TotalSeconds -gt 20) {
+        # (A live stream comes at real time at best: a gap in it is the stream's, see the stall check below.)
+        if ($Kind -eq 'content' -and -not $slowWarned -and -not $Media.IsLive -and ($now - $t0).TotalSeconds -gt 20) {
           if ($speed -lt 0.93) { $slowCount++ } else { $slowCount = 0 }
-          if ($slowCount -ge 2 -and -not $requested -and -not ($Media.IsDirectUrl -and $Media.Stream) -and (Test-CanStepDown)) {
+          # Played straight from a server (a site's player, a link to a video file): a lighter stream wouldn't help.
+          $fromNet = ($Media.IsDirectUrl -and ($Media.Stream -or $Media.Kind -eq 'url'))
+          if ($slowCount -ge 2 -and -not $requested -and -not $fromNet -and (Test-CanStepDown)) {
             # Falling behind real time means stutter for everyone: go a notch lighter and carry on from here.
             $script:SlowSpeed = $speed
             $requested = 'slow'; Send-Key $proc 'q'; $quitSentAt = $now
-          } elseif ($slowCount -ge 2 -and $Media.IsDirectUrl -and $Media.Stream) {
+          } elseif ($slowCount -ge 2 -and $fromNet -and $Media.Kind -eq 'site') {
             $slowWarned = $true
             Say (T '  The video site is sending this one slower than real time, so viewers may see stutter. The next videos download in advance, so they won''t have this problem.') 'Yellow'
+          } elseif ($slowCount -ge 2 -and $fromNet) {
+            $slowWarned = $true
+            Say (T '  The server of this video is sending it slower than real time, so viewers may see stutter.') 'Yellow'
           } elseif ($slowCount -ge 2) {
             $slowWarned = $true
             Say (T '  The stream is running slower than real time, so viewers will see stutter. Either your PC is too busy (close heavy programs, or set "Height" to 540 in config.json) or your internet upload is too slow (lower "VideoKbps" in config.json).') 'Yellow'
@@ -3988,7 +4166,7 @@ function Invoke-Source {
     if ($stalled) {
       # A web stream that stalls is usually the site. If the relay takes the rest of the pipe once the
       # source is stopped, it's fine: keep it (and the viewers) connected and try the site again.
-      if ($Kind -eq 'content' -and $Media.IsDirectUrl -and $Media.Stream) {
+      if ($Kind -eq 'content' -and $Media.IsDirectUrl -and ($Media.Stream -or $Media.IsLive -or "$($Media.Path)" -match '^(?i)https?://')) {
         try { [void]$copy.Wait(4000) } catch {}
         $sourceStalled = ($copy.IsCompleted -and -not $copy.IsFaulted)
       }
@@ -4008,7 +4186,11 @@ function Invoke-Source {
   elseif (-not $pr) { $script:LastEnd = [Math]::Max($script:LastEnd, $off + ((Get-Date) - $t0).TotalSeconds) }
   Clear-StatusLine
   $outcome = 'failed'
-  if ($sourceStalled -and -not $relayBroke -and -not $copyFailed -and (Test-RelayAlive)) { $outcome = 'failed' }
+  if ($sourceStalled -and -not $relayBroke -and -not $copyFailed -and (Test-RelayAlive)) {
+    $outcome = 'failed'
+    # A live stream that stopped sending has ended (or is gone): on to the next video.
+    if ($Media.IsLive) { $outcome = 'done'; Say (T '  The live stream stopped sending - going on.') 'Yellow' }
+  }
   elseif ($relayBroke -or $stalled -or $copyFailed -or -not (Test-RelayAlive)) { $outcome = 'relay' }
   elseif ($requested) { $outcome = $requested }
   elseif ($exit -eq 0) { $outcome = 'done' }
@@ -4427,6 +4609,14 @@ function Invoke-Queue {
       $cur.ResumeAt = [Math]::Max(0.0, $r.Position - 2)
       # Another encoder means another H.264 header: the players reconnect once, so none of them freezes on it.
       if ($resync -and (Test-RelayAlive)) { Restart-RelayForResync }
+      continue
+    }
+    if ($cur.Kind -eq 'url' -and $cur.IsDirectUrl -and -not $cur.IsLive -and "$($cur.Path)" -match '^(?i)https?://' -and $cur.DirectFails -lt 3) {
+      # A link played straight from its server that stopped (the server hiccuped): again from where it was.
+      $cur.DirectFails++
+      $cur.ResumeAt = Get-ClampedPos $cur ([Math]::Max($cur.ResumeAt, $r.Position - 2))
+      Say (T 'The stream from the server stopped - trying again from {0}.' (Format-Time $cur.ResumeAt)) 'Yellow'
+      if ($r.Error) { Say "  ($(Get-ShortText $r.Error 110))" 'DarkGray' }
       continue
     }
     $why = (T 'ffmpeg stopped with error {0}' $r.ExitCode)

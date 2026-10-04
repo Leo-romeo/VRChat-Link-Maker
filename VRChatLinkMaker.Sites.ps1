@@ -3564,7 +3564,8 @@ function Resolve-AnimelibVideo($source, [int]$targetHeight = 720, [switch]$NoPro
 
 # Download a subtitle file (Referer as the site sends it) and store it as UTF-8 (no BOM) for ffmpeg's subtitles filter.
 function Save-AnimelibSubtitle([string]$url, [string]$path) {
-  $r = Invoke-Web -Url $url -Headers @{ 'Referer' = $script:AnimelibSiteOrigin + '/'; 'Origin' = $script:AnimelibSiteOrigin } -TimeoutSec 30
+  # (15 s at most: it may be fetched on the main thread while a video streams, see Add-SiteSubtitle.)
+  $r = Invoke-Web -Url $url -Headers @{ 'Referer' = $script:AnimelibSiteOrigin + '/'; 'Origin' = $script:AnimelibSiteOrigin } -TimeoutSec 15
   if ($r.Status -ne 200) { throw "AnimeLib: subtitle download failed (HTTP $($r.Status))" }
   $text = $r.Text
   if ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
@@ -3809,6 +3810,37 @@ function Resolve-Collaps {
     Warning     = $warn
     EmbedUrl    = $embedUrl
   }
+}
+
+# The subtitles that go along with a Collaps stream: only when the chosen sound is the original one (not a Russian
+# voice-over), so the subtitles are the translation. Russian ones first, else the first. -> Provider, Url, Format,
+# Lang, Label (see Add-SiteSubtitle), or $null.
+function Select-CollapsSubtitle($r) {
+  $subs = @($r.Subtitles | Where-Object { $_ -and $_.Url })
+  if ($subs.Count -eq 0 -or $r.AudioIndex -lt 0 -or $r.AudioIndex -ge @($r.AudioTracks).Count) { return $null }
+  $t = @($r.AudioTracks)[$r.AudioIndex]
+  $lang = "$($t.Lang)".Trim().ToLowerInvariant()
+  $origWord = -join [char[]](0x043E, 0x0440, 0x0438, 0x0433, 0x0438, 0x043D)   # (Russian "original")
+  $orig = ("$($t.Name)" -match ('(?i)original|' + $origWord)) -or ($lang -match '^[a-z]{2,3}$' -and $lang -notmatch '^(ru|rus|und)$')
+  if (-not $orig) { return $null }
+  $ruRe = '(?i)\brus|' + (-join [char[]](0x0440, 0x0443, 0x0441))   # (Russian "rus")
+  $pick = @($subs | Where-Object { "$($_.Name)" -match $ruRe }) + @($subs) | Select-Object -First 1
+  $l = ''; if ("$($pick.Name)" -match $ruRe) { $l = 'ru' }
+  $fmt = 'vtt'
+  if ("$($pick.Url)" -match '(?i)\.(ass|ssa|srt|vtt)(?:[?#]|$)') { $fmt = $Matches[1].ToLowerInvariant() }
+  return [pscustomobject]@{ Provider = 'collaps'; Url = [string]$pick.Url; Format = $fmt; Lang = $l; Label = [string]$pick.Name }
+}
+
+# Download a Collaps subtitle file (WebVTT; the player's Origin) and store it as UTF-8 (no BOM) for ffmpeg.
+function Save-CollapsSubtitle([string]$url, [string]$path) {
+  $origin = "https://$($script:CollapsEmbedHost)"
+  if ($url.StartsWith('//')) { $url = 'https:' + $url } elseif ($url.StartsWith('/')) { $url = $origin + $url }
+  $r = Invoke-Web -Url $url -Headers @{ 'Referer' = $origin + '/'; 'Origin' = $origin } -TimeoutSec 15
+  if ($r.Status -ne 200 -or -not $r.Text) { throw "Collaps: subtitle download failed (HTTP $($r.Status))" }
+  $text = $r.Text
+  if ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+  [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))
+  return $path
 }
 
 # ==================================================================================================
@@ -4312,11 +4344,23 @@ function Expand-Animevost([string]$u) {
   $list = @(Select-SiteEpisodes $eps $startPos $canAsk)
   $base = $script:AnimevostSite + '/tip/tv/' + $id + '-anime.html'   # (the same key whichever link form was given)
   $items = New-Object System.Collections.ArrayList
+  # 720p and 480p as two candidates of the same voice-over (480p first when no more is sent): the list names a 720p
+  # file for every episode, but some are missing. A missing one fails fast (HTTP 404) and the next one takes over.
+  $stdFirst = ((Get-QualityCap) -le 480)
   foreach ($e in $list) {
-    $url = $e.Hd; if (-not $url) { $url = $e.Std }
-    $c = New-Cand 'animevost' $url '' 'AnimeVost'
-    $c | Add-Member -NotePropertyName Std -NotePropertyValue $e.Std
-    $site = [pscustomobject]@{ Type = 'player'; Cands = @($c) }
+    $urls = @(@($e.Hd, '720p'), @($e.Std, '480p'))
+    if ($stdFirst) { $urls = @(@($e.Std, '480p'), @($e.Hd, '720p')) }
+    $cands = New-Object System.Collections.ArrayList
+    foreach ($uq in $urls) {
+      $url = $uq[0]
+      if (-not $url -or @($cands | Where-Object { $_.Url -eq $url }).Count -gt 0) { continue }
+      $c = New-Cand 'animevost' $url '' 'AnimeVost'
+      if ($e.Hd -and $e.Std -and $e.Hd -ne $e.Std) { $c.Label = 'AnimeVost ' + $uq[1] }   # (which of the two failed)
+      # (The second one is only a fallback of the same player, not a player to choose or compare: see Invoke-AutoPick.)
+      if ($cands.Count -gt 0) { $c | Add-Member -NotePropertyName Backup -NotePropertyValue $true }
+      [void]$cands.Add($c)
+    }
+    $site = [pscustomobject]@{ Type = 'player'; Cands = $cands.ToArray() }
     $name = $title
     if ($eps.Count -gt 1) { $name = (T '{0} - episode {1}' $title $e.Number) }
     [void]$items.Add((New-SiteItem ($base + '#episode=' + $e.Number) $name $site))
@@ -4872,6 +4916,14 @@ function Expand-Wparty([string]$u) {
     if ($canAsk) { Say (T 'The room is playing: {0}' $v) 'Gray' }
     if ((Test-SiteLink $v) -and -not (Test-WpartyUrl $v)) { return @(Expand-SiteLink $v) }
     $it = New-QueueItem 'url' $v
+    # A video file / playlist the room plays straight from its server wants WPARTY's Referer / Origin: ffmpeg
+    # sends them (the stream's headers, as for the players' streams), and it plays as it is, not through yt-dlp.
+    $hint = Get-WpartyUrlPlayHint $room
+    if ($hint -and $hint.Tool -eq 'ffmpeg' -and $hint.Referer) {
+      $kind = 'file'
+      if (($v -split '[?#]', 2)[0] -match '(?i)\.m3u8') { $kind = 'hls' }
+      $it.Stream = New-Stream $v $kind @{ 'Referer' = [string]$hint.Referer; 'Origin' = [string]$hint.Origin }
+    }
     $uts = 0.0
     if ($null -ne $room.LeaderTS -and $room.LeaderTS -gt 0) { $uts = [double]$room.LeaderTS } elseif ($room.VideoTS) { $uts = [double]$room.VideoTS }
     if ($script:SiteChoice) { $it.ResumeAt = $script:SiteChoice.Start }
@@ -5212,22 +5264,43 @@ function Find-SiteContent([string]$query) {
     (Get-AnimevostSearchRequest $q $sec)
   )
   $answers = @(Invoke-WebParallel $reqs)
+  # AniLiberty / AnimeVost not answering at that address: all their other addresses at once, in one more round (as
+  # Invoke-MirrorApi would try them one after the other: the first one in its order that answers is taken).
+  $retry = New-Object System.Collections.ArrayList
+  for ($i = 0; $i -lt $srcs.Count; $i++) {
+    $s = $srcs[$i]
+    if (($s -ne 'aniliberty' -and $s -ne 'animevost') -or (Test-SearchAnswer $s $answers[$i])) { continue }
+    $tried = ([Uri]$reqs[$i].Url).GetLeftPart([System.UriPartial]::Authority)
+    if ($s -eq 'aniliberty') { $hosts = $script:AnilibertyHosts; $state = $script:AnilibertyState; $path = Get-AnilibertySearchPath $q; $method = 'GET' }
+    else { $hosts = $script:AnimevostHosts; $state = $script:AnimevostState; $path = '/v1/search'; $method = 'POST' }
+    $list = @($hosts)
+    if ($state.Good) { $list = @($state.Good) + @($list | Where-Object { $_ -ne $state.Good }) }
+    foreach ($h in @($list | Where-Object { $_ -ne $tried })) {
+      $rq = @{ Url = $h + $path; Method = $method; Headers = @{ 'Accept' = 'application/json' }; TimeoutSec = 6 }
+      if ($method -ne 'GET') { $rq.Body = $reqs[$i].Body; $rq.ContentType = 'application/x-www-form-urlencoded; charset=UTF-8' }
+      [void]$retry.Add([pscustomobject]@{ Pos = $i; Host = $h; State = $state; Req = $rq })
+    }
+  }
+  if ($retry.Count -gt 0) {
+    $more = @(Invoke-WebParallel @($retry | ForEach-Object { $_.Req }))
+    $taken = @{}
+    for ($k = 0; $k -lt $retry.Count; $k++) {
+      $x = $retry[$k]; $r2 = $more[$k]
+      if ($taken.ContainsKey($x.Pos) -or -not $r2 -or $r2.Error) { continue }
+      $t = ([string]$r2.Text).TrimStart()
+      if (($r2.Status -eq 200 -or $r2.Status -eq 404) -and ($t.StartsWith('{') -or $t.StartsWith('['))) {
+        $x.State.Good = $x.Host
+        $answers[$x.Pos] = [pscustomobject]@{ Status = $r2.Status; Text = $r2.Text; Error = $null }
+        $taken[$x.Pos] = $true
+      }
+    }
+  }
   $found = @{}
   for ($i = 0; $i -lt $srcs.Count; $i++) {
     $a = $answers[$i]; $s = $srcs[$i]
     $found[$s] = @()
     # AnimeVost answers "nothing found" with HTTP 404.
     $ok = Test-SearchAnswer $s $a
-    if (-not $ok -and ($s -eq 'aniliberty' -or $s -eq 'animevost')) {
-      # Their other addresses, one after the other.
-      $tried = ([Uri]$reqs[$i].Url).GetLeftPart([System.UriPartial]::Authority)
-      try {
-        if ($s -eq 'aniliberty') { $r2 = Invoke-MirrorApi $script:AnilibertyHosts $script:AnilibertyState (Get-AnilibertySearchPath $q) 'GET' $null 6 $tried }
-        else { $r2 = Invoke-MirrorApi $script:AnimevostHosts $script:AnimevostState '/v1/search' 'POST' $reqs[$i].Body 6 $tried }
-        $a = [pscustomobject]@{ Status = $r2.Status; Text = $r2.Text; Error = $null }
-        $ok = Test-SearchAnswer $s $a
-      } catch {}
-    }
     $why = $null
     if ($a.Error) { $why = $a.Error }
     elseif (-not $ok) { $why = "HTTP $($a.Status)" }
@@ -5653,16 +5726,21 @@ function Resolve-Candidate($c) {
       if ($c.PSObject.Properties['Duration'] -and $c.Duration -gt 0) { $st.Duration = [double]$c.Duration }
     }
     'animevost' {
-      # 720p when its file is there (the list names one for every episode, but some are missing), else 480p.
-      $u = $c.Url; $alt = $null
-      if ($c.PSObject.Properties['Std']) { $alt = [string]$c.Std }
-      if ($alt -and $alt -ne $u -and ($cap -le 480 -or -not (Test-WebFileThere $u))) { $u = $alt }
-      $st = New-Stream $u 'file' @{}
+      # One file (720p or 480p, see Expand-Animevost). A missing one answers 404 when it is read: the next candidate.
+      $st = New-Stream $c.Url 'file' @{}
     }
     'animelib' {
       $r = Resolve-AnimelibVideo $c.Source $cap -NoProbe
       $st = New-Stream $r.Url $r.Kind (ConvertTo-HeaderTable $r.Headers)
       if ($r.Duration) { $st.Duration = [double]$r.Duration }
+      # A translation that is subtitles only: its subtitle file goes along (Add-SiteSubtitle saves it and draws it in).
+      if ($r.SubtitleUrl -and $c.Source.TranslationType -eq 'subtitles') {
+        $sub = $null
+        foreach ($x in @($r.Subtitles)) { if ($x -and $x.Url -eq $r.SubtitleUrl) { $sub = $x; break } }
+        $lang = ''; $label = [string]$c.Source.Team
+        if ($sub) { $lang = [string]$sub.Lang; if ($sub.Label) { $label = [string]$sub.Label } }
+        $st | Add-Member -Force -NotePropertyName Subtitle -NotePropertyValue ([pscustomobject]@{ Provider = 'animelib'; Url = $r.SubtitleUrl; Format = $r.SubtitleFormat; Lang = $lang; Label = $label })
+      }
     }
     'collaps' {
       $r = Resolve-Collaps -KinopoiskId $c.Url -Season $c.Season -Episode $c.Episode -PreferAudio $c.Dub
@@ -5672,6 +5750,8 @@ function Resolve-Candidate($c) {
       if ($r.Duration) { $st.Duration = [double]$r.Duration }
       if ($r.Audio) { $c.Label = "Collaps, $($r.Audio)" }
       if ($r.Warning) { $c.Note = $r.Warning }
+      $sub = Select-CollapsSubtitle $r
+      if ($sub) { $st | Add-Member -Force -NotePropertyName Subtitle -NotePropertyValue $sub }
     }
     'alloha' {
       $r = $null
