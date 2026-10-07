@@ -4119,12 +4119,15 @@ function Get-VideoGraph($item, [string]$inLabel, [double]$start, [string]$pix, [
 }
 
 # The small picture the control window shows (a second output of the same ffmpeg, twice a second).
-# It keeps the stream's own timestamps (passthrough). By default ffmpeg timed it from 0, so once the stream was a few
-# minutes in, this output seemed far behind the stream and ffmpeg held the stream back for it: the waiting / paused
-# screens went out at about 14 of 24 frames a second, and every minute on them put viewers' players ~25 s further
-# behind live. (Starting its timestamps at 0 instead stops the audio: then the stream itself seems far ahead.)
+# ffmpeg keeps the outputs of one run level: it holds back what feeds an output that is ahead of the one furthest
+# behind. With two pictures a second this output was always up to half a second behind the stream, and ffmpeg kept
+# holding the stream back for it whenever the picture and the sound come from two inputs (the waiting / paused /
+# starting screens, and videos whose sound comes separately): they went out at about 14 of 24 frames a second
+# (0.56x with ffmpeg 9), and every minute on such a screen put viewers' players ~25 s further behind live, for good.
+# So its timestamps run 1 s ahead of the stream's: it is never the one behind. Apart from that it keeps the stream's
+# own timestamps (passthrough): timed from 0, the stream itself seemed far ahead and its sound stopped.
 function Add-PreviewOutput($a, [ref]$graph) {
-  $graph.Value += ';[v]split=2[vo][pv0];[pv0]fps=2,scale=384:-2,format=yuvj420p[pv]'
+  $graph.Value += ';[v]split=2[vo][pv0];[pv0]fps=2,scale=384:-2,format=yuvj420p,setpts=PTS+1/TB[pv]'
   return @('-map', '[pv]', '-an', '-c:v', 'mjpeg', '-q:v', '7') + $script:PreviewSyncArgs + @('-f', 'image2', '-update', '1', $script:PreviewFile)
 }
 
