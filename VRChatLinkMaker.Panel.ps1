@@ -97,8 +97,8 @@ function Get-PanelFocus {
 # in a list Left / Right scroll it (Space still pauses).
 function Test-PanelKeyOurs([System.Windows.Forms.Keys]$code) {
   # (A question shown in its card: Space / the arrows are the card's own keys, see Invoke-PanelAskKey. Not while
-  # another tab is looked at meanwhile.)
-  try { if ($script:Panel.AskId -and $script:Panel.Ask.Visible) { return $false } } catch {}
+  # another tab is looked at meanwhile, nor on the search's "Searching..." card: it has no use for them.)
+  try { if ($script:Panel.AskId -and $script:Panel.Ask.Visible -and [string]$script:Panel.AskView['Kind'] -ne 'busy') { return $false } } catch {}
   $K = [System.Windows.Forms.Keys]
   $fc = $null
   try { $fc = Get-PanelFocus } catch {}
@@ -208,6 +208,7 @@ function New-ControlPanel {
     AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null; AskDigits = ''; AskDigitsAt = [DateTime]::MinValue
     Wide = $null; Page = 'queue'; PageBack = 'queue'; ClockOn = $false; ListNames = @(); ListInfo = @(); QHot = -1; QHotBtn = ''; QOn = $false
     AskRows = @(); AskHot = -1; AskTags = $false; LogAtEnd = $true; Icon = $null; ListTotal = 0; QPress = $null; AskCtxLines = @()
+    WarmAt = [DateTime]::MinValue
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -564,6 +565,7 @@ function New-ControlPanel {
     try { if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { $e.Handled = $true; $e.SuppressKeyPress = $true; Submit-PanelInput } } catch {}
   })
   $ib.Add_HandleCreated({ try { Set-PanelCue } catch {} })
+  $ib.Add_TextChanged({ try { Request-PanelWarm } catch {} })
   $p.Input = $ib
   $p.AddLine = New-PanelButton (T 'Add') (T 'Add what you typed (Enter): a link or a file is queued, a title is searched for.') '' $null $null
   $p.AddLine.Add_Click({ try { Submit-PanelInput } catch {} })
@@ -877,6 +879,18 @@ function Receive-PanelDrop($data) {
   return $true
 }
 
+# A title being typed while a video plays: the main thread loads its search (Start-AddWorker), so it is ready by Enter.
+# Not for a link or a path (they are added without one); at most every 30 s.
+function Request-PanelWarm {
+  $q = $script:Panel
+  $t = ([string]$q.Input.Text).Trim()
+  if ($t.Length -lt 2 -or @('', 'off', 'waiting') -contains [string]$q.Mode) { return }
+  if ($t -match '^(?i)([a-z][a-z0-9+.-]*://|magnet:|[a-z]:[\\/]|[\\/"])') { return }
+  if (([DateTime]::UtcNow - $q.WarmAt).TotalSeconds -lt 30) { return }
+  $q.WarmAt = [DateTime]::UtcNow
+  Add-PanelCommand 'warm' ''
+}
+
 # Enter / [Add]: what the box holds goes to the main thread as a typed line.
 function Submit-PanelInput {
   $q = $script:Panel
@@ -1028,8 +1042,8 @@ function Update-PanelMenu {
   $prompt = ($s -and [bool]$s['Prompt'])
   $mode = ''
   if ($s) { $mode = [string]$s['Mode'] }
-  # (Not while a question is open: the item would only run after it.)
-  $asking = Test-PanelAskOpen
+  # (Not while the main thread asks: the item would only run after it. The search's questions don't hold it.)
+  $asking = Test-PanelMainAsk
   $waitOk = ($mode -eq 'waiting' -and -not $prompt -and -not $asking)
   $tip = T 'Available while nothing plays (press Stop first).'
   $n = 0
@@ -1108,7 +1122,7 @@ function Update-PanelQueueMenu {
   $q = $script:Panel
   $s = $null
   try { $s = $script:PanelSync.State } catch {}
-  $ok = ($null -ne $s -and -not [bool]$s['Prompt'] -and -not (Test-PanelAskOpen))
+  $ok = ($null -ne $s -and -not [bool]$s['Prompt'] -and -not (Test-PanelMainAsk))
   $ids = @($q.ListIds)
   $ix = $q.List.SelectedIndex
   $has = ($ok -and (Get-PanelListId) -gt 0)
@@ -1490,14 +1504,32 @@ function Get-PanelAsk {
   $b = Get-PanelBus
   if ($null -eq $b) { return $null }
   $a = $b.Ask
-  if ($a -is [System.Collections.IDictionary] -and [string]$a['Id']) { return $a }
-  return $null
+  if (-not ($a -is [System.Collections.IDictionary] -and [string]$a['Id'])) { $a = $null }
+  # The search started in this window while a video plays (Start-AddWorker) asks on a bus of its own: its card shows
+  # when the main thread asks nothing (the start screen's '>' waits behind it).
+  if ($null -eq $a -or [string]$a['Kind'] -eq 'line') {
+    $wb = $b['WBus']
+    if ($null -ne $wb) {
+      $w = $wb.Ask
+      if ($w -is [System.Collections.IDictionary] -and [string]$w['Id']) { return $w }
+    }
+  }
+  return $a
 }
 
 # Is a question open that the card shows (not the start screen's '>')?
 function Test-PanelAskOpen {
   $a = Get-PanelAsk
   return ($null -ne $a -and [string]$a['Kind'] -ne 'line')
+}
+
+# Is the main thread asking (not the start screen's '>')? Its questions hold it: Up next's buttons and menu wait for them
+# (what they ask for would only run after). The search's questions (Start-AddWorker) don't hold it.
+function Test-PanelMainAsk {
+  $b = Get-PanelBus
+  if ($null -eq $b) { return $false }
+  $a = $b.Ask
+  return ($a -is [System.Collections.IDictionary] -and [string]$a['Id'] -and [string]$a['Kind'] -ne 'line')
 }
 
 function Test-PanelActive {
@@ -1526,7 +1558,11 @@ function Send-PanelAnswer([hashtable]$ans, [switch]$Line) {
     if ($q.Ask.ContainsFocus) { $q.Form.ActiveControl = $q.LinkBox }
     $q.Ask.Enabled = $false
   }
-  $b.Answers.Enqueue($ans)
+  # (To the thread that asked: the main one, or the search's.)
+  $to = $b
+  $wb = $b['WBus']
+  if ($null -ne $wb -and $wb.Ask -is [System.Collections.IDictionary] -and [string]$wb.Ask['Id'] -ceq $id) { $to = $wb }
+  $to.Answers.Enqueue($ans)
   return $true
 }
 
@@ -1734,6 +1770,12 @@ function Show-PanelAsk($a) {
   $q = $script:Panel
   $k = $q.K
   $WF = 'System.Windows.Forms'
+  # (The main thread's question over the search's, or back, while the replaced one - not answered here - had the focus:
+  # the keys being pressed were meant for that one. This one waits for a click or Tab, as one that comes while the
+  # user types in the input box.)
+  $prevId = [string]$q.AskId
+  $newId = [string]$a['Id']
+  $cut = ($prevId -and $newId -and $q.Ask.ContainsFocus -and $q.AskSent -cne $prevId -and $prevId.Substring(0, 1) -cne $newId.Substring(0, 1))
   $q.AskView = $a
   $q.AskId = [string]$a['Id']
   $q.AskSent = ''
@@ -1839,6 +1881,9 @@ function Show-PanelAsk($a) {
         }
         $q.AskBody.Controls.Add($fl)
       }
+      'busy' {
+        # (The search's card while it looks something up, before and between its questions: the title and Cancel.)
+      }
       default {
         # text / episodes: a box (a secret one shows dots), episodes with [All]
         $g = New-PanelGrid 2 ([int]($q.Font.Height * 2.1))
@@ -1886,8 +1931,10 @@ function Show-PanelAsk($a) {
       $q.Tips.SetToolTip($b, (T 'Leave these questions; nothing is added or changed'))
       $nav = 'home'
       if (-not [bool]$a['CanHome']) { $nav = 'back' }
+      # (The search's card isn't a question: its Cancel stops the search, Stop-PanelSearch.)
+      if ([string]$a['Kind'] -eq 'busy') { $nav = 'stop'; $q.Tips.SetToolTip($b, (T 'Stop the search; nothing is added')) }
       $b.Tag = $nav
-      $b.Add_Click({ try { Send-PanelAskNav ([string]$this.Tag) } catch { Write-PanelWarning $_ } })
+      $b.Add_Click({ try { if ([string]$this.Tag -eq 'stop') { Stop-PanelSearch } else { Send-PanelAskNav ([string]$this.Tag) } } catch { Write-PanelWarning $_ } })
       $q.AskBar.Controls.Add($b)
     }
     if ($ok) {
@@ -1910,9 +1957,31 @@ function Show-PanelAsk($a) {
   # when the question ends (InputParked, see Update-PanelView).
   $fc = $null
   try { $fc = Get-PanelFocus } catch {}
+  # (The search's card isn't a question: no flash, no sound. Its title was just sent with Enter, so its first question
+  # takes the focus as usual.)
+  if ([string]$a['Kind'] -eq 'busy') {
+    if ($fc -and $q.InputRow.Contains($fc)) { $q.Form.ActiveControl = $q.LinkBox; $q.InputParked = $true }
+    $q.AskFocusPending = $false
+    # (A flash for the question it replaces - one that ended in the console or by its time limit - stops.)
+    if ($q.AskFlashing) {
+      $q.AskFlashing = $false
+      try { [void][VRCLinkMaker.Win]::StopFlash($q.Form.Handle) } catch {}
+    }
+    return
+  }
   if ($fc -and $q.InputRow.Contains($fc)) { $q.Form.ActiveControl = $q.LinkBox; $q.InputParked = $true; $q.AskFocusPending = $true }
+  if ($cut) { $q.Form.ActiveControl = $q.LinkBox; $q.AskFocusPending = $true }
   if (-not (Test-PanelActive)) { $q.AskFocusPending = $true; Invoke-PanelAttention }
   elseif (-not $q.AskFocusPending) { Move-PanelAskFocus }
+}
+
+# Cancel / Esc on the search's card: the main thread stops the search (Stop-AddWorkerSearch) and the card goes.
+function Stop-PanelSearch {
+  $q = $script:Panel
+  if (-not $q.AskId -or $null -eq $q.AskView -or [string]$q.AskView['Kind'] -ne 'busy') { return }
+  if ($q.Ask.ContainsFocus) { $q.Form.ActiveControl = $q.LinkBox }
+  $q.Ask.Enabled = $false
+  Add-PanelCommand 'wcancel' $q.AskId
 }
 
 function Move-PanelAskFocus {
@@ -1929,7 +1998,8 @@ function Invoke-PanelAttention {
   $q = $script:Panel
   $win = [bool]('VRCLinkMaker.Win' -as [type])
   try { if ($win -and [VRCLinkMaker.Win]::ConsoleInFront()) { return } } catch {}
-  if ($win) { try { $q.AskFlashing = [bool][VRCLinkMaker.Win]::Flash($q.Form.Handle) } catch {} }
+  # (Flash returns the caption's state before the call, not whether it flashes: a flash started here is one to stop.)
+  if ($win) { try { [void][VRCLinkMaker.Win]::Flash($q.Form.Handle); $q.AskFlashing = $true } catch {} }
   try { [System.Media.SystemSounds]::Asterisk.Play() } catch {}
 }
 
@@ -2031,6 +2101,24 @@ function Update-PanelAsk {
   if ($q.AskId) {
     $txt = Get-PanelAskInfo $q.AskView
     if ($txt -cne $q.AskInfoText) { $q.AskInfoText = $txt; $q.AskInfo.Text = $txt }
+    # (The search's card: what it is doing now - its status line, e.g. a download's progress - under its title.)
+    if ([string]$q.AskView['Kind'] -eq 'busy') {
+      $now = ''
+      try {
+        $wb = (Get-PanelBus)['WBus']
+        $st = $null
+        if ($null -ne $wb) { $st = $wb.Status }
+        if ($st -and ([DateTime]::UtcNow - [DateTime]$st['At']).TotalSeconds -lt 5) { $now = [string]$st['Text'] }
+      } catch {}
+      $l = $q.AskCtxLines[0]
+      if ($l.Text -cne $now) {
+        $l.Text = $now
+        $l.ForeColor = $q.Colors.Dim
+        $q.Tips.SetToolTip($l, $now)
+        $l.Visible = [bool]$now
+        $q.AskCtx.Visible = [bool]$now
+      }
+    }
   }
 }
 
@@ -2047,6 +2135,10 @@ function Invoke-PanelAskKey([System.Windows.Forms.Keys]$keyData) {
   $code = $keyData -band $K::KeyCode
   $mods = $keyData -band $K::Modifiers
   $bm = [string]$a['BackMode']
+  if ([string]$a['Kind'] -eq 'busy') {
+    if ($mods -eq $K::None -and $code -eq $K::Escape) { Stop-PanelSearch; return $true }
+    return $false
+  }
   if ($mods -eq $K::Alt -and $code -eq $K::Left) { if ($bm -eq 'back' -or $bm -eq 'leave') { Send-PanelAskNav 'back' }; return $true }
   if ($mods -eq $K::Alt -and $code -eq $K::Right) { if ([bool]$a['CanForward']) { Send-PanelAskNav 'forward' }; return $true }
   if ($mods -ne $K::None) { return $false }
@@ -2558,11 +2650,23 @@ function Update-PanelView($s) {
       try { $fc = Get-PanelFocus } catch {}
       if ($fc -eq $q.LinkBox) { $q.Form.ActiveControl = $q.Input }
     }
-    $tipKey = [string]$inputOn + [string]$stripAsk
+    # (A title back from the search - nothing found, or left: in the box again, to change it.)
+    if ($inputOn) {
+      $bus = Get-PanelBus
+      $back = $null
+      try { if ($bus) { $back = $bus['InputBack'] } } catch {}
+      if ($back) {
+        $bus['InputBack'] = $null
+        if (-not $q.Input.Text) { $q.Input.Text = [string]$back; $q.Input.SelectionStart = $q.Input.TextLength }
+      }
+    }
+    $busyAsk = ($stripAsk -and [string]$ask['Kind'] -eq 'busy')
+    $tipKey = [string]$inputOn + [string]$stripAsk + [string]$busyAsk
     if ($script:PanelLast['inputtip'] -cne $tipKey) {
       $script:PanelLast['inputtip'] = $tipKey
       $t = ''
-      if ($stripAsk) { $t = T 'Answer the question first.' }
+      if ($busyAsk) { $t = T 'The search is running: wait for it or cancel it.' }
+      elseif ($stripAsk) { $t = T 'Answer the question first.' }
       elseif (-not $inputOn) { $t = T 'Busy with the last step: the box works again in a moment.' }
       $q.Tips.SetToolTip($q.InputRow, $t)
     }
@@ -2595,8 +2699,8 @@ function Update-PanelView($s) {
     # top and log.txt always; End stream while something is on the air or a question waits.)
     $q.CmdOn = $cmdOn
     $q.ClockOn = [bool]$s['Clock']
-    # Up next's buttons: not on the start screen, nor while a question is open (as its menu, Update-PanelQueueMenu).
-    $qon = ($hasState -and -not [bool]$s['Prompt'] -and -not $stripAsk)
+    # Up next's buttons: not on the start screen, nor while the main thread asks (as its menu, Update-PanelQueueMenu).
+    $qon = ($hasState -and -not [bool]$s['Prompt'] -and -not (Test-PanelMainAsk))
     if ($qon -ne $q.QOn) { $q.QOn = $qon; $q.List.Invalidate() }
 
     $up = @()

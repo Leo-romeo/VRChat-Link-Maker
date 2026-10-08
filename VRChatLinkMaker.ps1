@@ -173,6 +173,7 @@ $script:UiLogSeq = 0
 $script:UiBus = [hashtable]::Synchronized(@{
     Log = $script:UiLog; Cmds = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Ask = $null
     Answers = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Status = $null; QuitReq = $false })
+$script:UiRingTo = $null
 function Add-UiLogLine([string]$text, [string]$color) {
   try {
     # (Numbered and timed: the lines said since the last question go with the next one to the control window,
@@ -182,8 +183,20 @@ function Add-UiLogLine([string]$text, [string]$color) {
     $script:UiLogRing.Add($e)
     if ($script:UiLogRing.Count -gt 600) { $script:UiLogRing.RemoveRange(0, 100) }
     $script:UiLog.Enqueue($e)
+    # (In the control window's search: for the main thread's ring too, Add-UiRingLine.)
+    if ($null -ne $script:UiRingTo) { $script:UiRingTo.Enqueue(@($text, $color)) }
     $drop = $null
     while ($script:UiLog.Count -gt 2000) { [void]$script:UiLog.TryDequeue([ref]$drop) }
+  } catch {}
+}
+
+# A line the control window's search said (already in the window's queue): into this thread's ring too, so a reopened
+# window still shows it. Marked as the search's: Get-AskContext leaves it out of this thread's questions' lead-in.
+function Add-UiRingLine([string]$text, [string]$color) {
+  try {
+    $script:UiLogSeq++
+    $script:UiLogRing.Add(@($text, $color, $script:UiLogSeq, [DateTime]::UtcNow, $true))
+    if ($script:UiLogRing.Count -gt 600) { $script:UiLogRing.RemoveRange(0, 100) }
   } catch {}
 }
 
@@ -1852,7 +1865,7 @@ function Read-Entries([string]$Prefill = '') {
     $la = $null
     if ($keys) {
       $script:NavAskSeq++
-      $la = @{ Id = 'm' + $script:NavAskSeq; Kind = 'line'; Title = (T 'What do you want to stream?'); Deadline = $null }
+      $la = @{ Id = $script:AskIdPrefix + $script:NavAskSeq; Kind = 'line'; Title = (T 'What do you want to stream?'); Deadline = $null }
       $b = $script:UiBus
       if ($b) { $x = $null; while ($b.Answers.TryDequeue([ref]$x)) {}; $b.Ask = $la }
     }
@@ -1935,7 +1948,7 @@ function Read-PastedRest {
 
 # While it streams, lines arrive one by one: what comes right after a code is the rest of it (dropped as well).
 $script:CodePasteUntil = $null
-function Add-TypedLine([string]$line, [string]$kind = '') {
+function Add-TypedLine([string]$line, [string]$kind = '', [switch]$FromWindow) {
   if ($script:CodePasteUntil -and (Get-Date) -lt $script:CodePasteUntil) { return }
   if ((Test-HostModule) -and (Test-VpsCodeText $line)) {
     $script:CodePasteUntil = (Get-Date).AddSeconds(2)
@@ -1952,8 +1965,13 @@ function Add-TypedLine([string]$line, [string]$kind = '') {
   }
   $entries = @(Split-EntryLine $line)
   if ($entries.Count -eq 0) { return }
-  # A title while something plays: search in a second window, so this one keeps streaming undisturbed.
-  if ($kind -ne 'waiting' -and $entries.Count -eq 1 -and (Test-IsTitle $entries[0])) { Open-AddWindow $entries[0]; return }
+  # A title while something plays: searched for apart from the stream, so it keeps going undisturbed - typed in the
+  # control window, right there (its questions in the window, Request-AddWorkerSearch); typed here, in a second window.
+  if ($kind -ne 'waiting' -and $entries.Count -eq 1 -and (Test-IsTitle $entries[0])) {
+    if ($FromWindow -and (Request-AddWorkerSearch ([string]$entries[0]))) { return }
+    Open-AddWindow $entries[0]
+    return
+  }
   Invoke-AddEntries $entries $kind $line
 }
 
@@ -2648,6 +2666,7 @@ $script:PinnedRefused = @{}     # tool -> the flow (or $true outside one) where 
 $script:PinnedNoted = $false
 $script:Rqbit = $null           # the running engine: Proc, Port, Auth, Dir, DlDir, Lock, Ready, Started, Torrents (id -> group)
 $script:RqbitStarts = 0
+$script:TorrentDirTag = ''    # added to its folder's name: the control window's search has its own ('-w1'..., Start-AddWorker)
 $script:KeepAwake = $false
 $script:NoteText = $null        # what the waiting screen's extra line says now (see Write-ScreenNote)
 $script:NoteAt = [datetime]::MinValue
@@ -2918,7 +2937,7 @@ function Start-TorrentEngine {
   $exe = Get-PinnedTool 'rqbit' (Test-CanAsk)
   if (-not $exe) { throw (T 'torrents need rqbit, which isn''t set up') }
   $script:RqbitStarts++
-  $dir = PathJoin $script:TempRoot "torrent-$PID"
+  $dir = PathJoin $script:TempRoot ("torrent-$PID" + $script:TorrentDirTag)
   if ($script:DeadRqbits.Count -gt 0) { $dir += '-' + $script:RqbitStarts }
   try { if ([System.IO.Directory]::Exists($dir)) { [System.IO.Directory]::Delete($dir, $true) } } catch {}
   $dl = PathJoin $dir 'dl'
@@ -4812,10 +4831,12 @@ function Publish-UiAsk($a, [bool]$canHome = $false) {
   return $v
 }
 
-# The question with this Id ended (answered, Back, Ctrl+C, End stream): the window's strip closes.
+# The question with this Id ended (answered, Back, Ctrl+C, End stream): the window's card closes. (In the control
+# window's search its "Searching..." card comes back until the next question: $script:AskIdle, Invoke-AddWorkerSearch.)
+$script:AskIdle = $null
 function Clear-UiAsk([string]$id) {
   $b = $script:UiBus
-  try { if ($b -and $b.Ask -and [string]$b.Ask.Id -ceq $id) { $b.Ask = $null } } catch {}
+  try { if ($b -and $b.Ask -and [string]$b.Ask.Id -ceq $id) { $b.Ask = $script:AskIdle } } catch {}
 }
 
 # What was said since the last question ended - what leads up to this one: an explanation, a warning ("the old link
@@ -4831,6 +4852,7 @@ function Get-AskContext {
     for ($i = $ring.Count - 1; $i -ge 0 -and $out.Count -lt 4; $i--) {
       $e = $ring[$i]
       if (@($e).Count -lt 4 -or [long]$e[2] -le [long]$script:AskCtxMark -or [DateTime]$e[3] -lt $since) { break }
+      if (@($e).Count -ge 5 -and $e[4]) { continue }   # (the control window's search said it, Add-UiRingLine)
       if (([string]$e[0]).Trim()) { $out.Insert(0, @([string]$e[0], [string]$e[1])) }
     }
   } catch {}
@@ -4882,6 +4904,7 @@ $script:Nav = $null            # the innermost open flow frame
 $script:NavSignal = ''         # 'back' / 'leave' / 'home' while a navigation unwinds; sticky until its flow takes it
 $script:NavSignalFrame = $null
 $script:NavAskSeq = 0
+$script:AskIdPrefix = 'm'    # the questions' Ids are this + a number ('w' in the control window's search, Start-AddWorker)
 $script:NavPass = 0          # counts the runs of flow bodies (Invoke-NavFlow): a re-run is a new pass
 # The session answers the search / site questions set (Invoke-NavFlow -Snap): put back when a flow goes back or is left.
 $script:SiteAnswerVars = @('DubChoice', 'DubPref', 'LastDub', 'LastEps', 'LastPart', 'LastPlayer', 'LastSearchLink', 'SiteChoice')
@@ -5232,7 +5255,7 @@ function Invoke-Ask($a) {
   $step = ($null -ne $f -and -not $f.Sealed)
   $a.CheckKey = Get-AskCheckKey $a
   $script:NavAskSeq++
-  $a.Id = 'm' + $script:NavAskSeq
+  $a.Id = $script:AskIdPrefix + $script:NavAskSeq
   if ($step -and $f.Pos -lt $f.Target) {
     $e = $f.Tape[$f.Pos]
     if ($e.Key -ceq $a.CheckKey) {
@@ -5688,6 +5711,7 @@ function Get-QueuedSeek {
 function Receive-Commands([string]$kind) {
   Add-Cmd (Read-KeyCommand $kind)
   try { Update-UpnpLeases } catch {}   # (also while waiting for input, not only while a video plays)
+  try { Receive-AddWorker } catch {}
   # End stream in the control window (the 'quit' it posts too may have gone with the start questions' clicks).
   try { if ($script:UiBus -and $script:UiBus.QuitReq) { $script:UiBus.QuitReq = $false; Add-Cmd (New-Cmd 'quit' $null 'panel') } } catch {}
   if ($script:PanelShown) {
@@ -5697,6 +5721,9 @@ function Receive-Commands([string]$kind) {
       if (-not $p) { break }
       switch ($p.Cmd) {
         'add' { Open-AddWindow '' }
+        # (A title being typed in the input box: its search gets ready, Start-AddWorker. Cancel on its card stops it.)
+        'warm' { if ($kind -ne 'waiting') { [void](Start-AddWorker) } }
+        'wcancel' { Stop-AddWorkerSearch ([string]$p.Arg) }
         'viewer' { Open-ViewerPreview }
         'clock' { Switch-Clock }
         # The window's input box: each line as if typed here and Enter pressed; files / a folder as if dropped here.
@@ -5710,7 +5737,7 @@ function Receive-Commands([string]$kind) {
             if ($titles.Count -gt 0) { $lns = @($rest + $titles[0]) }
             if ($titles.Count -gt 1) { Say (T '  Only the first title is searched for ({0}); {1} more skipped.' $titles[0] ($titles.Count - 1)) 'Yellow' }
           }
-          foreach ($ln in $lns) { Add-TypedLine $ln $kind }
+          foreach ($ln in $lns) { Add-TypedLine $ln $kind -FromWindow }
         }
         'files' {
           $fs = @(@($p.Arg) | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() })
@@ -5858,6 +5885,258 @@ function Open-AddWindow([string]$query) {
     [void][System.Diagnostics.Process]::Start($psi)
     Say (T '  Opened a second window: search or add videos there, this one keeps streaming.') 'Gray'
   } catch { Say (T '  Couldn''t open a second window: {0}' $_.Exception.Message) 'Yellow' }
+}
+
+# ------------------------------------------------------------------ the control window's search
+# A title typed in the control window while a video plays is searched for right there, in a worker: a second thread
+# with this tool loaded, so the stream keeps going undisturbed (as with a second window). Its questions (which one,
+# voice-over, episodes, player, now or after) show in the window's Question tab only: the console's keys belong to the
+# stream. What the search ends with goes to the queue as a second window's does (queue.txt, Receive-QueueFile). A title
+# typed in the console, and +, still open a second window.
+# Each search gets a worker of its own (nothing carries over from the last one, as with a new window); typing a title in
+# the input box loads one ('warm'), so it is ready by Enter. Its bus ($script:UiBus.WBus while it searches: the window
+# finds it there): Log = the window's message queue; LogLines / RingLines = its lines for log.txt and this thread's ring
+# (this thread takes them, Write-AddWorkerLog); Ask /
+# Answers as on the main bus (its question Ids: 'w<n>.1', 'w<n>.2'...); Status; QuitReq (its next question cancels it);
+# Req = the search (@{ Text; Lang; Player }); Ready (loaded); Handing (its questions are over); Done (@{ Nav; Text;
+# Added }); Stop; Ended; Error.
+$script:AddWorker = $null    # the one loading or searching: @{ Rs; Ps; Run; Bus; N; Title; At }
+$script:AddWorkersEnding = New-Object System.Collections.ArrayList   # cancelled ones, until they end
+$script:AddWorkerN = 0
+$script:AddWorkerIdleMin = 10.0   # a worker loaded but not used ends after this long
+$script:AddWorkerBroken = $false  # one couldn't load this tool: titles go to a second window again
+$script:AddWorkerBoot = @'
+param($Bus, $ToolFile, $N, $IdleMin)
+try {
+  $global:VrclmNoMain = $true
+  . $ToolFile
+  Initialize-AddWorker $Bus $N
+  $Bus.Ready = $true
+  # (One search, then it ends: the next one gets a new worker.)
+  $until = [DateTime]::UtcNow.AddMinutes($IdleMin)
+  while (-not $Bus.Stop -and $null -eq $Bus.Req -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 50 }
+  if ($null -ne $Bus.Req -and -not $Bus.Stop) {
+    $res = @(Invoke-AddWorkerSearch $Bus.Req)
+    $Bus.Done = $res[$res.Count - 1]
+  }
+} catch {
+  $Bus.Error = $_.Exception.Message
+} finally {
+  $Bus.Ask = $null
+  $Bus.Ended = $true
+}
+'@
+
+# In the worker, once this tool is loaded there: no console (its keys belong to the stream: Read-NavKey never gets
+# one), questions and messages to the control window through the worker's bus, log.txt through the main thread. The
+# main thread draws the window and keeps the router's port forwards; nothing is printed here.
+function Initialize-AddWorker($bus, [int]$n) {
+  $script:UiBus = $bus
+  $script:UiLog = $bus.Log
+  $script:UiRingTo = $bus.RingLines
+  # (It is there to ask in the window: also when this process otherwise runs unattended, VRCLM_AUTO.)
+  $script:Interactive = $true
+  $script:PanelShown = $true
+  $script:HasConsole = $false
+  $script:KeySource = { param($op) if ($op -eq 'avail') { return $false }; throw (New-Object System.OperationCanceledException 'no console here') }
+  $script:AddMode = $true
+  $script:AskIdPrefix = "w$n."
+  $script:TorrentDirTag = "-w$n"
+  $lw = New-Object psobject -Property @{ Q = $bus.LogLines }
+  Add-Member -InputObject $lw -MemberType ScriptMethod -Name WriteLine -Value { param($t) $this.Q.Enqueue([string]$t) }
+  Add-Member -InputObject $lw -MemberType ScriptMethod -Name Dispose -Value { }
+  $script:LogWriter = $lw
+  function script:Invoke-PanelPump { }
+  function script:Update-AskLeases { }
+  function script:Write-Host { }
+}
+
+# In the worker: the search for $req.Text with the questions a second window asks, and what it ends with to the queue
+# file. @{ Nav ('leave' / 'home': left by Esc or Cancel); Text (the title, for the input box, when nothing went to the
+# queue); Added (how many links did) }.
+function Invoke-AddWorkerSearch($req) {
+  $out = @{ Nav = ''; Text = ''; Added = 0 }
+  $text = [string]$req.Text
+  try {
+    Initialize-Language ([string]$req.Lang)
+    # (config.json's "DubPriority" and "Player" count here too, only read: the streaming thread owns the file.)
+    if ([System.IO.File]::Exists((Get-ConfigPath))) { try { $script:Cfg = Get-Config } catch {} }
+    # (Not asked again when the stream already has an answer this session, as with a second window: Read-HandoverPlayer.)
+    [Environment]::SetEnvironmentVariable('VRCLM_PLAYER', [string]$req.Player)
+    $script:AskIdle = $script:UiBus.Ask
+    $r = Invoke-NavFlow -Name 'add' -Origin 'addwin' -Snap $script:SiteAnswerVars -Body { Get-AddHandover @($text) }
+    # (The questions are over: the card goes now, and what is handed over can't be "cancelled" any more.)
+    $script:AskIdle = $null
+    $script:UiBus.Handing = $true
+    $script:UiBus.Ask = $null
+    $abs = @($r.Value | Where-Object { $_ })
+    if ($r.Nav) { $out.Nav = [string]$r.Nav; $out.Text = $text }
+    elseif ($abs.Count -eq 0) { $out.Text = $text }
+    elseif (Add-ToQueueFile $abs) { $out.Added = @($abs | Where-Object { $_ -ne '#vrclm-now' }).Count }
+    else { Say (T 'Couldn''t reach the stream that is already running.') 'Red' }
+  } catch {
+    if ($script:NavSignal) { throw }   # (a Back / Home goes on, as from every question; Invoke-NavFlow keeps its own)
+    if (-not $script:CtrlCQuit) { Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+    $out.Text = $text
+  } finally {
+    $script:AskIdle = $null
+    try { Stop-TorrentEngine } catch {}
+  }
+  return $out
+}
+
+# Loads a worker for the next search unless one is loaded or loading: on 'warm' (a title being typed in the input box
+# while a video plays) and on a search. $null when it can't (the title is then searched for in a second window).
+function Start-AddWorker {
+  Receive-AddWorker
+  $w = $script:AddWorker
+  # (A loaded one whose idle time is nearly up makes way for a new one: a search handed to it just as it ends would be lost.)
+  if ($w -and $null -eq $w.Bus.Req -and ([DateTime]::UtcNow - $w.At).TotalMinutes -ge $script:AddWorkerIdleMin * 0.95) {
+    $script:AddWorker = $null
+    $w.Bus.Stop = $true
+    [void]$script:AddWorkersEnding.Add($w)
+    $w = $null
+  }
+  if ($w) { return $w }
+  if ($script:AddWorkerBroken -or -not $script:PanelShown -or -not $script:ScriptFile) { return $null }
+  $rs = $null
+  $ps = $null
+  try {
+    $script:AddWorkerN++
+    $bus = [hashtable]::Synchronized(@{
+        Log = $script:UiLog; LogLines = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]')
+        RingLines = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Ask = $null
+        Answers = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Status = $null; QuitReq = $false
+        Req = $null; Ready = $false; Handing = $false; Done = $null; Stop = $false; Ended = $false; Error = $null })
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($script:AddWorkerBoot).AddArgument($bus).AddArgument($script:ScriptFile).AddArgument($script:AddWorkerN).AddArgument([double]$script:AddWorkerIdleMin)
+    $script:AddWorker = @{ Rs = $rs; Ps = $ps; Run = $ps.BeginInvoke(); Bus = $bus; N = $script:AddWorkerN; Title = ''; At = [DateTime]::UtcNow }
+    return $script:AddWorker
+  } catch {
+    Write-LogLine ('  (search worker: ' + $_.Exception.Message + ')')
+    if ($ps) { try { $ps.Dispose() } catch {} }
+    if ($rs) { try { $rs.Dispose() } catch {} }
+    $script:AddWorker = $null
+    return $null
+  }
+}
+
+# The worker's card while it searches, and between its questions: the title and Cancel ('wcancel', Stop-AddWorkerSearch).
+function New-AddWorkerCard([string]$title, [int]$n) {
+  return @{ Id = "w0-$n"; Kind = 'busy'; Title = (T 'Searching for "{0}"...' $title); Options = [string[]]@(); AllowNone = $false; NoneLabel = ''
+    Default = $null; Prev = $null; Crumb = ''; BackMode = 'leave'; CanBack = $true; BackLabel = (T 'Cancel'); CanHome = $true; EscLabel = ''
+    CanForward = $false; Secret = $false; Prefill = ''; All = ''; Deadline = $null; TimeoutLabel = ''; Key = 'busy'; Context = @() }
+}
+
+# A title typed in the control window while a video plays (Add-TypedLine): searched for in a worker, its card in the
+# window until the first question. $false = no worker (a second window searches it instead).
+function Request-AddWorkerSearch([string]$title) {
+  $w = $script:AddWorker
+  if ($w -and $null -ne $w.Bus.Req) {
+    # (One search at a time: this title goes back to the input box.)
+    Say (T '  Still searching for "{0}" in the control window: answer its questions there or cancel it first.' $w.Title) 'Yellow'
+    Set-PanelInputBack $title
+    return $true
+  }
+  $w = Start-AddWorker
+  if (-not $w) { return $false }
+  $w.Title = $title
+  $b = $w.Bus
+  $b.Ask = New-AddWorkerCard $title $w.N
+  $b.Req = @{ Text = $title; Lang = [string]$script:Lang; Player = [string]$script:PlayerPref }
+  $script:UiBus.WBus = $b
+  return $true
+}
+
+# Cancel on the worker's card ($id: that card's): the search stops and the card closes at once (a web request under way
+# may take a few seconds more to let go: what it finds then is dropped). The title goes back to the input box. Only while
+# that card shows: a Cancel read late, once the search went on to a question or hands over, stops nothing.
+function Stop-AddWorkerSearch([string]$id) {
+  $w = $script:AddWorker
+  if (-not $w -or $null -eq $w.Bus.Req -or $w.Bus.Handing) { return }
+  $a = $w.Bus.Ask
+  if ($id -and -not ($a -is [System.Collections.IDictionary] -and [string]$a['Id'] -ceq $id)) { return }
+  $script:AddWorker = $null
+  $b = $w.Bus
+  $b.QuitReq = $true
+  $b.Stop = $true
+  try { if ($script:UiBus.WBus -eq $b) { $script:UiBus.WBus = $null } } catch {}
+  $b.Ask = $null
+  try { [void]$w.Ps.BeginStop($null, $null) } catch {}
+  [void]$script:AddWorkersEnding.Add($w)
+  Write-LogLine ('  (search cancelled: ' + $w.Title + ')')
+  Set-PanelInputBack $w.Title
+}
+
+# Every round (Receive-Commands): the workers' log.txt lines, and a search's end - its card gone, the title back in the
+# input box when nothing went to the queue (left, nothing found), an error said. Cancelled ones go once they end.
+function Receive-AddWorker {
+  if (-not $script:AddWorker -and $script:AddWorkersEnding.Count -eq 0) { return }
+  $w = $script:AddWorker
+  if ($w) {
+    Write-AddWorkerLog $w.Bus
+    if ($w.Bus.Ended -or $w.Run.IsCompleted) {
+      $script:AddWorker = $null
+      $b = $w.Bus
+      try { if ($script:UiBus.WBus -eq $b) { $script:UiBus.WBus = $null } } catch {}
+      if ($b.Error) { Write-LogLine ('  (search worker: ' + $b.Error + ')') }
+      if ($b.Error -and -not $b.Ready) {
+        # (It couldn't load the tool: this title and the next ones are searched for in a second window, as before.)
+        $script:AddWorkerBroken = $true
+        if ($null -ne $b.Req) { Open-AddWindow ([string]$b.Req.Text) }
+      } else {
+        if ($b.Error -and $null -ne $b.Req) { Say (T '  The search didn''t work: {0}' $b.Error) 'Yellow' }
+        $d = $b.Done
+        if ($null -ne $b.Req -and ($null -eq $d -or [string]$d.Text)) { Set-PanelInputBack ([string]$b.Req.Text) }
+      }
+      Close-AddWorker $w
+    }
+  }
+  for ($i = $script:AddWorkersEnding.Count - 1; $i -ge 0; $i--) {
+    $e = $script:AddWorkersEnding[$i]
+    Write-AddWorkerLog $e.Bus
+    if ($e.Bus.Ended -or $e.Run.IsCompleted) { $script:AddWorkersEnding.RemoveAt($i); Close-AddWorker $e }
+  }
+}
+
+function Write-AddWorkerLog($bus) {
+  $x = $null
+  while ($bus.LogLines.TryDequeue([ref]$x)) { if ($script:LogWriter) { try { $script:LogWriter.WriteLine([string]$x) } catch {} } }
+  while ($bus.RingLines.TryDequeue([ref]$x)) { Add-UiRingLine ([string]$x[0]) ([string]$x[1]) }
+}
+
+function Close-AddWorker($w) {
+  try { $w.Ps.Dispose() } catch {}
+  try { $w.Rs.Dispose() } catch {}
+}
+
+# The tool ends: the workers stop (a moment for them to let go of rqbit and their folders; what is left the next start
+# clears, Clear-OldTemp). One that doesn't stop in time ends with the tool.
+function Stop-AddWorker {
+  $all = @($script:AddWorkersEnding)
+  if ($script:AddWorker) { $all += $script:AddWorker }
+  $script:AddWorker = $null
+  $script:AddWorkersEnding.Clear()
+  try { if ($script:UiBus) { $script:UiBus.WBus = $null } } catch {}
+  foreach ($w in $all) {
+    $w.Bus.QuitReq = $true
+    $w.Bus.Stop = $true
+    try { [void]$w.Ps.BeginStop($null, $null) } catch {}
+  }
+  $until = [DateTime]::UtcNow.AddSeconds(2)
+  foreach ($w in $all) {
+    while (-not $w.Run.IsCompleted -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 50 }
+    Write-AddWorkerLog $w.Bus
+    if ($w.Run.IsCompleted) { Close-AddWorker $w }
+  }
+}
+
+# Text for the control window's input box: put there when it is empty again (a search that found nothing, or was left).
+function Set-PanelInputBack([string]$text) {
+  try { if ($script:UiBus -and $text) { $script:UiBus.InputBack = $text } } catch {}
 }
 
 function Open-ViewerPreview {
@@ -7843,6 +8122,7 @@ function Invoke-ResumeOffer([int]$from = 0) {
 function Stop-Everything {
   Set-CtrlCAsKey $false
   Clear-StatusLine
+  try { Stop-AddWorker } catch {}
   if ($script:Src) { Stop-Proc $script:Src.Proc }
   if ($script:Current) { Stop-Proc $script:Current }
   Stop-HostServer
@@ -7864,6 +8144,55 @@ function Stop-Everything {
   if ($script:SlateDir) { try { [System.IO.File]::Delete((Get-NoteFile)) } catch {} }
   if ($script:MutexOwned) { try { $script:Mutex.ReleaseMutex() } catch {} }
   if ($script:LogWriter) { try { $script:LogWriter.Dispose() } catch {}; $script:LogWriter = $null }
+}
+
+# What a second window hands the streaming one for $entries (links, titles, paths), asking here what the streaming
+# window can't ask while a video plays: a torrent with its episodes (a bare hash as a magnet link, a file with its full
+# path), a title searched for and picked, a site link with its voice-over / episodes / player, a file with its full
+# path; then, when there is any, "now or after what is queued?" ('#vrclm-now' first = now). Main's add mode and the
+# control window's search (Invoke-AddWorkerSearch) run it as the 'add' flow.
+function Get-AddHandover([string[]]$entries) {
+  $abs = @()
+  foreach ($e in $entries) {
+    $t = "$e".Trim().Trim('"')
+    if (Test-TorrentLink $t) {
+      # A torrent (magnet, bare hash, .torrent file or link): its file list and which episodes are asked here; the
+      # streaming window gets the link with the episodes (a bare hash as a magnet link, a file with its full path).
+      if ($script:Interactive) {
+        try {
+          $its = @(Expand-Torrent $t)
+          if ($its.Count -gt 0) { $abs += (Get-TorrentHandover $its $t) }
+        } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow' }
+      } else { $abs += (Get-TorrentHandover @() $t) }
+      continue
+    }
+    if ($script:Interactive -and $t -notmatch '^(?i)[a-z][a-z0-9+.-]*://' -and (Test-IsTitle $t)) {
+      # A title: search, pick, answer the questions here; the streaming window gets the link with the answers.
+      $script:LastSearchLink = $null
+      try { [void](Invoke-ContentSearch $t -AskPlayer) } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
+      if ($script:LastSearchLink) { $abs += $script:LastSearchLink }
+      continue
+    }
+    if ($t -match '^(?i)[a-z][a-z0-9+.-]*://') {
+      if ($script:Interactive -and (Test-SiteLink $t)) {
+        # The running window can't ask which voice-over / episodes: ask here and hand the answers over.
+        try {
+          $script:LastDub = $null; $script:LastEps = $null; $script:LastPlayer = $null
+          $its = @(Expand-SiteLink $t)
+          if ($its.Count -eq 0) { continue }
+          Read-HandoverPlayer $its
+          $choice = Get-SiteChoiceText $its
+          if ($choice) { $t = $t + '#vrclm=' + $choice }
+        } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow'; continue }
+      }
+      $abs += $t
+    } else { try { $abs += [System.IO.Path]::GetFullPath($t) } catch {} }
+  }
+  if ($abs.Count -gt 0 -and $script:Interactive) {
+    $when = Read-Choice (T 'Play it now, or after what is queued?') @((T 'After what is queued'), (T 'Now (instead of what plays now)')) 0 $false -Key 'when'
+    if ($when -eq 1) { $abs = @('#vrclm-now') + $abs }
+  }
+  return $abs
 }
 
 function Main {
@@ -7894,49 +8223,7 @@ function Main {
       }
       if ($entries -contains $script:QuitMark) { $script:NoPause = $true; return }
       if ($entries.Count -eq 1 -and (Test-IsTitle ([string]$entries[0]))) { $entries = @([string]$entries[0]) }
-      $r = Invoke-NavFlow -Name 'add' -Origin 'addwin' -Snap $script:SiteAnswerVars -Body {
-        $abs = @()
-        foreach ($e in $entries) {
-          $t = "$e".Trim().Trim('"')
-          if (Test-TorrentLink $t) {
-            # A torrent (magnet, bare hash, .torrent file or link): its file list and which episodes are asked here; the
-            # streaming window gets the link with the episodes (a bare hash as a magnet link, a file with its full path).
-            if ($script:Interactive) {
-              try {
-                $its = @(Expand-Torrent $t)
-                if ($its.Count -gt 0) { $abs += (Get-TorrentHandover $its $t) }
-              } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow' }
-            } else { $abs += (Get-TorrentHandover @() $t) }
-            continue
-          }
-          if ($script:Interactive -and $t -notmatch '^(?i)[a-z][a-z0-9+.-]*://' -and (Test-IsTitle $t)) {
-            # A title: search, pick, answer the questions here; the streaming window gets the link with the answers.
-            $script:LastSearchLink = $null
-            try { [void](Invoke-ContentSearch $t -AskPlayer) } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  The search didn''t work: {0}' $_.Exception.Message) 'Yellow' }
-            if ($script:LastSearchLink) { $abs += $script:LastSearchLink }
-            continue
-          }
-          if ($t -match '^(?i)[a-z][a-z0-9+.-]*://') {
-            if ($script:Interactive -and (Test-SiteLink $t)) {
-              # The running window can't ask which voice-over / episodes: ask here and hand the answers over.
-              try {
-                $script:LastDub = $null; $script:LastEps = $null; $script:LastPlayer = $null
-                $its = @(Expand-SiteLink $t)
-                if ($its.Count -eq 0) { continue }
-                Read-HandoverPlayer $its
-                $choice = Get-SiteChoiceText $its
-                if ($choice) { $t = $t + '#vrclm=' + $choice }
-              } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow'; continue }
-            }
-            $abs += $t
-          } else { try { $abs += [System.IO.Path]::GetFullPath($t) } catch {} }
-        }
-        if ($abs.Count -gt 0 -and $script:Interactive) {
-          $when = Read-Choice (T 'Play it now, or after what is queued?') @((T 'After what is queued'), (T 'Now (instead of what plays now)')) 0 $false -Key 'when'
-          if ($when -eq 1) { $abs = @('#vrclm-now') + $abs }
-        }
-        $abs
-      }
+      $r = Invoke-NavFlow -Name 'add' -Origin 'addwin' -Snap $script:SiteAnswerVars -Body { Get-AddHandover $entries }
       $abs = @($r.Value | Where-Object { $_ })
       if ($abs.Count -gt 0 -or -not $again) { break }
       $entries = @()   # (left, or nothing found: ask again, with the text kept)
@@ -8043,7 +8330,8 @@ function Main {
   Say (T 'Stream ended.') 'Cyan'
 }
 
-if ($env:VRCLM_NO_MAIN) { return }   # test harnesses dot-source this file for its functions only
+# (Test harnesses dot-source this file for its functions only; so does the control window's search, Start-AddWorker.)
+if ($env:VRCLM_NO_MAIN -or $global:VrclmNoMain) { return }
 try {
   Main
 } catch {

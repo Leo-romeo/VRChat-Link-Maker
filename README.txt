@@ -71,11 +71,13 @@ Paste a link to one of these like any other link:
   just Enter takes the first one ("<- auto"). After you picked one, the next
   shows offer that one first. "DubPriority" in config.json sets the preferred
   ones (see SETTINGS).
-- To add a series while something is already streaming, press + (it opens a
+- To add a series while something is already streaming, type its title in the
+  control window (it asks the questions right there), press + (it opens a
   second window), or drop the link on the .bat (or paste it into a new window
   of it): that window asks the questions and hands the answers to the running
-  stream. Pasted into the streaming window itself, it can't ask, so it queues
-  the next 25 episodes with the voice-over you chose last.
+  stream. A link pasted into the console or the control window while it
+  streams can't be asked about, so it queues the next 25 episodes with the
+  voice-over you chose last.
 - For a WPARTY room it picks up the show, season, episode and voice-over the
   room is on, offers the rest of the season, and can start where the room is.
   It only looks at the room; it never changes anything there.
@@ -89,9 +91,9 @@ Paste a link to one of these like any other link:
 - When an episode is on several players (Kodik, AniBoom, Sibnet...), it asks
   once which one to use. "Auto" checks the real picture size of each (a few
   seconds) and takes the sharpest; the next episodes then use that player.
-  A show added through the second window is asked about there (unless this
-  session already has an answer); with "Auto", its first episode is checked
-  when its turn comes.
+  A show added through the second window or the control window's search is
+  asked about there (unless this session already has an answer); with
+  "Auto", its first episode is checked when its turn comes.
 - If the chosen voice-over or player doesn't work for an episode, it uses
   another one and says so in the window.
 - If the stream from a player breaks off mid-episode, it carries on from the
@@ -116,8 +118,10 @@ just type a title (Russian or English) instead of a link and press Enter.
 - It plays through Kodik, Dream Cast's site, AniLiberty's site (Kodik as
   the backup), AnimeVost, CVH or Alloha (if those fail, Collaps). When Kodik doesn't have a voice-over Alloha has (e.g. an official
   dub), that one can be picked too.
-- This works on the start screen, while something streams, and in the search
-  window that + opens (there you can "play now" or add to the queue).
+- This works on the start screen and while something streams: typed in the
+  control window, the search runs right there (its questions in the Question
+  tab); typed in the console, or after +, in a second window. Either way you
+  can "play now" or add to the queue.
 - English anime: SubsPlease and Nyaa (trusted uploads only) are searched too.
   Their rows come last and are marked [EN]; they are torrents (see below).
 
@@ -238,7 +242,12 @@ On the right:
                    and Folder... pick videos. You can also drop files, a folder
                    or a link anywhere on the window, or press Ctrl+V. On the
                    start screen the box answers its first question (what to
-                   stream).
+                   stream). A title typed here while a video plays is searched
+                   for right in this window, not in a second one: the Question
+                   tab shows "Searching...", then the results and the questions
+                   after them (only here, not in the console); Cancel or Esc
+                   stops it. If nothing is found, the title comes back into
+                   the box.
   Up next          the queue. Point at a video for its buttons: play now, move
                    up, move down, remove (its download stops). Right-click has
                    the same and Clear the queue. The video that plays can't be

@@ -911,5 +911,8 @@
   "Type a title or paste a link above and press Enter, or drop videos anywhere on this window.": "Введите название или вставьте ссылку выше и нажмите Enter либо перетащите видео в любое место этого окна.",
   "The video time in a corner of the picture: compare it to spot who is behind.": "Время видео в углу картинки: сверьте его, чтобы понять, кто отстаёт.",
   "Where to stream, picture size, speed test, new link, language, the clock on the stream, always on top, log.txt and End stream. The stream settings work while nothing plays; their questions show here and in the console window.": "Куда транслировать, размер картинки, проверка скорости, новая ссылка, язык, часы в трансляции, поверх всех окон, log.txt и завершение трансляции. Настройки трансляции работают, пока ничего не играет; их вопросы появляются здесь и в окне консоли.",
-  "VRChat Link Maker - console": "VRChat Link Maker - консоль"
+  "VRChat Link Maker - console": "VRChat Link Maker - консоль",
+  "  Still searching for \"{0}\" in the control window: answer its questions there or cancel it first.": "  Ещё идёт поиск «{0}» в окне управления: сначала ответьте там на его вопросы или отмените его.",
+  "Stop the search; nothing is added": "Остановить поиск; ничего не добавится",
+  "The search is running: wait for it or cancel it.": "Идёт поиск: дождитесь его или отмените."
 }
