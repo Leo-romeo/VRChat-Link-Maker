@@ -204,65 +204,76 @@ WHILE IT'S STREAMING
 
 THE CONTROL WINDOW
 ------------------
-A small window opens by itself next to the console (F2 opens it again).
+A window opens by itself next to the console (F2 opens it again): the player
+on the left, everything you add and answer on the right. When the window is
+narrow, the right side moves under the player.
+
 At the top:
 
+  What plays       its title, and right of it what the stream carries
+                   (server, picture size, frames per second, video bitrate).
+                   Orange means too little bitrate for that picture size: a
+                   smaller size looks sharper. Settings is on the far right.
   Link for VRChat  the link to put in the world's video player, with Copy and
                    Quest link (copies the link for Quest / Android viewers,
-                   when the server has one). Right of the title: what the
-                   stream carries (server, picture size, frames per second,
-                   video bitrate). Orange means too little bitrate for that
-                   picture size: a smaller size looks sharper.
+                   when the server has one).
+  A yellow or red strip shows the latest warning for about 15 seconds (click it
+  to hide it; every message stays in Messages).
+
+On the left: a live preview of what's being streamed, a seek bar, and buttons:
+
+  << 30s  << 10s  Pause / Continue / Start now  10s >>  30s >>  Next
+  Stop (click it twice)
+
+Under them: what the stream is doing, what your VRChat player shows, and
+
+  Watch as viewers see it   opens the real stream in a player on your PC,
+                   with the same delay viewers have
+  Resync everyone  same as R R
+
+On the right:
+
   The input box    type a title, paste a link or a file path and press Enter
                    (or Add): it works like typing it into the console. Files...
                    and Folder... pick videos. You can also drop files, a folder
                    or a link anywhere on the window, or press Ctrl+V. On the
                    start screen the box answers its first question (what to
                    stream).
-  Questions        every question the console asks shows here too, under the
-                   input box: buttons or a list to pick from, Yes / No, or a
-                   box to type in (a password shows as dots), with < Back,
-                   Forward > and Cancel where the console has them. Answer
-                   either here or in the console: the first answer counts.
-                   Enter = OK, Esc = what Esc does in the console, Alt+Left =
-                   back, Alt+Right = forward, a number picks an option (12 =
-                   1 then 2). A question that comes while you type in the
-                   input box waits for a click or Tab. When the window is
-                   behind another one (VRChat), its taskbar button flashes
-                   and a short sound plays; it never takes the focus.
-                   Questions about the next video while viewers wait (which
-                   audio / subtitles, which player) take the suggested answer
-                   after 60 seconds (AskTimeoutSec); the strip counts down.
-  A yellow or red strip shows the latest warning for about 15 seconds (click it
-  to hide it; every message stays in Messages below).
-
-Below that: a live preview of what's being streamed, a seek bar, and buttons:
-
-  << 30s  << 10s  Pause / Continue / Start now  10s >>  30s >>  Next
-  Stop (click it twice)
-  Up next          the queue. Right-click a video: Play now, Move up, Move
-                   down, Remove (its download stops), Clear the queue. The
-                   video that plays can't be removed: use Next or Stop. A
-                   video that downloads (a torrent episode too) shows how far
-                   the download got.
+  Up next          the queue. Point at a video for its buttons: play now, move
+                   up, move down, remove (its download stops). Right-click has
+                   the same and Clear the queue. The video that plays can't be
+                   removed: use Next or Stop. A video that downloads (a torrent
+                   episode too) shows how far the download got.
   Messages         everything the console says (right-click: copy, log.txt)
-  Add / search...  search by title in a second window
-  Watch as viewers see it   opens the real stream in a player on your PC,
-                   with the same delay viewers have
-  Resync everyone  same as R R
+  Question         every question the console asks shows here too, in its own
+                   tab that opens by itself: buttons or a list to pick from (a
+                   list of search results shows where each one comes from on
+                   the right), Yes / No, or a box to type in (a password shows
+                   as dots), with < Back, Forward > and Cancel where the
+                   console has them. Answer either here or in the console: the
+                   first answer counts. Enter = OK, Esc = what Esc does in the
+                   console, Alt+Left = back, Alt+Right = forward, a number
+                   picks an option (12 = 1 then 2). You can look at Up next or
+                   Messages meanwhile: the question waits in its tab. A
+                   question that comes while you type in the input box waits
+                   for a click or Tab. When the window is behind another one
+                   (VRChat), its taskbar button flashes and a short sound
+                   plays; it never takes the focus. Questions about the next
+                   video while viewers wait (which audio / subtitles, which
+                   player) take the suggested answer after 60 seconds
+                   (AskTimeoutSec); the question counts down.
+
   Settings         the same list as M in the console: where to stream, picture
                    size and language to pick from a list, the upload speed
                    test, a new link, "ask again". They work while nothing
                    plays; their questions show in the window and the console.
-                   Also Open log.txt and End stream (it works while a question
+                   Also Clock on the stream (shows the video time in a corner
+                   of the picture, so you can compare who is behind), Always on
+                   top, Open log.txt and End stream (it works while a question
                    waits too).
-  Clock on the stream   shows the video time in a corner of the picture, so
-                   you can compare who is behind
-  Always on top
 
 Space and the arrow keys work in it too (not while you type in a box or a
-question is open). Don't want it? Set "ControlWindow": false in config.json.
-
+question shows). Don't want it? Set "ControlWindow": false in config.json.
 
 CONTROL IT FROM THE WORLD'S VIDEO PLAYER
 ----------------------------------------
@@ -606,7 +617,8 @@ IF SOMETHING DOESN'T WORK
   PC that manages the server, paste install.sh on the server again after
   adding or removing streams.
 - Someone is behind the others: press R R (or put the plain link in again).
-  Turn on "Clock on the stream" in the control window to compare who is where.
+  Turn on "Clock on the stream" (Settings in the control window) to compare
+  who is where.
 - A web link fails to download: update yt-dlp (open PowerShell and run
   winget upgrade yt-dlp.yt-dlp), then try again.
 - Stutters for everyone: run the speed test (T), pick 540p with V, and/or

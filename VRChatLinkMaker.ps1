@@ -164,6 +164,7 @@ function Say([string]$text, [string]$color = '') {
 # The control window's message pane gets every Say line: the window drains the queue, and the ring refills a reopened window.
 $script:UiLog = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 $script:UiLogRing = New-Object 'System.Collections.Generic.List[object]'
+$script:UiLogSeq = 0
 # The bus between this thread and the control window: made once, so it outlives the window (a language change or F2
 # opens a new window on the same bus: no click, question or answer is lost). Log = the message lines (above); Cmds =
 # the window's clicks ({Cmd; Arg}); Ask = the question open now (a copy for the window, see Publish-UiAsk) or $null;
@@ -174,7 +175,10 @@ $script:UiBus = [hashtable]::Synchronized(@{
     Answers = (New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'); Status = $null; QuitReq = $false })
 function Add-UiLogLine([string]$text, [string]$color) {
   try {
-    $e = @($text, $color)
+    # (Numbered and timed: the lines said since the last question go with the next one to the control window,
+    # Get-AskContext.)
+    $script:UiLogSeq++
+    $e = @($text, $color, $script:UiLogSeq, [DateTime]::UtcNow)
     $script:UiLogRing.Add($e)
     if ($script:UiLogRing.Count -gt 600) { $script:UiLogRing.RemoveRange(0, 100) }
     $script:UiLog.Enqueue($e)
@@ -493,7 +497,8 @@ namespace VRCLinkMaker {
     public string Text { get { lock (gate) { return text; } } }
   }
   // (The control window: the grey hint text in its input box, EM_SETCUEBANNER; a question flashes its taskbar button
-  // until the window comes to the front, never taking the focus: Flash / StopFlash; is the console in front?)
+  // until the window comes to the front, never taking the focus: Flash / StopFlash; is the console in front?; a dark
+  // title bar: DarkTitle)
   public static class Win {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr h, int msg, IntPtr w, string l);
     [StructLayout(LayoutKind.Sequential)] struct FlashInfo { public uint Size; public IntPtr Hwnd; public uint Flags; public uint Count; public uint Timeout; }
@@ -510,6 +515,12 @@ namespace VRCLinkMaker {
     public static bool Flash(IntPtr h) { return DoFlash(h, 3 | 12); }   // FLASHW_ALL | FLASHW_TIMERNOFG
     public static bool StopFlash(IntPtr h) { return DoFlash(h, 0); }
     public static bool ConsoleInFront() { IntPtr c = GetConsoleWindow(); return c != IntPtr.Zero && c == GetForegroundWindow(); }
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
+    // DWMWA_USE_IMMERSIVE_DARK_MODE: 20 since Windows 10 2004, 19 in 1809-1909; false where Windows has neither.
+    public static bool DarkTitle(IntPtr h) {
+      int on = 1;
+      try { return DwmSetWindowAttribute(h, 20, ref on, 4) == 0 || DwmSetWindowAttribute(h, 19, ref on, 4) == 0; } catch { return false; }
+    }
   }
 }
 '@
@@ -1861,7 +1872,7 @@ function Read-Entries([string]$Prefill = '') {
         $line = [string]$r.Text
         break
       }
-    } finally { if ($la) { Clear-UiAsk $la.Id } }
+    } finally { if ($la) { Clear-UiAsk $la.Id }; $script:AskCtxMark = $script:UiLogSeq }   # (its help text isn't the next question's, Get-AskContext)
     if ($null -ne $picked) {
       if ($picked.Count -gt 0) { return $picked }
       continue
@@ -4748,7 +4759,9 @@ function Update-AskLeases {
 # earlier answer: index / bool; never a text), Crumb, BackMode ('back' | 'leave' | 'esc' | 'saved' | ''), CanBack,
 # BackLabel, CanHome (Cancel leaves the task), EscLabel (what Esc gives on a one-off question), CanForward, Secret,
 # Prefill (a text: your earlier one, never a secret; episodes: the suggested range; All = every episode) and Deadline
-# (UTC, or $null). Answers still waiting from before are dropped. Returns the copy (Read-AskLine waits on it).
+# (UTC, or $null), Key (the question's name in its flow: 'search' = the search results, each ending in [source]) and
+# Context (what was said just before it, Get-AskContext). Answers still waiting from before are dropped. Returns the
+# copy (Read-AskLine waits on it).
 function Publish-UiAsk($a, [bool]$canHome = $false) {
   $kind = [string]$a.Kind
   $title = [string]$a.Title
@@ -4756,7 +4769,9 @@ function Publish-UiAsk($a, [bool]$canHome = $false) {
   if ($kind -eq 'yesno') { $title = $title -replace '\s*\[[^\[\]]{1,8}/[^\[\]]{1,8}\]\s*:?\s*$', '' }
   $v = @{ Id = [string]$a.Id; Kind = $kind; Title = $title.Trim(); Options = [string[]]@(); AllowNone = $false; NoneLabel = ''; Default = $null
     Prev = $null; Crumb = ([string]$a.Crumb).Trim(); BackMode = [string]$a.BackMode; CanBack = [bool]$a.CanBack; BackLabel = [string]$a.BackLabel
-    CanHome = $canHome; EscLabel = ''; CanForward = [bool]$a.CanForward; Secret = [bool]$a.Secret; Prefill = ''; All = ''; Deadline = $a.Deadline; TimeoutLabel = '' }
+    CanHome = $canHome; EscLabel = ''; CanForward = [bool]$a.CanForward; Secret = [bool]$a.Secret; Prefill = ''; All = ''; Deadline = $a.Deadline; TimeoutLabel = ''
+    Key = [string]$a.Key; Context = @() }
+  if ($a.Context) { $v.Context = @($a.Context) }
   if ($a.TimeoutEsc) { try { $v.TimeoutLabel = [string](Get-AskEscValue $a).Label } catch {} }
   if ($a.BackMode -eq 'esc') { try { $v.EscLabel = [string](Get-AskEscValue $a).Label } catch {} }
   if ($kind -eq 'choice') {
@@ -4801,6 +4816,25 @@ function Publish-UiAsk($a, [bool]$canHome = $false) {
 function Clear-UiAsk([string]$id) {
   $b = $script:UiBus
   try { if ($b -and $b.Ask -and [string]$b.Ask.Id -ceq $id) { $b.Ask = $null } } catch {}
+}
+
+# What was said since the last question ended - what leads up to this one: an explanation, a warning ("the old link
+# stops working") - at most its last 4 lines (empty ones left out) of the last 2 minutes (a question long after the
+# last one isn't led up to by what played meanwhile), as @(text, colour) pairs. The control window shows them in the
+# question's card, which covers its Messages tab; the console has them right above the question anyway.
+$script:AskCtxMark = 0
+function Get-AskContext {
+  $out = New-Object 'System.Collections.Generic.List[object]'
+  try {
+    $ring = $script:UiLogRing
+    $since = [DateTime]::UtcNow.AddMinutes(-2)
+    for ($i = $ring.Count - 1; $i -ge 0 -and $out.Count -lt 4; $i--) {
+      $e = $ring[$i]
+      if (@($e).Count -lt 4 -or [long]$e[2] -le [long]$script:AskCtxMark -or [DateTime]$e[3] -lt $since) { break }
+      if (([string]$e[0]).Trim()) { $out.Insert(0, @([string]$e[0], [string]$e[1])) }
+    }
+  } catch {}
+  return , $out.ToArray()
 }
 
 # A question from the waiting screen's preparation while the stream is on the air (Select-Tracks, the player, a yt-dlp
@@ -5238,6 +5272,7 @@ function Invoke-Ask($a) {
   $a.NavOn = ($a.CanBack -or $a.CanForward)
   $a.Crumb = ''
   if ($step -and $n -gt 0) { $a.Crumb = Get-NavCrumb $f $n }
+  $a.Context = Get-AskContext
   Show-AskBody $a
   $limit = Get-AskTimeout
   $a.Deadline = $null
@@ -5254,7 +5289,7 @@ function Invoke-Ask($a) {
   catch { $a.View = @{ Id = ''; Deadline = $a.Deadline }; Write-LogLine ('  (control window: the question could not be shown: ' + $_.Exception.Message + ')') }
   try {
     $res = Read-AskAnswer $a $step $sealed $f $rej $limit
-  } finally { Clear-UiAsk $a.Id }
+  } finally { Clear-UiAsk $a.Id; $script:AskCtxMark = $script:UiLogSeq }
   if ($step) { Add-NavTape $f $a $res }
   return $res.Result
 }
@@ -6605,6 +6640,8 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     # (the window's right-click menu names an item by its Id: Invoke-QueueCommand).
     $up = @()
     $upIds = @()
+    $upNames = @()
+    $upInfo = @()
     $from = $script:Idx + 1
     if ($kind -eq 'waiting') { $from = $script:Idx }
     # (A download in progress - a torrent episode's too - says how far it is, as on the console's status line; looked at
@@ -6613,11 +6650,15 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     for ($i = $from; $i -lt [Math]::Min($script:Queue.Count, $from + 20); $i++) {
       $it = $script:Queue[$i]
       $nm = [string]$it.Name
+      $info = ''
       if ($it.State -eq 'downloading') {
         $dk = [int](Get-Prop $it 'Id')
         if (-not $script:PanelDlTexts.ContainsKey($dk)) { $dt = ''; try { $dt = [string](Get-DownloadText $it) } catch {}; $script:PanelDlTexts[$dk] = $dt }
-        if ($script:PanelDlTexts[$dk]) { $nm += '  (' + $script:PanelDlTexts[$dk] + ')' }
-      } elseif ($it.Kind -eq 'torrent' -and $it.State -eq 'torrent-meta') { $nm += '  (' + (T 'looking for people sharing it') + ')' }
+        $info = [string]$script:PanelDlTexts[$dk]
+      } elseif ($it.Kind -eq 'torrent' -and $it.State -eq 'torrent-meta') { $info = T 'looking for people sharing it' }
+      $upNames += $nm
+      $upInfo += $info
+      if ($info) { $nm += '  (' + $info + ')' }
       $up += $nm
       $upIds += [int](Get-Prop $it 'Id')
     }
@@ -6639,6 +6680,7 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $quest = ''
     if ($script:HostP) { $quest = [string]$script:HostP.QuestUrl } elseif ($script:Cfg) { $quest = [string](Get-Prop $script:Cfg 'QuestUrl') }
     $s = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up; UpcomingIds = [int[]]$upIds
+      UpcomingNames = [string[]]$upNames; UpcomingInfo = [string[]]$upInfo; UpcomingTotal = [Math]::Max(0, $script:Queue.Count - $from)
       Link = $script:ShownLink; QuestLink = $quest; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
       Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip }
     $m = $null
@@ -7825,8 +7867,9 @@ function Stop-Everything {
 }
 
 function Main {
-  try { $Host.UI.RawUI.WindowTitle = 'VRChat Link Maker' } catch {}
   Initialize-Language (Get-LanguageSetting)
+  # (The control window is "VRChat Link Maker": this console says what it is, so the two differ in the taskbar.)
+  try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - console') } catch {}
   Say "VRChat Link Maker $($script:Version)" 'Cyan'
   [void][System.IO.Directory]::CreateDirectory($script:TempRoot)
   $entries = @($script:Args0 | Where-Object { $_ -and "$_".Trim() })
