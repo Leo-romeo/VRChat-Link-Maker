@@ -14,6 +14,10 @@
 $ErrorActionPreference = 'Stop'
 $script:Version = '1.9'
 $script:Args0 = @($args)
+# A download window (D, "Download Videos.bat"): started with --download first, see Invoke-DownloadMain.
+$script:DownloadArg = '--download'
+$script:DownloadMode = ($script:Args0.Count -gt 0 -and "$($script:Args0[0])" -eq $script:DownloadArg)
+if ($script:DownloadMode) { $script:Args0 = @($script:Args0 | Select-Object -Skip 1) }
 
 # ------------------------------------------------------------------ basics
 $script:ToolDir = $PSScriptRoot
@@ -201,10 +205,11 @@ function Add-UiRingLine([string]$text, [string]$color) {
 }
 
 # Everything the window says also goes into log.txt next to the tool (the previous run's is log-previous.txt).
-function Open-Log {
+# A download window writes log-download.txt instead (a second one at the same time writes none).
+function Open-Log([string]$name = 'log.txt') {
   try {
-    $p = PathJoin $script:DataDir 'log.txt'
-    if ([System.IO.File]::Exists($p)) { try { [System.IO.File]::Copy($p, (PathJoin $script:DataDir 'log-previous.txt'), $true) } catch {} }
+    $p = PathJoin $script:DataDir $name
+    if ($name -eq 'log.txt' -and [System.IO.File]::Exists($p)) { try { [System.IO.File]::Copy($p, (PathJoin $script:DataDir 'log-previous.txt'), $true) } catch {} }
     $script:LogWriter = New-Object System.IO.StreamWriter($p, $false, $script:Utf8NoBom)
     $script:LogWriter.AutoFlush = $true
   } catch { $script:LogWriter = $null }
@@ -1749,6 +1754,9 @@ function Get-MenuItems([switch]$WithMenu) {
     @{ Id = 'newlink'; Label = (T 'New link...'); Letter = 'N'; Need = 'host'; Re = '^\s*(?:n|new|\u0442)\s*$' },
     # ("yazyk" = U+044F U+0437 U+044B U+043A)
     @{ Id = 'lang'; Label = (T 'Language'); Letter = 'L'; Need = 'lang'; Re = '^\s*(?:l|lang|language|\u0434|\u044f\u0437\u044b\u043a)\s*$' },
+    # D works while a video plays too: it opens a window of its own (Read-Entries, Add-TypedLine; the control window has
+    # its own item). ("skachat'" = U+0441 U+043A U+0430 U+0447 U+0430 U+0442 U+044C)
+    @{ Id = 'download'; Label = (T 'Download videos to this PC (no stream)...'); Letter = 'D'; Need = ''; Re = '^\s*(?:d|download|\u0432|\u0441\u043a\u0430\u0447\u0430\u0442\u044c)\s*$' },
     @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' }
   )
   if ($WithMenu) { $items += @{ Id = 'menu'; Label = (T 'Settings'); Letter = 'M'; Need = ''; Re = '^\s*(?:m|menu|\u044c)\s*$' } }
@@ -1779,6 +1787,7 @@ function Invoke-MenuAction([string]$id, $pick = $null) {
     'newlink' { Invoke-NewLinkMenu }
     'lang' { if ($null -ne $pick) { Invoke-LanguageMenu $pick } else { Invoke-LanguageMenu } }
     'forget' { Clear-AskedPrefs }
+    'download' { Open-DownloadWindow }
     'menu' { Invoke-SettingsMenu }
   }
 }
@@ -1842,30 +1851,40 @@ function Read-Entries([string]$Prefill = '') {
   if (-not $script:Interactive) { return @() }
   $keys = ($script:HasConsole -or $script:KeySource)
   $add = [bool]$script:AddMode
+  $dlm = [bool]$script:DownloadMode
+  $side = ($add -or $dlm)   # (a window next to the one that streams: no settings here, Esc closes it)
+  $ask = T 'What do you want to stream?'
+  if ($dlm) { $ask = T 'What do you want to download?' }
   while ($true) {
     $script:EntryLine = ''
     Say ''
-    Say (T 'What do you want to stream?') 'Cyan'
+    Say $ask 'Cyan'
     if (Get-Command Find-SiteContent -CommandType Function -ErrorAction SilentlyContinue) {
       Say (T '  - Type a title (anime, film, series - in Russian or English) and press Enter to search for it')
     }
     Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
-    Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
-    Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
-    Say (T '  - or just press Enter to pick files')
-    if ((Test-HasTranslations) -and -not $add) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
-    $hostKeys = ((Test-HostModule) -and $script:HostP -and -not $add)
+    if ($dlm) {
+      Say (T '  - or paste a magnet link or a .torrent file')
+      Say (T '  - or just press Enter to open the folder with the downloads')
+    } else {
+      Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
+      Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
+      Say (T '  - or just press Enter to pick files')
+    }
+    if ((Test-HasTranslations) -and -not $side) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
+    $hostKeys = ((Test-HostModule) -and $script:HostP -and -not $side)
     if ($hostKeys) { Say (T '  - H = where to stream (Topaz / this PC / your VPS),  T = test your upload speed,  N = new link') 'DarkGray' }
-    if (-not $add) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
+    if (-not $side) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
+    if (-not $dlm) { Say (T '  - D = download videos to this PC instead (no stream; a window of its own)') 'DarkGray' }
     if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
-    if ($add) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
+    if ($side) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
     $line = ''
     $picked = $null
     # (The control window's input box answers this question too: a line, or files picked / dropped there.)
     $la = $null
     if ($keys) {
       $script:NavAskSeq++
-      $la = @{ Id = $script:AskIdPrefix + $script:NavAskSeq; Kind = 'line'; Title = (T 'What do you want to stream?'); Deadline = $null }
+      $la = @{ Id = $script:AskIdPrefix + $script:NavAskSeq; Kind = 'line'; Title = $ask; Deadline = $null }
       $b = $script:UiBus
       if ($b) { $x = $null; while ($b.Answers.TryDequeue([ref]$x)) {}; $b.Ask = $la }
     }
@@ -1875,8 +1894,8 @@ function Read-Entries([string]$Prefill = '') {
         $Prefill = ''
         if ($r.From -and $null -ne $r.From.Files) { $picked = @($r.From.Files); break }
         if ($r.Nav -eq 'back') {
-          # (Esc never ends the stream: Q + Enter does. A second window just closes.)
-          if ($add) { return @($script:QuitMark) }
+          # (Esc never ends the stream: Q + Enter does. A second window or a download window just closes.)
+          if ($side) { return @($script:QuitMark) }
           Show-NavHint (T '  Q + Enter = end the stream.')
           continue
         }
@@ -1914,20 +1933,26 @@ function Read-Entries([string]$Prefill = '') {
       return $out
     }
     if (-not $line.Trim()) {
+      if ($dlm) { Open-DownloadFolder; continue }
       $files = @(Show-FilePicker)
       if ($files.Count -gt 0 -or -not $keys) { return $files }
       continue   # (picker cancelled: ask again)
     }
     # Q + Enter (or "quit"; on a Russian keyboard layout the Q key types U+0439) = end.
     if ($line -match '^\s*(?:q|quit|\u0439)\s*$') { return @($script:QuitMark) }
-    # The menu letters (Get-MenuItems): H / V / T / N / L, and M = the settings menu.
+    # The menu letters (Get-MenuItems): H / V / T / N / L, D = a download window, and M = the settings menu.
     $mi = Get-MenuItemFor $line
-    if ($mi -and -not $add -and (Test-MenuItemOn $mi)) { Invoke-MenuAction $mi.Id; continue }
+    if ($mi -and $mi.Id -eq 'download') {
+      if ($dlm) { Say (T '  This window downloads already: type a title or paste a link.') 'Yellow' } else { Open-DownloadWindow }
+      continue
+    }
+    if ($mi -and -not $side -and (Test-MenuItemOn $mi)) { Invoke-MenuAction $mi.Id; continue }
     if ($mi) {
-      # (A second window only hands videos over: the settings belong to the window that streams, which owns config.json.)
+      # (A second window only hands videos over, a download window only downloads: the settings belong to the window
+      # that streams, which owns config.json.)
       $msg = ''
-      if ($add -and ($mi.Id -eq 'res' -or $mi.Id -eq 'lang') -and (Test-MenuItemOn $mi)) { $msg = T '  V and L work in the window that streams.' }
-      elseif ($add -and $mi.Id -eq 'menu') { $msg = T '  {0} works in the window that streams.' $mi.Letter }
+      if ($side -and ($mi.Id -eq 'res' -or $mi.Id -eq 'lang') -and (Test-MenuItemOn $mi)) { $msg = T '  V and L work in the window that streams.' }
+      elseif ($side -and $mi.Id -eq 'menu') { $msg = T '  {0} works in the window that streams.' $mi.Letter }
       elseif ($mi.Need -eq 'host' -and (Test-HostModule) -and $line -match '^\s*(?:h|t|n|\u0440|\u0435|\u0442)\s*$') { $msg = T '  H / T / N work in the window that streams.' }
       if ($msg) { Say $msg 'Yellow'; continue }
     }
@@ -1956,8 +1981,9 @@ function Add-TypedLine([string]$line, [string]$kind = '', [switch]$FromWindow) {
     return
   }
   # The menu letters (H / V / T / N / L, M = the settings menu): asked while nothing plays (Invoke-Queue runs them
-  # with the waiting screen on); while a video plays they only say when they work.
+  # with the waiting screen on); while a video plays they only say when they work. D (a download window) works always.
   $mi = Get-MenuItemFor $line
+  if ($mi -and $mi.Id -eq 'download') { Open-DownloadWindow; return }
   if ($mi -and (Test-MenuItemOn $mi)) {
     if ($kind -eq 'waiting') { Add-Cmd (New-Cmd $mi.Id); return }
     Say (T '  {0} works while nothing plays (after Q Q = stop).' $mi.Letter) 'Yellow'
@@ -2270,6 +2296,9 @@ function Start-StreamDownload($item, $stream) {
   $argv = New-Object System.Collections.Generic.List[string]
   foreach ($x in @('-hide_banner', '-nostdin', '-v', 'error', '-nostats', '-progress', 'progress.txt', '-y')) { $argv.Add($x) }
   foreach ($x in (Get-StreamInputArgs $stream)) { $argv.Add($x) }
+  # A server that blocks fast downloads (LiveOnly: Alloha; only a download window downloads such a stream) takes twice
+  # the normal speed (see Resolve-Alloha's notes); an ffmpeg older than 5.0 reads it at normal speed.
+  if ($stream.LiveOnly) { if (Test-FFmpegReadRate) { $argv.Add('-readrate'); $argv.Add('2') } else { $argv.Add('-re') } }
   $argv.Add('-i'); $argv.Add($stream.Url)
   if ($stream.AudioUrl) {
     foreach ($x in (Get-StreamInputArgs $stream)) { $argv.Add($x) }
@@ -2545,16 +2574,17 @@ function Start-NextSource($item) {
       if (-not $script:PlayerPref) { $script:PlayerPref = $pref }   # (the answer holds for the session, as when asked here)
     } else { $pref = Get-PlayerPref $item }
     $won = $null
-    if ($pref -eq 'auto' -and -not $isCur) {
+    if ($pref -eq 'auto' -and (-not $isCur -or $script:DownloadMode)) {
       # No checking while a video streams (it would hold up this window). A show not checked yet waits for its turn:
       # getting it ready now meant taking the first player in the list (Kodik), whatever "auto" would have picked.
+      # (A download window checks a show's first episode only: the next ones take the player that won.)
       $won = Get-AutoWinner $item
-      if ($null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly -and -not $_.PSObject.Properties['Backup'] }).Count -ge 2) { return }
+      if (-not $isCur -and $null -eq $won -and @(Get-SameDubCands $item | Where-Object { -not $_.LiveOnly -and -not $_.PSObject.Properties['Backup'] }).Count -ge 2) { return }
     }
     $item | Add-Member -NotePropertyName PlayerPicked -NotePropertyValue $true
     if ($pref -ne 'auto') { Set-CandFirst $item $pref }
-    elseif ($isCur) { Invoke-AutoPick $item }
     elseif ($won) { Set-CandFirst $item $won }
+    elseif ($isCur) { Invoke-AutoPick $item }
   }
   while ($item.CandIdx -lt $item.Cands.Count) {
     $c = $item.Cands[$item.CandIdx]
@@ -2583,8 +2613,17 @@ function Start-NextSource($item) {
   throw (T 'no video source found for it')
 }
 
-# A finished ffmpeg download: $true = file is ready, $false = it failed and the next source is downloading.
-function Complete-StreamDownload($item) {
+$script:HasReadRate = $null
+function Test-FFmpegReadRate {
+  if ($null -eq $script:HasReadRate) {
+    $script:HasReadRate = $false
+    try { $script:HasReadRate = ((Invoke-Capture $script:FFmpeg @('-hide_banner', '-nostdin', '-readrate', '2', '-version')).ExitCode -eq 0) } catch {}
+  }
+  return $script:HasReadRate
+}
+
+# A finished ffmpeg download (Start-StreamDownload): '' = <job>\dl\video.mkv is complete, else why it isn't.
+function Get-StreamDownloadError($item) {
   $out = PathJoin $item.DlDir 'video.mkv'
   $exit = $null
   try { $exit = $item.Dl.Proc.ExitCode } catch {}
@@ -2593,18 +2632,24 @@ function Complete-StreamDownload($item) {
   if ($pr) { $got = $pr.Time }
   $short = ($item.Stream -and $item.Stream.Duration -gt 60 -and $null -ne $got -and $got -lt $item.Stream.Duration - 20)
   if ((Get-BgText $item.Dl) -match 'Stream ends prematurely|partial file') { $short = $true }
-  if ($exit -eq 0 -and -not $short -and [System.IO.File]::Exists($out) -and (New-Object System.IO.FileInfo($out)).Length -gt 262144) {
-    $item.Path = $out
-    return $true
-  }
+  if ($exit -eq 0 -and -not $short -and [System.IO.File]::Exists($out) -and (New-Object System.IO.FileInfo($out)).Length -gt 262144) { return '' }
   $why = Get-LastLines (Get-BgText $item.Dl) 2
-  $stalled = [bool]($item.Dl.PSObject.Properties['Stalled'] -and $item.Dl.Stalled)
-  if ($stalled) {
-    $why = T 'no progress for {0} seconds' $script:DlStallSec
-    $item.Retried = $true   # (not the same source once more: on to the next one)
-  } elseif ($short -and $null -ne $got -and $item.Stream.Duration -gt 0) { $why = T 'it stopped at {0} of {1}' (Format-Time $got) (Format-Time $item.Stream.Duration) }
+  if ($item.Dl.PSObject.Properties['Stalled'] -and $item.Dl.Stalled) { $why = T 'no progress for {0} seconds' $script:DlStallSec }
+  elseif ($short -and $null -ne $got -and $item.Stream.Duration -gt 0) { $why = T 'it stopped at {0} of {1}' (Format-Time $got) (Format-Time $item.Stream.Duration) }
   elseif ($short) { $why = T 'the connection was cut off' }
   if (-not $why) { $why = T 'ffmpeg error {0}' $exit }
+  return $why
+}
+
+# A finished ffmpeg download: $true = file is ready, $false = it failed and the next source is downloading.
+function Complete-StreamDownload($item) {
+  $why = Get-StreamDownloadError $item
+  if (-not $why) {
+    $item.Path = PathJoin $item.DlDir 'video.mkv'
+    return $true
+  }
+  # (Stalled: not the same source once more, on to the next one.)
+  if ($item.Dl.PSObject.Properties['Stalled'] -and $item.Dl.Stalled) { $item.Retried = $true }
   $item.Errors = @($item.Errors) + @("$($item.Using.Label): " + (T 'download failed ({0})' $why))
   if (-not $item.Retried -and $why -notmatch '(?i)\b404\b') {
     # Try the same source once more (links can expire or a server can hiccup), then the others. (A file that isn't
@@ -3658,7 +3703,7 @@ function Update-ScreenNote {
 function Update-KeepAwake([bool]$off = $false) {
   $want = $false
   if (-not $off) {
-    $want = (Test-RelayAlive) -or (@($script:Queue | Where-Object { $_.Kind -eq 'torrent' -and ($_.State -eq 'downloading' -or $_.State -eq 'torrent-meta') }).Count -gt 0)
+    $want = (Test-RelayAlive) -or $script:DownloadBusy -or (@($script:Queue | Where-Object { $_.Kind -eq 'torrent' -and ($_.State -eq 'downloading' -or $_.State -eq 'torrent-meta') }).Count -gt 0)
   }
   if ($want -eq $script:KeepAwake) { return }
   try {
@@ -4979,6 +5024,7 @@ function Get-NavRootLabel([string]$origin) {
   if ($origin -eq 'waiting') { return (T 'Waiting screen') }
   if ($origin -eq 'menu') { return (T 'Settings') }
   if ($origin -eq 'addwin') { return (T 'Add window') }
+  if ($origin -eq 'download') { return (T 'Download') }
   return (T 'Start')
 }
 
@@ -6985,6 +7031,7 @@ function Get-PanelMenuState {
   if ($null -eq $script:PanelLangs) { $script:PanelLangs = @(); try { $script:PanelLangs = @(Get-Languages) } catch {} }
   $items = @()
   foreach ($it in @(Get-MenuItems)) {
+    if ($it.Id -eq 'download') { continue }   # (the window has it apart: it opens the download window itself, any time)
     $on = $false
     if ($it.Need -eq 'lang') { $on = (@($script:PanelLangs).Count -gt 1) } else { $on = [bool](Test-MenuItemOn $it) }
     $items += @{ Id = [string]$it.Id; Label = [string]$it.Label; On = $on }
@@ -8195,6 +8242,392 @@ function Get-AddHandover([string[]]$entries) {
   return $abs
 }
 
+# ------------------------------------------------------------------ downloading only (no stream)
+# D (typed on '>', on the waiting screen or while a video plays; also in M and in the control window's Settings) opens
+# a download window: this tool once more, started with --download ("Download Videos.bat" starts it that way too). It
+# asks what to download with the start screen's questions (search, season, voice-over, episodes, player) and saves the
+# videos one at a time into the download folder (Downloads\VRChat Link Maker, or "DownloadFolder" in config.json), a
+# show's episodes in a folder of their own, in the best quality the site has. It streams nothing, stays out of the
+# streaming window's single-instance lock and only reads config.json, so it runs next to a stream or on its own.
+$script:DownloadBusy = $false     # an episode downloads: the PC is kept awake (Update-KeepAwake)
+$script:LastDownloadDir = ''      # where the last download went (just Enter on '>' opens it)
+
+function Open-DownloadWindow {
+  try {
+    $argv = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $script:ScriptFile, $script:DownloadArg)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = Join-CmdArgs $argv
+    $psi.UseShellExecute = $true
+    # This session's answer to "which player", so the new window doesn't ask it again (Read-HandoverPlayer).
+    [Environment]::SetEnvironmentVariable('VRCLM_PLAYER', $script:PlayerPref)
+    Write-StartLog $psi
+    [void][System.Diagnostics.Process]::Start($psi)
+    Say (T '  Opened a download window: pick what to download there.') 'Gray'
+  } catch { Say (T '  Couldn''t open a download window: {0}' $_.Exception.Message) 'Yellow' }
+}
+
+# The download folder: "DownloadFolder" in config.json (a path relative to the tool's folder works too), else
+# "VRChat Link Maker" in the Windows Downloads folder (where Windows has it, also when it was moved to another drive).
+function Get-DownloadRoot {
+  $d = "$(Get-Prop $script:Cfg 'DownloadFolder')".Trim().Trim('"')
+  if ($d) {
+    $d = [Environment]::ExpandEnvironmentVariables($d)
+    if (-not [System.IO.Path]::IsPathRooted($d)) { $d = PathJoin $script:DataDir $d }
+    try { return [System.IO.Path]::GetFullPath($d) } catch { return $d }
+  }
+  $dl = ''
+  try {
+    $k = '{374DE290-123F-4565-9164-39C4925E467B}'
+    $dl = [Environment]::ExpandEnvironmentVariables([string](Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -Name $k -ErrorAction Stop).$k)
+  } catch {}
+  if (-not $dl -or -not [System.IO.Directory]::Exists($dl)) { $dl = PathJoin ([Environment]::GetFolderPath('UserProfile')) 'Downloads' }
+  return (PathJoin $dl 'VRChat Link Maker')
+}
+
+function Open-DownloadFolder {
+  $dir = $script:LastDownloadDir
+  if (-not $dir -or -not [System.IO.Directory]::Exists($dir)) { $dir = Get-DownloadRoot }
+  try {
+    [void][System.IO.Directory]::CreateDirectory($dir)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $dir
+    $psi.UseShellExecute = $true
+    [void][System.Diagnostics.Process]::Start($psi)
+    Say (T '  Opened {0}' $dir) 'Gray'
+  } catch { Say (T '  Couldn''t open {0}: {1}' $dir $_.Exception.Message) 'Yellow' }
+}
+
+# A name Windows takes for a file or folder: no \ / : * ? " < > |, no dot or space at the end, not too long.
+function ConvertTo-FileName([string]$s, [int]$max = 120) {
+  $bad = [System.IO.Path]::GetInvalidFileNameChars()
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($ch in $s.ToCharArray()) { if ([array]::IndexOf($bad, $ch) -ge 0) { [void]$sb.Append(' ') } else { [void]$sb.Append($ch) } }
+  $t = ($sb.ToString() -replace '\s+', ' ').Trim().TrimEnd('.', ' ')
+  if ($t.Length -gt $max) { $t = $t.Substring(0, $max).TrimEnd('.', ' ') }
+  if ($t -match '^(?i)(con|prn|aux|nul|com\d|lpt\d)(\..*)?$') { $t = '_' + $t }
+  if (-not $t) { $t = '_' }
+  return $t
+}
+
+# Does a web video's name follow one of these name patterns (T '{0} - episode {1}', ...)? Then the {0} part (the show),
+# else $null.
+function Get-NamePart([string]$name, [string[]]$patterns) {
+  foreach ($p in $patterns) {
+    $rx = '^' + [regex]::Escape($p) + '$'
+    $rx = $rx.Replace('\{0}', '(.+)').Replace('\{1}', '.+?').Replace('\{2}', '.+?')
+    $m = [regex]::Match($name, $rx)
+    if ($m.Success) { return $m.Groups[1].Value.Trim() }
+  }
+  return $null
+}
+
+# Where a download goes: @{ Dir; Base (the file name without its extension; $null = the downloaded file's own name);
+# Unique (a name only this video has: one that is there already means it was downloaded before) }.
+# A show's episodes go into a folder named after the show; a torrent with several videos into one named after it.
+function Get-DownloadTarget($item) {
+  $root = Get-DownloadRoot
+  if ($item.Kind -eq 'site') {
+    $name = [string]$item.Name
+    $show = Get-NamePart $name @((T '{0} - season {1}, episode {2}'), (T '{0} - episode {1}'))
+    $dir = $root
+    if ($show) { $dir = PathJoin $root (ConvertTo-FileName $show 80) }
+    # ("Kodik video": a lone player link has no name of its own.)
+    $lone = ($null -ne (Get-NamePart $name @((T '{0} video'))))
+    return @{ Dir = $dir; Base = (ConvertTo-FileName $name); Unique = -not $lone }
+  }
+  if ($item.Kind -eq 'torrent') {
+    $dir = $root
+    $g = $item.Torrent.G
+    $n = 0
+    try { $n = @(Get-TorrentEpisodes $g.Files).Count } catch {}
+    if ($g.Name -and $n -gt 1) { $dir = PathJoin $root (ConvertTo-FileName $g.Name 80) }
+    return @{ Dir = $dir; Base = $null; Unique = $false }
+  }
+  if ($item.Kind -eq 'url' -and ((Get-UrlMediaExt $item.Source) -or $item.Stream)) {
+    # A link straight to a video file or a playlist: named after the file in the link (a playlist's "index" or
+    # "master" says nothing: then "video" and the time).
+    $p = (([string]$item.Source -split '[?#]', 2)[0]).TrimEnd('/')
+    $leaf = $p.Substring($p.LastIndexOf('/') + 1)
+    $dot = $leaf.LastIndexOf('.')
+    if ($dot -gt 0) { $leaf = $leaf.Substring(0, $dot) }
+    try { $leaf = [Uri]::UnescapeDataString($leaf) } catch {}
+    if ($leaf.Length -lt 3 -or $leaf -match '^(?i)(index|master|playlist|video|stream|chunklist\w*|manifest|hls|media|file|download|output|prog_index)$') {
+      $leaf = T 'video {0}' ((Get-Date).ToString('yyyy-MM-dd HH-mm-ss', $script:Inv))
+    }
+    return @{ Dir = $root; Base = (ConvertTo-FileName $leaf); Unique = $false }
+  }
+  # (yt-dlp names the file after the page's title.)
+  return @{ Dir = $root; Base = $null; Unique = $false }
+}
+
+# A video already in $dir named $base (any video file type), or $null.
+function Find-SavedDownload([string]$dir, [string]$base) {
+  try {
+    if (-not [System.IO.Directory]::Exists($dir)) { return $null }
+    foreach ($f in [System.IO.Directory]::GetFiles($dir)) {
+      if ([System.IO.Path]::GetFileNameWithoutExtension($f) -ieq $base -and $script:MediaExts -contains [System.IO.Path]::GetExtension($f).ToLowerInvariant()) { return $f }
+    }
+  } catch {}
+  return $null
+}
+
+# Step-Prep for a download: only as far as a complete file on this PC ('ready', in .Path), never playing it straight
+# from the site. A web video that can only be read at normal speed (Alloha) is read at twice that (Start-StreamDownload).
+function Step-Download($item) {
+  if ($item.State -eq 'ready' -or $item.State -eq 'failed') { return }
+  try {
+    if (-not $item.JobDir) { $item.JobDir = New-JobDir }
+    if ($item.Kind -eq 'torrent') {
+      Step-TorrentPrep $item
+      if ($item.State -eq 'probe') { $item.State = 'ready' }
+      return
+    }
+    if ($item.State -eq 'new') {
+      $item.NoDirect = $true
+      if ($item.Kind -eq 'site') { Start-NextSource $item }
+      elseif ($item.Kind -eq 'url') {
+        if ($item.Source -notmatch '^(?i)https?://') { throw (T 'a live stream can''t be downloaded') }
+        $ext = Get-UrlMediaExt $item.Source
+        if (-not $ext -and -not $item.Stream) {
+          # A web page (not a link straight to a video file): yt-dlp downloads it.
+          $yt = Get-YtDlp
+          if (-not $yt) { throw (T 'links to web pages need yt-dlp, and it isn''t installed') }
+          Start-Download $item $yt
+          return
+        }
+        $st = $item.Stream
+        if (-not $st) { $k = 'file'; if ($ext -eq 'm3u8') { $k = 'hls' }; $st = New-Stream $item.Source $k @{} }
+        if ($st.Kind -eq 'hls') { $st = Complete-HlsStream (New-Stream $st.Url 'hls' $st.Headers) }
+        Start-StreamDownload $item $st
+      } else { throw (T 'it is on this PC already') }
+    }
+    if ($item.State -eq 'probe' -and $item.IsDirectUrl) {
+      # (The player found can only be played live, Alloha: downloaded all the same, at a speed it allows.)
+      $item.IsDirectUrl = $false
+      Start-StreamDownload $item $item.Stream
+    }
+    if ($item.State -ne 'downloading' -or -not $item.Dl) { return }
+    if (-not $item.Dl.Proc.HasExited) {
+      if (-not (Test-DownloadStalled $item)) { return }
+      # No progress for minutes: give it up (and go on with the next player, if there is one).
+      Stop-ProcessTree $item.Dl.Proc
+      $item.Dl | Add-Member -Force -NotePropertyName Stalled -NotePropertyValue $true
+      if ($item.Kind -ne 'site') { throw (T 'the download made no progress for {0} seconds' $script:DlStallSec) }
+      Clear-StatusLine
+      Say (T '  The download made no progress for {0} seconds, so it was stopped.' $script:DlStallSec) 'Yellow'
+    }
+    if ($item.DlKind -eq 'ytdlp') {
+      Complete-Download $item
+      $item.State = 'ready'
+      return
+    }
+    if ($item.Kind -eq 'site') {
+      # (Didn't work out: the next player with the same voice-over downloads now.)
+      if (-not (Complete-StreamDownload $item)) { return }
+      if ($item.State -eq 'probe') { return }   # (one that plays only live comes next: the next round downloads it)
+      $item.State = 'ready'
+      return
+    }
+    $why = Get-StreamDownloadError $item
+    if ($why) { throw (T 'download failed ({0})' $why) }
+    $item.Path = PathJoin $item.DlDir 'video.mkv'
+    $item.State = 'ready'
+  } catch {
+    if (Test-NavAbort) { throw }
+    $item.State = 'failed'
+    $item.Error = $_.Exception.Message
+  }
+}
+
+# Moves a finished download into the download folder, its subtitle files next to it (named like it, so players and this
+# tool find them). A name that is taken gets " (2)". Returns the new path.
+function Save-Download($item) {
+  $t = Get-DownloadTarget $item
+  [void][System.IO.Directory]::CreateDirectory($t.Dir)
+  $src = [string]$item.Path
+  $ext = [System.IO.Path]::GetExtension($src)
+  $srcBase = [System.IO.Path]::GetFileNameWithoutExtension($src)
+  $base = $t.Base
+  if (-not $base) { $base = ConvertTo-FileName $srcBase }
+  $dst = PathJoin $t.Dir ($base + $ext)
+  for ($n = 2; [System.IO.File]::Exists($dst); $n++) { $dst = PathJoin $t.Dir ("$base ($n)$ext") }
+  # (Across drives Move copies; a file another program still has open is copied instead.)
+  try { [System.IO.File]::Move($src, $dst) } catch { [System.IO.File]::Copy($src, $dst) }
+  $vb = [System.IO.Path]::GetFileNameWithoutExtension($dst)
+  foreach ($s in @($item.ExtraSubs)) {
+    if (-not $s -or -not $s.Path -or -not [System.IO.File]::Exists([string]$s.Path)) { continue }
+    $sn = [System.IO.Path]::GetFileName([string]$s.Path)
+    $rest = '.' + $sn
+    if ($s.PSObject.Properties['FromSite']) {
+      $rest = [System.IO.Path]::GetExtension($sn)
+      if ($s.Lang) { $rest = '.' + $s.Lang + $rest }
+    } elseif ($sn.StartsWith($srcBase, [System.StringComparison]::OrdinalIgnoreCase)) { $rest = $sn.Substring($srcBase.Length) }
+    $sd = PathJoin $t.Dir ($vb + $rest)
+    if (-not [System.IO.File]::Exists($sd)) { try { [System.IO.File]::Copy([string]$s.Path, $sd) } catch {} }
+  }
+  return $dst
+}
+
+# Esc while downloading: stop? (Ctrl+C ends this window.) $true = stop.
+function Test-DownloadStopKey {
+  if (-not ($script:HasConsole -or $script:KeySource)) { return $false }
+  while (Test-NavKeyWaiting) {
+    $k = Read-NavKey
+    if (Test-CtrlCKey $k) { Stop-ByCtrlC }
+    if ($k.Key -ne [ConsoleKey]::Escape) { continue }
+    Clear-StatusLine
+    # (The download goes on meanwhile.)
+    if (Read-YesNoUi (T 'Stop downloading? What isn''t finished is thrown away. [y/N]') $false -Esc $false) { return $true }
+  }
+  return $false
+}
+
+# Downloads $items one after the other (in $script:Queue, which a download window doesn't otherwise use: the torrent
+# code looks there), then says what came of it.
+function Invoke-Downloads($items) {
+  $script:Queue.Clear()
+  foreach ($it in $items) { [void]$script:Queue.Add($it) }
+  $saved = 0; $had = 0; $stopped = $false
+  $failed = New-Object System.Collections.ArrayList
+  $dirs = New-Object System.Collections.ArrayList
+  Say ''
+  if ($items.Count -eq 1) { Say (T 'Downloading 1 video into {0}   (Esc = stop)' (Get-DownloadRoot)) 'Cyan' }
+  else { Say (T 'Downloading {0} videos into {1}   (Esc = stop)' $items.Count (Get-DownloadRoot)) 'Cyan' }
+  Set-CtrlCAsKey $true
+  try {
+    # (A torrent's file list can add episodes after this one: the count is read again each time.)
+    for ($i = 0; $i -lt $script:Queue.Count; $i++) {
+      $script:Idx = $i
+      $it = $script:Queue[$i]
+      Say ''
+      Say (T '[{0}/{1}] {2}' ($i + 1) $script:Queue.Count $it.Name) 'White'
+      if ($it.Kind -eq 'file') { Say (T '  It is on this PC already: {0}' $it.Path) 'Gray'; continue }
+      # (Only a web video has its name before it downloads: a torrent episode may not even have its file list yet.)
+      $t = $null
+      if ($it.Kind -eq 'site') { $t = Get-DownloadTarget $it }
+      if ($t -and $t.Unique) {
+        $f = Find-SavedDownload $t.Dir $t.Base
+        if ($f) {
+          Say (T '  Downloaded before, so skipped: {0}  (delete it to download it again)' ([System.IO.Path]::GetFileName($f))) 'Gray'
+          $had++
+          $script:LastDownloadDir = $t.Dir
+          continue
+        }
+      }
+      $script:DownloadBusy = $true
+      Show-Status (T '  Looking for the video...')
+      while ($it.State -ne 'ready' -and $it.State -ne 'failed') {
+        Step-Download $it
+        if ($it.State -eq 'ready' -or $it.State -eq 'failed') { break }
+        $txt = ''
+        if ($it.State -eq 'torrent-meta') { $txt = T 'looking for people sharing it' }
+        elseif ($it.State -eq 'downloading') {
+          $txt = Get-DownloadText $it
+          if ($it.DlKind -eq 'ffmpeg' -and $it.DlDir) { $txt += ', ' + (Format-Bytes (Get-DirBytes $it.DlDir)) }
+        }
+        if ($txt) { Show-Status ('  ' + $txt + '   ' + (T '(Esc = stop)')) }
+        Update-KeepAwake
+        if (Test-DownloadStopKey) { $stopped = $true; break }
+        Start-Sleep -Milliseconds 250
+      }
+      Clear-StatusLine
+      if ($stopped) {
+        Say (T '  Stopped.') 'Yellow'
+        break
+      }
+      if ($it.State -eq 'ready') {
+        try {
+          if ($it.Kind -eq 'site') { Add-SiteSubtitle $it }
+          $p = Save-Download $it
+          $saved++
+          $script:LastDownloadDir = [System.IO.Path]::GetDirectoryName($p)
+          if (-not $dirs.Contains($script:LastDownloadDir)) { [void]$dirs.Add($script:LastDownloadDir) }
+          $size = ''
+          try { $size = Format-Bytes (New-Object System.IO.FileInfo($p)).Length } catch {}
+          $from = ''
+          if ($it.Using) { $from = ', ' + $it.Using.Label }
+          Say (T '  Saved: {0}  ({1}{2})' ([System.IO.Path]::GetFileName($p)) $size $from) 'Green'
+        } catch {
+          [void]$failed.Add($it.Name)
+          Say (T '  Couldn''t save it: {0}' $_.Exception.Message) 'Red'
+        }
+      } else {
+        [void]$failed.Add($it.Name)
+        Say (T '  Couldn''t download it: {0}' $it.Error) 'Red'
+      }
+      Remove-ItemFiles $it
+      $script:DownloadBusy = $false
+    }
+  } finally {
+    Set-CtrlCAsKey $false
+    $script:DownloadBusy = $false
+    Clear-StatusLine
+    # (What wasn't reached or was stopped: its download, its folder, its torrent's share in rqbit.)
+    foreach ($it in @($script:Queue)) { Remove-ItemFiles $it }
+    $script:Queue.Clear()
+    $script:Idx = 0
+    Update-KeepAwake
+    if ($script:PendingDirs.Count -gt 0) { Start-Sleep -Milliseconds 300; Remove-PendingDirs }
+  }
+  Say ''
+  $c = 'Green'
+  if ($failed.Count -gt 0 -or $stopped) { $c = 'Yellow' }
+  Say (T 'Downloaded: {0} of {1}.' $saved $items.Count) $c
+  if ($had -gt 0) { Say (T '  Skipped (downloaded before): {0}' $had) 'Gray' }
+  if ($failed.Count -gt 0) { Say (T '  Not downloaded: {0}' ((@($failed) | ForEach-Object { Get-ShortText $_ 60 }) -join '; ')) 'Yellow' }
+  foreach ($d in $dirs) { Say (T '  In: {0}' $d) 'Gray' }
+}
+
+# The download window's questions for $entries, as the start screen asks them (search, season, voice-over, episodes)
+# and then which player (Read-HandoverPlayer), as one flow (Invoke-DownloadMain). The items to download.
+function Get-DownloadItems([string[]]$entries) {
+  # (A VPS connection code is a password: it is never searched for or printed.)
+  if (Test-HostModule) {
+    $entries = @($entries | Where-Object { -not (Test-VpsCodeText "$_") -and -not ("$_" -match '^[A-Za-z0-9_-]{40,}$' -and -not [System.IO.File]::Exists("$_") -and -not (Test-TorrentLink "$_")) })
+  }
+  $items = @(Resolve-Entries $entries)
+  if ($items.Count -gt 0 -and -not $script:PlayerPref) { Read-HandoverPlayer $items }
+  return $items
+}
+
+# A download window (started with --download): what to download, its questions, the downloads; then the same again
+# until Esc on '>' (or Q + Enter) closes it.
+function Invoke-DownloadMain([string[]]$entries) {
+  try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - download') } catch {}
+  # (config.json only read: DubPriority, Player, Torrents, DownloadFolder. The streaming window owns the file.)
+  if ([System.IO.File]::Exists((Get-ConfigPath))) { try { $script:Cfg = Get-Config } catch { Say $_.Exception.Message 'Yellow' } }
+  if (-not $script:Cfg) { $script:Cfg = New-Object psobject }
+  Open-Log 'log-download.txt'
+  Disable-QuickEdit
+  Initialize-Tools
+  # The sharpest picture the sites have: the tallest quality of a playlist (Complete-HlsStream), players asked for
+  # up to 1080p (Get-QualityCap).
+  $script:OutH = 2160
+  $script:OutW = 3840
+  Say (T 'This window downloads videos to this PC (it streams nothing). They go into: {0}' (Get-DownloadRoot)) 'Gray'
+  $prefill = ''
+  if ($entries.Count -eq 1) { $prefill = [string]$entries[0] }
+  $again = ($script:Interactive -and ($script:HasConsole -or $script:KeySource))
+  while ($true) {
+    if ($entries.Count -eq 0) {
+      $entries = @(Read-Entries $prefill)
+      $prefill = $script:EntryLine
+    }
+    if ($entries -contains $script:QuitMark) { $script:NoPause = $true; return }
+    $r = Invoke-NavFlow -Name 'download' -Origin 'download' -Snap $script:SiteAnswerVars -Body { Get-DownloadItems $entries }
+    $items = @($r.Value | Where-Object { $_ })
+    if ($items.Count -gt 0) {
+      # (The answer to "which player" holds for the next downloads of this window too.)
+      if ($script:LastPlayer -and -not $script:PlayerPref) { $script:PlayerPref = $script:LastPlayer }
+      Invoke-Downloads $items
+      $prefill = ''
+    }
+    if (-not $again) { return }
+    $entries = @()
+  }
+}
+
 function Main {
   Initialize-Language (Get-LanguageSetting)
   # (The control window is "VRChat Link Maker": this console says what it is, so the two differ in the taskbar.)
@@ -8202,6 +8635,9 @@ function Main {
   Say "VRChat Link Maker $($script:Version)" 'Cyan'
   [void][System.IO.Directory]::CreateDirectory($script:TempRoot)
   $entries = @($script:Args0 | Where-Object { $_ -and "$_".Trim() })
+
+  # A download window: no stream, so not the single-instance lock either (it runs next to a stream, or on its own).
+  if ($script:DownloadMode) { Invoke-DownloadMain $entries; return }
 
   if (-not (Enter-SingleInstance)) {
     # Already streaming in another window: add these videos to its queue (this window asks the questions).

@@ -43,7 +43,8 @@ Answering its questions (the same keys in every question):
 - On the start screen, type Q and press Enter to end (Esc never ends it).
   M + Enter opens the settings menu (where to stream, picture size, speed
   test, new link, language). H, V, T, N and L open its parts directly, on the
-  start screen and on the waiting screen.
+  start screen and on the waiting screen. D + Enter opens a download window
+  (see DOWNLOADING EPISODES below).
 
 
 ANIME SITES AND WATCH-TOGETHER ROOMS
@@ -163,6 +164,37 @@ far the download got ("Downloading the next episode: 45% of 700 MB, about
   Russian subtitles if they have them, else English ("SubLang" below).
 
 
+DOWNLOADING EPISODES (NO STREAM)
+--------------------------------
+To keep episodes or videos on your PC instead of streaming them, type D and
+press Enter (on the start screen, on the waiting screen or while a video
+plays), or pick "Download videos to this PC" in M or in the control window's
+Settings. Or double-click "Download Videos.bat": it opens only the download
+window, nothing goes on the air. A download window opens:
+
+- Type a title, or paste a link, a magnet link or a .torrent file, as on the
+  start screen. The same questions follow (which one, season, voice-over,
+  which episodes, which player), then it downloads the episodes one after
+  the other.
+- They go into Downloads\VRChat Link Maker, a show's episodes into a folder
+  named after the show ("Frieren - episode 5.mkv"). "DownloadFolder" in
+  config.json picks another folder. Just Enter on '>' opens the folder.
+- In the best quality the site has (up to 1080p). "Auto" checks the players
+  on the first episode and takes the sharpest one for the rest.
+- Subtitles that come as files (a torrent's, or a subtitled translation on
+  AnimeLib / Collaps) are saved next to the video under its name, so players
+  show them, and so does this tool when you stream the file later.
+- An episode that is in the folder already is skipped (delete it to download
+  it again).
+- Esc stops (what isn't finished is thrown away). Esc on '>' closes the
+  window.
+- A stream that runs goes on meanwhile: the download only shares your
+  internet connection with it.
+- To stream what you downloaded, drag the files (or the show's folder) onto
+  "Make VRChat Link.bat".
+- Only download what you are allowed to.
+
+
 WHILE IT'S STREAMING
 --------------------
   Space         pause / continue (instant). While it waits for the players,
@@ -276,10 +308,11 @@ On the right:
                    size and language to pick from a list, the upload speed
                    test, a new link, "ask again". They work while nothing
                    plays; their questions show in the window and the console.
-                   Also Clock on the stream (shows the video time in a corner
-                   of the picture, so you can compare who is behind), Always on
-                   top, Open log.txt and End stream (it works while a question
-                   waits too).
+                   Also Download videos to this PC (opens a download window,
+                   at any time), Clock on the stream (shows the video time in a
+                   corner of the picture, so you can compare who is behind),
+                   Always on top, Open log.txt and End stream (it works while a
+                   question waits too).
 
 Space and the arrow keys work in it too (not while you type in a box or a
 question shows). Don't want it? Set "ControlWindow": false in config.json.
@@ -600,6 +633,8 @@ All of these are optional.
   TorrentDownloadKBps  0 = no cap. A number caps the download speed (KB/s).
   SubLang     "ru,en" (the default): subtitle languages taken without asking,
               best first. "en" = English first.
+  DownloadFolder  where a download window saves videos (see DOWNLOADING
+              EPISODES). Default: "VRChat Link Maker" in your Downloads folder.
 Delete config.json to get a brand-new link.
 
 

@@ -309,7 +309,7 @@ function New-ControlPanel {
   $top.Controls.Add($p.Quality, 2, 0)
   # Settings: the same list as M in the console (the main thread sends it, see Update-PanelMenu), then the clock, always
   # on top, log.txt and End stream. What changes the link or the picture works only while nothing plays.
-  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Where to stream, picture size, speed test, new link, language, the clock on the stream, always on top, log.txt and End stream. The stream settings work while nothing plays; their questions show here and in the console window.') '' $null $null
+  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Where to stream, picture size, speed test, new link, language, downloading videos, the clock on the stream, always on top, log.txt and End stream. The stream settings work while nothing plays; their questions show here and in the console window.') '' $null $null
   $p.More.AutoEllipsis = $false
   $menu = New-Object "$WF.ContextMenuStrip"
   $menu.ShowItemToolTips = $true
@@ -1028,6 +1028,22 @@ function Open-PanelLogFile {
   }
 }
 
+function Test-PanelToolFile {
+  $f = [string]$script:PanelSync.ToolFile
+  return [bool]($f -and [System.IO.File]::Exists($f))
+}
+
+# The tool once more, as a download window (VRChatLinkMaker.ps1: Invoke-DownloadMain).
+function Open-PanelDownloadWindow {
+  $f = [string]$script:PanelSync.ToolFile
+  if (-not $f -or -not [System.IO.File]::Exists($f)) { return }
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'powershell.exe'
+  $psi.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -STA -File "' + $f + '" --download'
+  $psi.UseShellExecute = $true
+  [void][System.Diagnostics.Process]::Start($psi)
+}
+
 # The Settings menu, made again each time it opens from what the main thread sent last (State.Menu = Get-MenuItems:
 # Id, Label, On; State.Choices.<id> = the choices of host / res / lang with State.Chosen.<id> checked). A click queues
 # the item's Id (with the choice as Arg); the main thread runs it on the waiting screen (Invoke-Queue).
@@ -1078,6 +1094,13 @@ function Update-PanelMenu {
     }
   }
   if ($n -gt 0) { [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
+  # A download window (the console's D): opened from here, so it works any time, also while a question waits.
+  $dw = New-PanelMenuItem (T 'Download videos to this PC (no stream)...') 'download'
+  $dw.Enabled = (Test-PanelToolFile)
+  $dw.ToolTipText = T 'Opens a window that downloads episodes or videos into a folder instead of streaming them. The stream goes on meanwhile.'
+  $dw.Add_Click({ try { Open-PanelDownloadWindow } catch { Write-PanelWarning $_ } })
+  [void]$m.Items.Add($dw)
+  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
   # The clock on the stream (ticked as the stream has it: the main thread flips it after the command) and always on top.
   $ck = New-PanelMenuItem (T 'Clock on the stream') 'clock'
   $ck.Checked = [bool]$q.ClockOn
@@ -2382,7 +2405,7 @@ function Open-ControlPanel {
     $sync = [hashtable]::Synchronized(@{
       State = $null; Cmds = $bus.Cmds; Bus = $bus
       Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
-      Log = $bus.Log; Backlog = $backlog; LogPath = $logPath
+      Log = $bus.Log; Backlog = $backlog; LogPath = $logPath; ToolFile = [string]$script:ScriptFile
       StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts
     })
     $self = $script:PanelSelf
