@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.10'
+$script:Version = '1.11'
 $script:Args0 = @($args)
 # A download window (D, "Download Videos.bat"): started with --download first, see Invoke-DownloadMain.
 $script:DownloadArg = '--download'
