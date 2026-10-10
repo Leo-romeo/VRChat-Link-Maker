@@ -3830,6 +3830,12 @@ function Start-Download($item, [string]$yt) {
   $argv = @('--no-playlist', '--no-mtime', '--ffmpeg-location', $script:FFmpegDir,
     '-f', 'bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b', '--merge-output-format', 'mkv',
     '-P', $dl, '-o', '%(title).80B.%(ext)s', $item.Source)
+  if ($script:DownloadMode) {
+    # A download window takes the page's own subtitles too ("SubLang" languages, not the automatic ones), as files next
+    # to the video. (-i: subtitles that fail to download don't fail the video.)
+    $langs = @(Get-SubLangOrder | ForEach-Object { "^$([regex]::Escape($_))([-_].*)?$" }) + @('-live_chat')
+    $argv = @('--write-subs', '--sub-langs', ($langs -join ','), '--sub-format', 'ass/srt/vtt/best', '-i') + $argv
+  }
   # (A link that wants its server's headers, a WPARTY room's video: yt-dlp sends them too.)
   if ($item.Stream -and $item.Stream.Headers) {
     foreach ($k in @($item.Stream.Headers.Keys)) { $argv = @('--add-header', "$($k):$($item.Stream.Headers[$k])") + $argv }
@@ -3903,7 +3909,9 @@ function Complete-Extract($item) {
 function Add-SiteSubtitle($item) {
   $item.ExtraSubs = @($item.ExtraSubs | Where-Object { $_ -and -not $_.PSObject.Properties['FromSite'] })
   $st = $item.Stream
-  if ($item.Kind -ne 'site' -or -not $st -or -not $st.PSObject.Properties['Subtitle'] -or -not $st.Subtitle -or -not $script:CanSubs) { return }
+  # (A download window saves the file next to the video, so it doesn't need an ffmpeg that can draw subtitles.)
+  if ($item.Kind -ne 'site' -or -not $st -or -not $st.PSObject.Properties['Subtitle'] -or -not $st.Subtitle) { return }
+  if (-not $script:CanSubs -and -not $script:DownloadMode) { return }
   $s = $st.Subtitle
   $failText = T 'the subtitles didn''t download, so it plays without them'
   if (-not $s.PSObject.Properties['Path']) {
@@ -8419,6 +8427,8 @@ function Step-Download($item) {
     }
     if ($item.DlKind -eq 'ytdlp') {
       Complete-Download $item
+      # (The subtitle files yt-dlp saved next to it: Save-Download moves them along.)
+      $item.ExtraSubs = @($item.ExtraSubs | Where-Object { $_ }) + @(Get-SidecarSubs $item.Path)
       $item.State = 'ready'
       return
     }
@@ -8452,10 +8462,60 @@ function Save-Download($item) {
   if (-not $base) { $base = ConvertTo-FileName $srcBase }
   $dst = PathJoin $t.Dir ($base + $ext)
   for ($n = 2; [System.IO.File]::Exists($dst); $n++) { $dst = PathJoin $t.Dir ("$base ($n)$ext") }
+  $subs = @($item.ExtraSubs | Where-Object { $_ -and $_.Path -and [System.IO.File]::Exists([string]$_.Path) })
+  $item | Add-Member -Force -NotePropertyName SubsEmbedded -NotePropertyValue $false
+  if ($subs.Count -gt 0 -and $ext -ieq '.mkv') {
+    # An .mkv takes its subtitles inside, as tracks that can be turned on and off (copied, nothing re-encoded). Written
+    # as .part first, so a window closed meanwhile leaves no half video that looks downloaded.
+    Show-Status (T '  Adding the subtitles into the video...')
+    $part = $dst + '.part'
+    $argv = New-Object System.Collections.Generic.List[string]
+    foreach ($x in @('-hide_banner', '-nostdin', '-v', 'error', '-y', '-i', $src)) { $argv.Add($x) }
+    foreach ($s in $subs) { $argv.Add('-i'); $argv.Add([string]$s.Path) }
+    $argv.Add('-map'); $argv.Add('0')
+    for ($i = 0; $i -lt $subs.Count; $i++) { $argv.Add('-map'); $argv.Add("$($i + 1):s:0") }
+    $argv.Add('-c'); $argv.Add('copy')
+    # (Existing subtitle tracks of the video come first; WebVTT goes in as SRT, which every player reads.)
+    $first = 0
+    try { $first = @((Get-MediaInfo $src $false).Subs).Count } catch { $first = -1 }
+    if ($first -ge 0) {
+      # (The one shown by default: the first "SubLang" language there is, else the first one.)
+      $def = 0
+      foreach ($l in (Get-SubLangOrder)) {
+        $m = @(for ($i = 0; $i -lt $subs.Count; $i++) { if (Test-SubLang $subs[$i].Lang $l) { $i } })
+        if ($m.Count -gt 0) { $def = $m[0]; break }
+      }
+      for ($i = 0; $i -lt $subs.Count; $i++) {
+        $k = $first + $i
+        if ("$($subs[$i].Codec)" -eq '.vtt') { $argv.Add("-c:s:$k"); $argv.Add('srt') }
+        if ($subs[$i].Lang) { $argv.Add("-metadata:s:s:$k"); $argv.Add("language=$($subs[$i].Lang)") }
+        if ($subs[$i].PSObject.Properties['FromSite'] -and $subs[$i].Title) { $argv.Add("-metadata:s:s:$k"); $argv.Add("title=$($subs[$i].Title)") }
+        if ($i -eq $def -and $first -eq 0) { $argv.Add("-disposition:s:$k"); $argv.Add('default') }
+      }
+    }
+    foreach ($x in @('-f', 'matroska', $part)) { $argv.Add($x) }
+    $ok = $false
+    $why = ''
+    try {
+      $r = Invoke-Capture $script:FFmpeg $argv.ToArray()
+      $ok = ($r.ExitCode -eq 0 -and [System.IO.File]::Exists($part) -and (New-Object System.IO.FileInfo($part)).Length -ge (New-Object System.IO.FileInfo($src)).Length)
+      if (-not $ok) { $why = Get-LastLines $r.Err 1 }
+    } catch { $why = $_.Exception.Message }
+    Clear-StatusLine
+    if (-not $ok) { Say (T '  Couldn''t put the subtitles inside the video ({0}), so they are files next to it.' $why) 'Yellow' }
+    if ($ok) {
+      [System.IO.File]::Move($part, $dst)
+      try { [System.IO.File]::Delete($src) } catch {}
+      $item.SubsEmbedded = $true
+      return $dst
+    }
+    # (Didn't work: the subtitles go next to it as files, as for any other video.)
+    try { [System.IO.File]::Delete($part) } catch {}
+  }
   # (Across drives Move copies; a file another program still has open is copied instead.)
   try { [System.IO.File]::Move($src, $dst) } catch { [System.IO.File]::Copy($src, $dst) }
   $vb = [System.IO.Path]::GetFileNameWithoutExtension($dst)
-  foreach ($s in @($item.ExtraSubs)) {
+  foreach ($s in $subs) {
     if (-not $s -or -not $s.Path -or -not [System.IO.File]::Exists([string]$s.Path)) { continue }
     $sn = [System.IO.Path]::GetFileName([string]$s.Path)
     $rest = '.' + $sn
@@ -8548,6 +8608,12 @@ function Invoke-Downloads($items) {
           $from = ''
           if ($it.Using) { $from = ', ' + $it.Using.Label }
           Say (T '  Saved: {0}  ({1}{2})' ([System.IO.Path]::GetFileName($p)) $size $from) 'Green'
+          $subs = @($it.ExtraSubs | Where-Object { $_ -and $_.Path -and [System.IO.File]::Exists([string]$_.Path) })
+          if ($subs.Count -gt 0) {
+            $ls = @($subs | ForEach-Object { if ($_.Lang) { $_.Lang } else { '?' } } | Select-Object -Unique)
+            if ($it.SubsEmbedded) { Say (T '  Subtitles inside it (can be turned on and off): {0}' ($ls -join ', ')) 'Green' }
+            else { Say (T '  Subtitles too, as files next to it: {0}' ($ls -join ', ')) 'Green' }
+          }
         } catch {
           [void]$failed.Add($it.Name)
           Say (T '  Couldn''t save it: {0}' $_.Exception.Message) 'Red'
