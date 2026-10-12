@@ -1296,24 +1296,98 @@ function New-ExternalSubTrack([string]$f) {
   $lang = ''
   $parts = $name.Split('.')
   if ($parts.Count -ge 3) {
-    $cand = $parts[$parts.Count - 2]
-    if ($cand -match '^[A-Za-z]{2,3}$') { $lang = $cand.ToLowerInvariant() }
+    # ("ep.01.ru.ass"; not "ep.01.YSS.ass", a group's initials)
+    $cand = $parts[$parts.Count - 2].ToLowerInvariant()
+    if ($script:LangNames.ContainsKey($cand)) { $lang = $cand }
   }
+  if (-not $lang) { $lang = Get-PathLangHint $f }
   return [pscustomobject]@{ Index = -1; Codec = [System.IO.Path]::GetExtension($f).ToLowerInvariant(); Lang = $lang; Title = (T 'file: {0}' $name); Default = $true; Forced = $false; Kind = 'external'; Path = $f; Channels = 0 }
 }
 
-function Get-SidecarSubs([string]$videoPath) {
+# The language the folders a file is in say ("RUS Sound\<group>\", "Rus Subs\", "ENG Subs"): '' when they say none.
+function Get-PathLangHint([string]$f) {
+  $d = [System.IO.Path]::GetDirectoryName($f)
+  for ($i = 0; $i -lt 2 -and $d; $i++) {
+    $n = [System.IO.Path]::GetFileName($d)
+    if ($n -match '(?i)(^|[^a-z])(rus|russian)([^a-z]|$)') { return 'rus' }
+    if ($n -match '(?i)(^|[^a-z])(eng|english)([^a-z]|$)') { return 'eng' }
+    $d = [System.IO.Path]::GetDirectoryName($d)
+  }
+  return ''
+}
+
+# Files that go with a video, named like it ($exts): next to it and in the folders under it ("RUS Sound\<group>\",
+# "Rus Subs\"); a video in "Specials" / "NC" / "Bonus" also takes the show folder's. Two copies of one file (the same
+# name and size, e.g. a dub both next to the video and in "RUS Sound"): the first. Its own folder first.
+$script:SidecarParentRx = '^(?i)(specials?|sp|extras?|bonus|nc|ncop|nced|creditless|ova|oad|movies?)$'
+function Get-SidecarFiles([string]$videoPath, [string[]]$exts) {
   $res = New-Object System.Collections.ArrayList
   try {
     $dir = [System.IO.Path]::GetDirectoryName($videoPath)
     $base = [System.IO.Path]::GetFileNameWithoutExtension($videoPath)
-    foreach ($f in @([System.IO.Directory]::GetFiles($dir) | Sort-Object)) {
-      $ext = [System.IO.Path]::GetExtension($f).ToLowerInvariant()
-      if ($script:SubExts -notcontains $ext) { continue }
-      if (-not [System.IO.Path]::GetFileName($f).StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-      [void]$res.Add((New-ExternalSubTrack $f))
+    $roots = @($dir)
+    if ([System.IO.Path]::GetFileName($dir) -match $script:SidecarParentRx) {
+      $up = [System.IO.Path]::GetDirectoryName($dir)
+      if ($up) { $roots += $up }
+    }
+    $seen = @{}
+    foreach ($root in $roots) {
+      $level = @($root)
+      for ($depth = 0; $depth -le 3 -and $level.Count -gt 0; $depth++) {
+        $next = New-Object System.Collections.ArrayList
+        foreach ($d in $level) {
+          try {
+            foreach ($f in @([System.IO.Directory]::GetFiles($d) | Sort-Object { Get-NaturalKey $_ })) {
+              if ($f -ieq $videoPath -or $seen.ContainsKey($f.ToLowerInvariant())) { continue }
+              if ($exts -notcontains [System.IO.Path]::GetExtension($f).ToLowerInvariant()) { continue }
+              $name = [System.IO.Path]::GetFileName($f)
+              if (-not $name.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+              # ("Overlord 1" is no "Overlord 10")
+              if ($name.Length -gt $base.Length -and [char]::IsDigit($name[$base.Length])) { continue }
+              $seen[$f.ToLowerInvariant()] = $true
+              $key = $name.ToLowerInvariant() + '|' + (New-Object System.IO.FileInfo($f)).Length
+              if ($seen.ContainsKey($key)) { continue }
+              $seen[$key] = $true
+              [void]$res.Add($f)
+            }
+            foreach ($sd in @([System.IO.Directory]::GetDirectories($d) | Sort-Object { Get-NaturalKey $_ })) { [void]$next.Add($sd) }
+          } catch {}
+        }
+        $level = @($next)
+      }
     }
   } catch {}
+  return $res.ToArray()
+}
+
+function Get-SidecarSubs([string]$videoPath) {
+  return @(Get-SidecarFiles $videoPath $script:SubExts | ForEach-Object { New-ExternalSubTrack $_ })
+}
+
+# Separate sound files that go with a video (a dub as an .mka next to it or in "RUS Sound\<group>\"): audio tracks
+# like its own, with .Path (played as a second input). Title: the file's own, else its folder ("<group>"); a
+# commentary track says so. $more: sound files dropped together with the video.
+function Get-SidecarAudio([string]$videoPath, [string[]]$more = @()) {
+  $res = New-Object System.Collections.ArrayList
+  $files = @(@($more | Where-Object { $_ }) + @(Get-SidecarFiles $videoPath $script:AudioOnlyExts) | Select-Object -Unique)
+  foreach ($f in $files) {
+    $ai = $null
+    try { $ai = Get-MediaInfo $f $false } catch { continue }
+    if ($ai.Video) { continue }
+    foreach ($t in @($ai.Audio)) {
+      $title = "$($t.Title)".Trim()
+      if (-not $title) {
+        $title = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($f)).Trim('[', ']', ' ')
+        if ($title -match '(?i)^(rus|eng)?\s*(sound|audio|dub)s?$' -or [System.IO.Path]::GetDirectoryName($f) -ieq [System.IO.Path]::GetDirectoryName($videoPath)) {
+          $title = [System.IO.Path]::GetFileNameWithoutExtension($f)
+        }
+      }
+      if ($f -match '(?i)comment' -and $title -notmatch '(?i)comment') { $title += ' (commentary)' }
+      $lang = "$($t.Lang)"
+      if (-not $lang -or $lang -match '^(?i)und$') { $lang = Get-PathLangHint $f }
+      [void]$res.Add([pscustomobject]@{ Index = $t.Index; Codec = $t.Codec; Lang = $lang; Title = $title; Default = $false; Forced = $false; Kind = 'audio'; Path = $f; Channels = $t.Channels })
+    }
+  }
   return $res.ToArray()
 }
 
@@ -1341,6 +1415,16 @@ function Test-Signs($t) { return ($t.Forced -or ("$($t.Title)" -match ('(?i)sign
 function Test-English([string]$lang) { return ($lang -match '^(?i)(en|eng)$') }
 
 function Get-DefaultAudioPos($audio) {
+  # A dub in a separate file (Get-SidecarAudio) in the first "SubLang" language the video itself has no sound in
+  # (a Japanese-only video with a Russian .mka): that one. Not a commentary.
+  if (@($audio | Where-Object { $_.Path }).Count -gt 0) {
+    foreach ($w in @(Get-SubLangOrder)) {
+      if (@($audio | Where-Object { -not $_.Path -and (Test-SubLang $_.Lang $w) }).Count -gt 0) { break }
+      for ($i = 0; $i -lt $audio.Count; $i++) {
+        if ($audio[$i].Path -and (Test-SubLang $audio[$i].Lang $w) -and "$($audio[$i].Title)" -notmatch '(?i)comment') { return $i }
+      }
+    }
+  }
   for ($i = 0; $i -lt $audio.Count; $i++) { if ($audio[$i].Default) { return $i } }
   if ($audio.Count -gt 0) { return 0 }
   return -1
@@ -1592,7 +1676,7 @@ function New-QueueItem([string]$kind, [string]$src) {
   return [pscustomobject]@{
     Id = $script:ItemSeq; Kind = $kind; Source = $src; Path = $path; Name = $name; State = 'new'; Error = $null
     JobDir = $null; Info = $null; AudioTrack = $null; SubTrack = $null; SubFile = $null; SubIsSrt = $false; SubWarn = $null
-    ExtraSubs = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false; IsLive = $false
+    ExtraSubs = @(); ExtraAudio = @(); Prep = @(); Dl = $null; DlDir = $null; IsDirectUrl = $false; IsLive = $false
     FpsFilter = $null; OutFps = 24.0; FpsNote = $null; ResumeAt = 0.0; Attempts = 0; Announced = $false
     Site = $null; Cands = $null; CandIdx = 0; Using = $null; Stream = $null; DlKind = $null; Errors = @(); Retried = $false; NoDirect = $false; DirectFails = 0; Reset = $false
     Torrent = $null
@@ -1610,7 +1694,10 @@ function New-SiteItem([string]$key, [string]$name, $site) {
 function Get-MediaInFolder([string]$dir) {
   $pick = {
     param($files)
-    @($files | Where-Object { $script:MediaExts -contains [System.IO.Path]::GetExtension($_).ToLowerInvariant() })
+    $m = @($files | Where-Object { $script:MediaExts -contains [System.IO.Path]::GetExtension($_).ToLowerInvariant() })
+    # (Sound files next to videos are their dubs (Get-SidecarAudio), not episodes; a folder of music stays music.)
+    $v = @($m | Where-Object { $script:AudioOnlyExts -notcontains [System.IO.Path]::GetExtension($_).ToLowerInvariant() })
+    if ($v.Count -gt 0) { $v } else { $m }
   }
   $media = @()
   try { $media = @(& $pick ([System.IO.Directory]::GetFiles($dir))) } catch {}
@@ -1660,10 +1747,20 @@ function Resolve-Entries([string[]]$entries) {
     }
     Say (T '  Not found: {0}' $e) 'Yellow'
   }
+  # (A sound file dropped together with a video named like it is that video's dub, not a queue entry of its own.)
+  $isSnd = { $script:AudioOnlyExts -contains [System.IO.Path]::GetExtension($args[0]).ToLowerInvariant() }
+  $dubs = @{}
+  $realVideos = @($videos | Where-Object { -not (& $isSnd $_) })
+  foreach ($s in @($videos | Where-Object { & $isSnd $_ })) {
+    $sn = [System.IO.Path]::GetFileName($s)
+    $owner = $realVideos | Where-Object { $sn.StartsWith([System.IO.Path]::GetFileNameWithoutExtension($_), [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+    if ($owner) { $dubs[$owner] = @($dubs[$owner] | Where-Object { $_ }) + @($s); [void]$videos.Remove($s) }
+  }
   $sorted = @($videos | Sort-Object { Get-NaturalKey ([System.IO.Path]::GetFileName($_)) })
   $items = New-Object System.Collections.ArrayList
   foreach ($v in $sorted) {
     $it = New-QueueItem 'file' $v
+    if ($dubs.ContainsKey($v)) { $it.ExtraAudio = @($dubs[$v]) }
     $vb = [System.IO.Path]::GetFileNameWithoutExtension($v)
     foreach ($s in $subFiles) {
       if ($sorted.Count -eq 1 -or [System.IO.Path]::GetFileName($s).StartsWith($vb, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -3879,6 +3976,21 @@ function Start-Extract($item) {
       $item.SubIsSrt = $true
       [void]$procs.Add((Start-Background $script:FFmpeg @('-hide_banner', '-nostdin', '-v', 'error', '-y', '-i', ('ext' + $ext), '-c:s', 'ass', 'sub.ass') $item.JobDir))
     }
+    # The fonts a subtitle group ships with its file ("<group>\Fonts\", or loose next to it / the video).
+    try {
+      $sd = [System.IO.Path]::GetDirectoryName($sub.Path)
+      $cands = @($sd, (PathJoin $sd 'Fonts'), (PathJoin $sd 'fonts'))
+      if (-not $item.IsDirectUrl -and $item.Path) { $cands += @(PathJoin ([System.IO.Path]::GetDirectoryName($item.Path)) 'Fonts') }
+      foreach ($fd in @($cands | Select-Object -Unique)) {
+        if (-not [System.IO.Directory]::Exists($fd)) { continue }
+        foreach ($ff in [System.IO.Directory]::GetFiles($fd)) {
+          if ([System.IO.Path]::GetExtension($ff) -notmatch '^(?i)\.(ttf|otf|ttc)$') { continue }
+          [void][System.IO.Directory]::CreateDirectory($fontsDir)
+          $dst = PathJoin $fontsDir ('ext' + $ff.GetHashCode().ToString('x8') + [System.IO.Path]::GetExtension($ff).ToLowerInvariant())
+          if (-not [System.IO.File]::Exists($dst)) { [System.IO.File]::Copy($ff, $dst) }
+        }
+      }
+    } catch {}
   }
   if ($sub -and $sub.Kind -ne 'bitmap' -and $item.Info.Fonts.Count -gt 0) {
     # Fonts that come inside the video file (common for anime). Saved under safe names.
@@ -4066,6 +4178,11 @@ function Step-Prep($item) {
       if (-not $item.IsDirectUrl) {
         $have = @($item.ExtraSubs | ForEach-Object { $_.Path })
         foreach ($sc in @(Get-SidecarSubs $item.Path)) { if ($have -notcontains $sc.Path) { $item.ExtraSubs = @($item.ExtraSubs) + @($sc) } }
+        # A dub in a separate sound file: offered as one more audio track (a video with no sound of its own too).
+        if ($item.Kind -eq 'file' -and $item.Info.Video -and @($item.Info.Audio | Where-Object { $_.Path }).Count -eq 0) {
+          $ext = @(Get-SidecarAudio $item.Path @($item.ExtraAudio))
+          if ($ext.Count -gt 0) { $item.Info.Audio = @($item.Info.Audio) + $ext }
+        }
       }
       Add-SiteSubtitle $item
       Select-Tracks $item
@@ -4235,6 +4352,12 @@ function Get-ContentArgs($item, [double]$start, [double]$off, [bool]$preview = $
     $a.Add('-re')
     foreach ($x in (Get-StreamInputArgs $item.Stream)) { $a.Add($x) }
     $a.Add('-i'); $a.Add($item.Stream.AudioUrl)
+    $ain = 1
+  } elseif ($item.AudioTrack -and $item.AudioTrack.Path) {
+    # A dub in a separate file (Get-SidecarAudio): a second input, started at the same point.
+    if ($start -gt 0.5) { $a.Add('-ss'); $a.Add((Format-Num $start)) }
+    $a.Add('-re')
+    $a.Add('-i'); $a.Add($item.AudioTrack.Path)
     $ain = 1
   }
   $remaining = 0.0

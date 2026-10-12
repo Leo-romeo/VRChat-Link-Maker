@@ -33,6 +33,12 @@ If the file has several audio or subtitle tracks, it asks which ones you want
 fancy fonts anime releases come with. Picture-based Blu-ray subs and .srt/.ass
 files sitting next to the video work too.
 
+A dub that comes as a separate sound file (an .mka named like the episode, next
+to it or in a folder like "RUS Sound\<group>") is offered as one more audio
+track, and taken by itself when the video has no Russian sound of its own.
+Subtitle files in folders like "RUS Subs\<group>" (and their Fonts folder) are
+found the same way. Drop the show's folder: the sound files are not episodes.
+
 Answering its questions (the same keys in every question):
 - Enter takes the suggested answer, the one in "(just Enter = ...)".
 - Esc or the Left arrow goes back one question; "0) Back" in a list does too.
