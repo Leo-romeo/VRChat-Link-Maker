@@ -21,8 +21,8 @@
 # card too; its answer goes into bus.Answers, and the first answer (console or window) wins.
 # Nothing on the window's side may throw: every handler is wrapped, and an internal error only closes the
 # window (the reason goes to $script:PanelError and log.txt).
-# What the window posts (Cmds, {Cmd; Arg}): the stream's commands (toggle, seek, seekto, skip, stop, resync, quit),
-# viewer / clock, the Settings menu's item Ids (host / res / lang with the choice as Arg), 'line' (the input box's
+# What the window posts (Cmds, {Cmd; Arg}): the stream's commands (toggle, seek, seekto, skip, stop, resync, quit;
+# audio / subs with a track's position, -1 = no subtitles), viewer / clock, the Settings menu's item Ids (host / res / lang with the choice as Arg), 'line' (the input box's
 # text), 'files' (paths: picked, dropped or pasted), and qplay / qup / qdown / qremove / qclear (Arg = @{ Id }, the
 # Up next rows' buttons and menu). The main thread carries them out in Receive-Commands only, never inside a question.
 # (This file stays plain ASCII: symbols are built from [char] codes.)
@@ -389,8 +389,8 @@ function New-ControlPanel {
   $left.Padding = New-Object System.Windows.Forms.Padding(0)
   [void]$left.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
   [void]$left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-  for ($i = 0; $i -lt 5; $i++) { [void]$left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
-  $left.RowCount = 6
+  for ($i = 0; $i -lt 6; $i++) { [void]$left.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize))) }
+  $left.RowCount = 7
   # (The status line is one or two lines high, as its text needs at this width: Set-PanelStatusHeight.)
   $left.Add_SizeChanged({ try { Set-PanelStatusHeight } catch {} })
   $p.LeftPane = $left
@@ -550,6 +550,27 @@ function New-ControlPanel {
   foreach ($b in @($p.Viewer, $p.Resync)) { Set-PanelAutoButton $b; $act.Controls.Add($b) }
   $p.Actions = $act
   $left.Controls.Add($act, 0, 5)
+
+  # Left 6: the audio track and subtitles of what plays, a menu each (only when it has something to choose: State.Tracks).
+  $trk = New-Object "$WF.FlowLayoutPanel"
+  $trk.Dock = [System.Windows.Forms.DockStyle]::Fill
+  $trk.AutoSize = $true
+  $trk.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+  $trk.WrapContents = $false
+  $trk.Margin = New-Object System.Windows.Forms.Padding(0, [int](2 * $k), 0, 0)
+  $trk.Visible = $false
+  $p.AudioBtn = New-PanelButton '' (T 'Switch the audio track (F3 in the console window). The video goes on from the same moment.') '' $null $p.SymS
+  $p.SubsBtn = New-PanelButton '' (T 'Turn the subtitles on or off, or switch them (F4 in the console window). They get drawn into the picture; the video goes on from the same moment.') '' $null $null
+  # (A menu that is empty when it opens starts out cancelled: filled now, it opens after all.)
+  $p.AudioMenu = New-Object "$WF.ContextMenuStrip"
+  $p.AudioMenu.Add_Opening({ param($sender, $e) try { Update-PanelTrackMenu 'audio'; $e.Cancel = ($sender.Items.Count -eq 0) } catch { Write-PanelWarning $_ } })
+  $p.SubsMenu = New-Object "$WF.ContextMenuStrip"
+  $p.SubsMenu.Add_Opening({ param($sender, $e) try { Update-PanelTrackMenu 'subs'; $e.Cancel = ($sender.Items.Count -eq 0) } catch { Write-PanelWarning $_ } })
+  $p.AudioBtn.Add_Click({ try { $q = $script:Panel; $q.AudioMenu.Show($q.AudioBtn, 0, $q.AudioBtn.Height) } catch {} })
+  $p.SubsBtn.Add_Click({ try { $q = $script:Panel; $q.SubsMenu.Show($q.SubsBtn, 0, $q.SubsBtn.Height) } catch {} })
+  foreach ($b in @($p.AudioBtn, $p.SubsBtn)) { Set-PanelAutoButton $b; $trk.Controls.Add($b) }
+  $p.TrackRow = $trk
+  $left.Controls.Add($trk, 0, 6)
 
   # Right 0: the input box (a title, a link, a file path; Enter = Add), [Files...], [Folder...]. Files and folders can be
   # dropped anywhere on the window, links and text too.
@@ -1130,6 +1151,33 @@ function Update-PanelMenu {
     } catch { Write-PanelWarning $_ }
   })
   [void]$m.Items.Add($en)
+}
+
+# The Audio / Subtitles menu ($what: 'audio' | 'subs'), made again each time it opens from State.Tracks: every track,
+# the one that plays (or is about to) ticked; Subtitles starts with "No subtitles". A click queues 'audio' / 'subs'
+# with the track's position (-1 = no subtitles).
+function Update-PanelTrackMenu([string]$what) {
+  $q = $script:Panel
+  $m = $q.AudioMenu
+  if ($what -eq 'subs') { $m = $q.SubsMenu }
+  $old = @($m.Items)
+  $m.Items.Clear()
+  foreach ($x in $old) { try { $x.Dispose() } catch {} }
+  $t = $null
+  try { $t = $script:PanelSync.State['Tracks'] } catch {}
+  if ($null -eq $t) { return }
+  $labels = @()
+  $cur = -1
+  if ($what -eq 'audio') { $labels = @($t['Audio']); $cur = [int]$t['A'] } else { $labels = @($t['Subs']); $cur = [int]$t['S'] }
+  $items = @()
+  if ($what -eq 'subs') { $items += , @((T 'No subtitles'), -1) }
+  for ($i = 0; $i -lt $labels.Count; $i++) { $items += , @([string]$labels[$i], $i) }
+  foreach ($x in $items) {
+    $mi = New-PanelMenuItem $x[0] $what ([int]$x[1])
+    $mi.Checked = ([int]$x[1] -eq $cur)
+    $mi.Add_Click({ try { Add-PanelCommand ([string]$this.Tag.Cmd) ([int]$this.Tag.Arg) } catch {} })
+    [void]$m.Items.Add($mi)
+  }
 }
 
 # The Id of the selected Up next line (0 = none).
@@ -2588,7 +2636,8 @@ function Remove-PanelResources {
 # 'off'), Title, Position, Duration (0 = unknown), Status, Player, Upcoming (string[]) and UpcomingIds (int[], the
 # queue items' Ids, same order) with UpcomingNames / UpcomingInfo (string[]: each one's name and how far its download
 # is, apart) and UpcomingTotal (how many wait in all: the rows stop at 20), Link, QuestLink ('' = none), Clock (bool), CanSeek (bool), Quality / QualityLow / QualityTip (the chip
-# right of the title), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu),
+# right of the title), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu), Tracks ($null, or the audio
+# tracks and subtitles of what plays: Audio / Subs / AudioShort / SubsShort (labels), A / S (-1 = none), Busy),
 # Prompt (bool: the start screen and its questions, nothing plays yet: Next / Stop / Resync and the Settings items off;
 # the input row answers the start screen's '>' only). An open question (bus.Ask, the card) turns the input row and the
 # Up next buttons and menu off.
@@ -2626,6 +2675,38 @@ function Update-PanelView($s) {
       $q.StopArmedUntil = [DateTime]::MinValue
       Reset-PanelStop
     }
+    # [Audio: ...] / [Subtitles: ...]: what plays (with an ellipsis while a pick gets ready), each only when it has a
+    # choice; the row only while something plays that has one.
+    $tk = $s['Tracks']
+    $trkOn = ($cmdOn -and $null -ne $tk)
+    $aOn = $false
+    $sOn = $false
+    $aTxt = ''
+    $sTxt = ''
+    if ($trkOn) {
+      $ash = @($tk['AudioShort'])
+      $ssh = @($tk['SubsShort'])
+      $ai = [int]$tk['A']
+      $si = [int]$tk['S']
+      $aOn = ($ash.Count -ge 2)
+      $sOn = ($ssh.Count -ge 1)
+      $an = T 'none'
+      if ($ai -ge 0 -and $ai -lt $ash.Count) { $an = [string]$ash[$ai] }
+      $sn = T 'off'
+      if ($si -ge 0 -and $si -lt $ssh.Count) { $sn = [string]$ssh[$si] }
+      $ell = [string][char]0x2026
+      if ($an.Length -gt 30) { $an = $an.Substring(0, 29).TrimEnd() + $ell }
+      if ($sn.Length -gt 30) { $sn = $sn.Substring(0, 29).TrimEnd() + $ell }
+      $tail = ' ' + [char]0x25BE
+      if ([bool]$tk['Busy']) { $tail = ' ' + $ell + $tail }
+      $aTxt = [string][char]0x266A + ' ' + (T 'Audio: {0}' $an) + $tail
+      $sTxt = (T 'Subtitles: {0}' $sn) + $tail
+    }
+    Set-PanelProp 'trka' $q.AudioBtn 'Text' $aTxt
+    Set-PanelProp 'trks' $q.SubsBtn 'Text' $sTxt
+    Set-PanelProp 'trkav' $q.AudioBtn 'Visible' $aOn
+    Set-PanelProp 'trksv' $q.SubsBtn 'Visible' $sOn
+    Set-PanelProp 'trkrow' $q.TrackRow 'Visible' ($aOn -or $sOn)
 
     $link = [string]$s['Link']
     $q.Link = $link

@@ -954,5 +954,20 @@
   "Opens a window that downloads episodes or videos into a folder instead of streaming them. The stream goes on meanwhile.": "Открывает окно, которое скачивает серии или видео в папку вместо трансляции. Трансляция тем временем продолжается.",
   "What do you want to download?": "Что хотите скачать?",
   "video {0}": "видео {0}",
-  "[{0}/{1}] {2}": "[{0}/{1}] {2}"
+  "[{0}/{1}] {2}": "[{0}/{1}] {2}",
+  "  This video has only one audio track.": "  В этом видео только одна звуковая дорожка.",
+  "  Audio: {0} ({1} of {2})": "  Звук: {0} ({1} из {2})",
+  "  This video has no subtitles.": "  В этом видео нет субтитров.",
+  "  Subtitles: off": "  Субтитры: выключены",
+  "  Subtitles: {0} ({1} of {2})": "  Субтитры: {0} ({1} из {2})",
+  "  Couldn't get those subtitles ready ({0}).": "  Не удалось подготовить эти субтитры ({0}).",
+  "  Getting them ready - the video goes on meanwhile...": "  Готовлю их - видео тем временем идёт дальше...",
+  "  Couldn't read those subtitles, so the subtitles stay as they were.": "  Не удалось прочитать эти субтитры, поэтому субтитры остались прежними.",
+  "  OK: the video goes on with them.": "  Готово: видео продолжится с ними.",
+  "             F3 = next audio track    F4 = next subtitles (or off)": "             F3 = следующая звуковая дорожка    F4 = следующие субтитры (или выкл.)",
+  "Switch the audio track (F3 in the console window). The video goes on from the same moment.": "Переключить звуковую дорожку (F3 в окне консоли). Видео продолжится с того же момента.",
+  "Turn the subtitles on or off, or switch them (F4 in the console window). They get drawn into the picture; the video goes on from the same moment.": "Включить, выключить или переключить субтитры (F4 в окне консоли). Они рисуются прямо в картинке; видео продолжится с того же момента.",
+  "No subtitles": "Без субтитров",
+  "none": "нет",
+  "off": "выкл."
 }

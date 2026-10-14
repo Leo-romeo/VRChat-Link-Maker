@@ -214,10 +214,17 @@ WHILE IT'S STREAMING
   R R           resync everyone (see below)
   +             open a second window to search / add videos
   F2            open the control window again
+  F3            next audio track (a dub, the original...)
+  F4            next subtitles, then off (they are drawn into the picture)
   P P           pause / continue (still works too)
   Ctrl+C        end
 
 - Quick presses are never lost, and several "10 seconds back" presses add up.
+- F3 / F4 (or Audio / Subtitles in the control window) switch while the video
+  plays: it goes on from the same moment with the new sound or subtitles, a
+  short jump like 10 seconds back. Subtitles inside the video file take a few
+  seconds to get ready; the video keeps playing meanwhile. The next episodes
+  keep what you picked.
 - Type a title and press Enter to search. Paste a link, or drag files into the
   window, and press Enter to add them. On the waiting screen, Enter alone lets
   you pick files.
@@ -272,6 +279,9 @@ Under them: what the stream is doing, what your VRChat player shows, and
   Watch as viewers see it   opens the real stream in a player on your PC,
                    with the same delay viewers have
   Resync everyone  same as R R
+  Audio / Subtitles   when the video has more than one audio track or has
+                   subtitles: pick another one, or No subtitles (same as F3 /
+                   F4)
 
 On the right:
 

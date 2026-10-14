@@ -1519,7 +1519,9 @@ function Read-YesNoUi {
   return [bool](Invoke-Ask $a)
 }
 
-function Select-Tracks($item) {
+# The audio tracks and subtitles a video offers: what Select-Tracks picks from, and what can be switched to while it
+# plays (Request-TrackSwitch). @{ Audio; Subs }
+function Get-TrackLists($item) {
   $audio = @($item.Info.Audio)
   $subs = @()
   if ($script:CanSubs -and -not $item.IsDirectUrl) { $subs = @($item.Info.Subs) + @($item.ExtraSubs) }
@@ -1529,6 +1531,21 @@ function Select-Tracks($item) {
     if ($script:CanSubs) { $subs += @($item.ExtraSubs | Where-Object { $_ -and $_.Kind -eq 'external' -and $_.Path -and [System.IO.File]::Exists($_.Path) }) }
   }
   $subs = @($subs | Where-Object { $_ })
+  return @{ Audio = @($audio | Where-Object { $_ }); Subs = $subs }
+}
+
+# The session's answer to "which audio / subtitles" (the next videos take the same ones), from positions in the lists.
+function New-TrackPref($audio, $subs, [int]$aPos, [int]$sPos) {
+  $p = [pscustomobject]@{ ALang = ''; ATitle = ''; APos = $aPos; SNone = ($sPos -lt 0); SLang = ''; STitle = ''; SSigns = $false; SPos = $sPos; SExternal = $false }
+  if ($aPos -ge 0 -and $aPos -lt @($audio).Count) { $p.ALang = $audio[$aPos].Lang; $p.ATitle = $audio[$aPos].Title }
+  if ($sPos -ge 0 -and $sPos -lt @($subs).Count) { $p.SLang = $subs[$sPos].Lang; $p.STitle = $subs[$sPos].Title; $p.SSigns = (Test-Signs $subs[$sPos]); $p.SExternal = ($subs[$sPos].Kind -eq 'external') }
+  return $p
+}
+
+function Select-Tracks($item) {
+  $tl = Get-TrackLists $item
+  $audio = @($tl.Audio)
+  $subs = @($tl.Subs)
   # (A translation that is subtitles only: its subtitle file is the translation, see Add-SiteSubtitle.)
   $sitePos = -1
   for ($i = 0; $i -lt $subs.Count; $i++) { if ($subs[$i].PSObject.Properties['FromSite']) { $sitePos = $i; break } }
@@ -1561,9 +1578,7 @@ function Select-Tracks($item) {
     }
     $aPos = [int]$tr.Value.A
     $sPos = [int]$tr.Value.S
-    $p = [pscustomobject]@{ ALang = ''; ATitle = ''; APos = $aPos; SNone = ($sPos -lt 0); SLang = ''; STitle = ''; SSigns = $false; SPos = $sPos; SExternal = $false }
-    if ($aPos -ge 0) { $p.ALang = $audio[$aPos].Lang; $p.ATitle = $audio[$aPos].Title }
-    if ($sPos -ge 0) { $p.SLang = $subs[$sPos].Lang; $p.STitle = $subs[$sPos].Title; $p.SSigns = (Test-Signs $subs[$sPos]); $p.SExternal = ($subs[$sPos].Kind -eq 'external') }
+    $p = New-TrackPref $audio $subs $aPos $sPos
     $noSubs = $p.SNone
     # (Kept for the next videos only when someone answered: a question that timed out asks again next time.)
     if ($script:AskTimeouts -eq $tos) { $script:TrackPref = $p }
@@ -3958,23 +3973,36 @@ function Complete-Download($item) {
 }
 
 function Start-Extract($item) {
+  $r = Start-SubPrep $item $item.SubTrack 'sub.ass'
+  if ($null -ne $r.IsSrt) { $item.SubIsSrt = $r.IsSrt }
+  $item.Prep = $r.Procs
+  $item.State = 'extracting'
+}
+
+# Gets subtitle track $sub of $item ready as $out (an .ass file in its job folder), with the fonts it needs in the
+# job's fonts folder. -> @{ Procs (the ffmpeg runs doing it, in the background); IsSrt (it was plain text like SRT:
+# drawn in our own style; $null for picture subtitles) }. Also for subtitles switched to while the video plays
+# (Request-TrackSwitch): a file name of their own then, and fonts already there are left as they are.
+function Start-SubPrep($item, $sub, [string]$out) {
   $procs = New-Object System.Collections.ArrayList
   $fontsDir = PathJoin $item.JobDir 'fonts'
-  $sub = $item.SubTrack
+  $isSrt = $null
   if ($sub -and $sub.Kind -eq 'text') {
     $codec = 'ass'
     if ($sub.Codec -eq 'ass' -or $sub.Codec -eq 'ssa') { $codec = 'copy' }
-    $item.SubIsSrt = ($codec -ne 'copy')
-    [void]$procs.Add((Start-Background $script:FFmpeg @('-hide_banner', '-nostdin', '-v', 'error', '-y', '-i', $item.Path, '-map', "0:$($sub.Index)", '-c:s', $codec, 'sub.ass') $item.JobDir))
+    $isSrt = ($codec -ne 'copy')
+    [void]$procs.Add((Start-Background $script:FFmpeg @('-hide_banner', '-nostdin', '-v', 'error', '-y', '-i', $item.Path, '-map', "0:$($sub.Index)", '-c:s', $codec, $out) $item.JobDir))
   } elseif ($sub -and $sub.Kind -eq 'external') {
     $ext = [System.IO.Path]::GetExtension($sub.Path).ToLowerInvariant()
     if ($ext -eq '.ass' -or $ext -eq '.ssa') {
-      Convert-TextFileToUtf8 $sub.Path (PathJoin $item.JobDir 'sub.ass')
-      $item.SubIsSrt = $false
+      Convert-TextFileToUtf8 $sub.Path (PathJoin $item.JobDir $out)
+      $isSrt = $false
     } else {
-      Convert-TextFileToUtf8 $sub.Path (PathJoin $item.JobDir ('ext' + $ext))
-      $item.SubIsSrt = $true
-      [void]$procs.Add((Start-Background $script:FFmpeg @('-hide_banner', '-nostdin', '-v', 'error', '-y', '-i', ('ext' + $ext), '-c:s', 'ass', 'sub.ass') $item.JobDir))
+      $mid = 'ext' + $ext
+      if ($out -ne 'sub.ass') { $mid = [System.IO.Path]::GetFileNameWithoutExtension($out) + '-ext' + $ext }
+      Convert-TextFileToUtf8 $sub.Path (PathJoin $item.JobDir $mid)
+      $isSrt = $true
+      [void]$procs.Add((Start-Background $script:FFmpeg @('-hide_banner', '-nostdin', '-v', 'error', '-y', '-i', $mid, '-c:s', 'ass', $out) $item.JobDir))
     }
     # The fonts a subtitle group ships with its file ("<group>\Fonts\", or loose next to it / the video).
     try {
@@ -3992,25 +4020,208 @@ function Start-Extract($item) {
       }
     } catch {}
   }
-  if ($sub -and $sub.Kind -ne 'bitmap' -and $item.Info.Fonts.Count -gt 0) {
-    # Fonts that come inside the video file (common for anime). Saved under safe names.
+  if ($sub -and $sub.Kind -ne 'bitmap' -and $item.Info.Fonts.Count -gt 0 -and -not (Get-Prop $item 'FontsOut')) {
+    # Fonts that come inside the video file (common for anime). Saved under safe names, once per video.
     $argv = New-Object System.Collections.Generic.List[string]
     foreach ($x in @('-hide_banner', '-nostdin', '-v', 'quiet', '-y')) { $argv.Add($x) }
     foreach ($f in $item.Info.Fonts) { $argv.Add("-dump_attachment:$($f.Index)"); $argv.Add("font$($f.Index)$($f.Ext)") }
     $argv.Add('-i'); $argv.Add($item.Path)
     [void]$procs.Add((Start-Background $script:FFmpeg $argv.ToArray() $fontsDir))
+    $item | Add-Member -Force -NotePropertyName FontsOut -NotePropertyValue $true
   }
-  Copy-FallbackFonts $fontsDir
-  $item.Prep = $procs.ToArray()
-  $item.State = 'extracting'
+  # (Not copied again over the ones a playing video may be using.)
+  if ($out -eq 'sub.ass' -or -not (Get-Prop $item 'FallbackOut')) {
+    Copy-FallbackFonts $fontsDir
+    $item | Add-Member -Force -NotePropertyName FallbackOut -NotePropertyValue $true
+  }
+  return [pscustomobject]@{ Procs = $procs.ToArray(); IsSrt = $isSrt }
 }
 
 function Complete-Extract($item) {
   $sub = $item.SubTrack
   if ($sub -and $sub.Kind -ne 'bitmap') {
     $sf = PathJoin $item.JobDir 'sub.ass'
-    if ([System.IO.File]::Exists($sf) -and (New-Object System.IO.FileInfo($sf)).Length -gt 0) { $item.SubFile = $sf }
+    if (Test-SubFileOk $sf) { $item.SubFile = $sf }
     else { $item.SubWarn = (T 'couldn''t read the subtitles, playing without them'); $item.SubTrack = $null }
+  }
+}
+
+function Test-SubFileOk([string]$f) { return ([System.IO.File]::Exists($f) -and (New-Object System.IO.FileInfo($f)).Length -gt 0) }
+
+# ------------------------------------------------------------------ switching audio / subtitles while a video plays
+# A pick (the control window's Audio / Subtitles menus, F3 / F4 here) waits in $script:TrackSwitch until it can go on
+# the air: subtitles get ready in the background meanwhile (the video keeps playing), and F3 / F4 pressed several times
+# in a row go on the air once, a moment after the last press. Then the video starts again from the same moment with
+# them (Invoke-Source: the same short jump as a seek, viewers stay connected); paused or waiting to start, it goes on
+# with them. The next videos take the same ones (TrackPref), also the ones already got ready (Update-QueuedTracks).
+$script:TrackSwitch = $null
+$script:SubSeq = 0
+
+# What $item plays now (positions in $tl = Get-TrackLists; -1 = none), or the pick about to go on the air (Busy).
+function Get-TrackPicks($item, $tl) {
+  $ts = $script:TrackSwitch
+  if ($ts -and [object]::ReferenceEquals($ts.Item, $item)) { return @{ A = $ts.APos; S = $ts.SPos; Busy = $true } }
+  $a = -1
+  $s = -1
+  if ($item.AudioTrack) { $a = [array]::IndexOf(@($tl.Audio), $item.AudioTrack) }
+  if ($item.SubTrack) { $s = [array]::IndexOf(@($tl.Subs), $item.SubTrack) }
+  return @{ A = $a; S = $s; Busy = $false }
+}
+
+# Subtitle files this video already has ready, by their position in Get-TrackLists: @{ "<pos>" = @{ File; IsSrt } }
+# (turning them off and on again doesn't read them again).
+function Get-SubCache($item) {
+  $c = Get-Prop $item 'SubCache'
+  if ($null -eq $c) { $c = @{}; $item | Add-Member -Force -NotePropertyName SubCache -NotePropertyValue $c }
+  return $c
+}
+
+# $what: 'audio' | 'subs'. $arg: a position in Get-TrackLists ('subs': -1 = none), or 'next' (F3 / F4: the next one;
+# subtitles go round through "none").
+function Request-TrackSwitch($item, [string]$what, $arg) {
+  if (-not $item -or -not $item.Info -or -not $item.JobDir) { return }
+  $tl = Get-TrackLists $item
+  $audio = @($tl.Audio)
+  $subs = @($tl.Subs)
+  $pk = Get-TrackPicks $item $tl
+  $a = [int]$pk.A
+  $s = [int]$pk.S
+  $cycle = ("$arg" -eq 'next')
+  $n = 0
+  if (-not $cycle -and -not [int]::TryParse("$arg", [ref]$n)) { return }
+  if ($what -eq 'audio') {
+    if ($audio.Count -lt 2) { Say (T '  This video has only one audio track.') 'Gray'; return }
+    if ($cycle) { $a = ($a + 1) % $audio.Count } elseif ($n -ge 0 -and $n -lt $audio.Count) { $a = $n } else { return }
+    Say (T '  Audio: {0} ({1} of {2})' (Get-TrackLabel $audio[$a] $true) ($a + 1) $audio.Count) 'Cyan'
+  } else {
+    if ($subs.Count -eq 0) { Say (T '  This video has no subtitles.') 'Gray'; return }
+    if ($cycle) { $s++; if ($s -ge $subs.Count) { $s = -1 } } elseif ($n -ge -1 -and $n -lt $subs.Count) { $s = $n } else { return }
+    if ($s -lt 0) { Say (T '  Subtitles: off') 'Cyan' }
+    else { Say (T '  Subtitles: {0} ({1} of {2})' (Get-TrackLabel $subs[$s] $true) ($s + 1) $subs.Count) 'Cyan' }
+  }
+  Set-TrackSwitch $item $tl $a $s $cycle
+}
+
+# Puts the pick ($a / $s: positions in $tl) in $script:TrackSwitch, and starts getting its subtitles ready. Back to what
+# plays now: nothing to do. $later: it goes on the air a moment later (another press may come).
+function Set-TrackSwitch($item, $tl, [int]$a, [int]$s, [bool]$later) {
+  $audio = @($tl.Audio)
+  $subs = @($tl.Subs)
+  $old = $script:TrackSwitch
+  $script:TrackSwitch = $null
+  $pa = -1
+  $ps = -1
+  if ($item.AudioTrack) { $pa = [array]::IndexOf($audio, $item.AudioTrack) }
+  if ($item.SubTrack) { $ps = [array]::IndexOf($subs, $item.SubTrack) }
+  $cache = Get-SubCache $item
+  if ($ps -ge 0 -and $item.SubFile -and $item.SubTrack.Kind -ne 'bitmap') { $cache["$ps"] = @{ File = $item.SubFile; IsSrt = $item.SubIsSrt } }
+  # (The subtitles the pick before was getting ready are kept when this pick has them too.)
+  $keep = ($old -and [object]::ReferenceEquals($old.Item, $item) -and $old.SPos -eq $s -and $old.SubFile)
+  if ($old -and -not $keep) { foreach ($bg in @($old.Prep)) { if ($bg) { Stop-Proc $bg.Proc } } }
+  if ($a -eq $pa -and $s -eq $ps) { return }
+  $now = Get-Date
+  $ts = [pscustomobject]@{ Item = $item; APos = $a; SPos = $s; Due = $now; Prep = @(); SubFile = $null; IsSrt = $null; Started = $now }
+  if ($later) { $ts.Due = $now.AddMilliseconds(1300) }
+  if ($s -ge 0 -and $s -ne $ps -and $subs[$s].Kind -ne 'bitmap') {
+    $c = $cache["$s"]
+    if ($keep) { $ts.Prep = $old.Prep; $ts.SubFile = $old.SubFile; $ts.IsSrt = $old.IsSrt; $ts.Started = $old.Started }
+    elseif ($c -and (Test-SubFileOk $c.File)) { $ts.SubFile = $c.File; $ts.IsSrt = $c.IsSrt }
+    else {
+      $script:SubSeq++
+      $name = "sub$($script:SubSeq).ass"
+      try {
+        $r = Start-SubPrep $item $subs[$s] $name
+        $ts.Prep = $r.Procs
+        $ts.IsSrt = $r.IsSrt
+        $ts.SubFile = PathJoin $item.JobDir $name
+        # (Subtitles inside the video file take a few seconds: ffmpeg reads the whole file for them.)
+        if ($subs[$s].Kind -eq 'text') { Say (T '  Getting them ready - the video goes on meanwhile...') 'Gray' }
+      } catch {
+        Say (T '  Couldn''t get those subtitles ready ({0}).' $_.Exception.Message) 'Yellow'
+        return
+      }
+    }
+  }
+  $script:TrackSwitch = $ts
+}
+
+# Called by Invoke-Source while $media plays (or waits paused / to start): puts a pick on the air once it is due and its
+# subtitles are ready. $true = what $media plays changed (a playing video then starts again from the same moment).
+# A pick for another video (that one ended meanwhile) is dropped.
+function Step-TrackSwitch($media) {
+  $ts = $script:TrackSwitch
+  if (-not $ts) { return $false }
+  if (-not $media -or -not [object]::ReferenceEquals($ts.Item, $media)) {
+    foreach ($bg in @($ts.Prep)) { if ($bg) { Stop-Proc $bg.Proc } }
+    $script:TrackSwitch = $null
+    return $false
+  }
+  $now = Get-Date
+  if ($now -lt $ts.Due) { return $false }
+  foreach ($bg in @($ts.Prep)) {
+    if (-not $bg) { continue }
+    $done = $true
+    try { $done = $bg.Proc.HasExited } catch {}
+    if (-not $done) {
+      if (($now - $ts.Started).TotalSeconds -lt 120) { return $false }
+      Stop-Proc $bg.Proc
+    }
+  }
+  $script:TrackSwitch = $null
+  $tl = Get-TrackLists $media
+  $audio = @($tl.Audio)
+  $subs = @($tl.Subs)
+  $at = $media.AudioTrack
+  if ($ts.APos -ge 0 -and $ts.APos -lt $audio.Count) { $at = $audio[$ts.APos] }
+  $st = $null
+  if ($ts.SPos -ge 0 -and $ts.SPos -lt $subs.Count) { $st = $subs[$ts.SPos] }
+  if ($st -and $st.Kind -ne 'bitmap' -and -not [object]::ReferenceEquals($st, $media.SubTrack)) {
+    if (-not $ts.SubFile -or -not (Test-SubFileOk $ts.SubFile)) {
+      Say (T '  Couldn''t read those subtitles, so the subtitles stay as they were.') 'Yellow'
+      $st = $media.SubTrack
+    } else {
+      (Get-SubCache $media)["$($ts.SPos)"] = @{ File = $ts.SubFile; IsSrt = $ts.IsSrt }
+    }
+  }
+  $changed = $false
+  if (-not [object]::ReferenceEquals($at, $media.AudioTrack)) { $media.AudioTrack = $at; $changed = $true }
+  if (-not [object]::ReferenceEquals($st, $media.SubTrack)) {
+    $media.SubTrack = $st
+    if ($st -and $st.Kind -ne 'bitmap') {
+      $media.SubFile = $ts.SubFile
+      if ($null -ne $ts.IsSrt) { $media.SubIsSrt = [bool]$ts.IsSrt }
+    }
+    $changed = $true
+  }
+  if ($changed) {
+    $ai = -1
+    $si = -1
+    if ($media.AudioTrack) { $ai = [array]::IndexOf($audio, $media.AudioTrack) }
+    if ($media.SubTrack) { $si = [array]::IndexOf($subs, $media.SubTrack) }
+    $script:TrackPref = New-TrackPref $audio $subs $ai $si
+    Update-QueuedTracks
+  }
+  return $changed
+}
+
+# The videos after the one that plays which are already got ready: with the audio / subtitles the session's answer
+# (TrackPref) picks now. Their subtitles are got ready again when that changes them.
+function Update-QueuedTracks {
+  for ($i = $script:Idx + 1; $i -lt $script:Queue.Count; $i++) {
+    $it = $script:Queue[$i]
+    if (($it.State -ne 'ready' -and $it.State -ne 'extracting') -or -not $it.Info -or -not $it.JobDir) { continue }
+    $a0 = $it.AudioTrack
+    $s0 = $it.SubTrack
+    # (It asks nothing: TrackPref is set.)
+    try { Select-Tracks $it } catch { if ($script:NavSignal) { throw }; continue }
+    if ([object]::ReferenceEquals($a0, $it.AudioTrack) -and [object]::ReferenceEquals($s0, $it.SubTrack)) { continue }
+    # (Fonts cut off halfway are taken out again.)
+    if ($it.State -eq 'extracting') { $it | Add-Member -Force -NotePropertyName FontsOut -NotePropertyValue $false }
+    foreach ($bg in @($it.Prep)) { if ($bg) { Stop-Proc $bg.Proc } }
+    $it.SubFile = $null
+    $it.SubWarn = $null
+    $it.SubIsSrt = $false
+    try { Start-Extract $it } catch { $it.State = 'failed'; $it.Error = $_.Exception.Message }
   }
 }
 
@@ -4287,7 +4498,8 @@ function Get-VideoGraph($item, [string]$inLabel, [double]$start, [string]$pix, [
   $post.Add("fps=$($script:StreamFps)")
   $sub = $item.SubTrack
   if ($sub -and $item.SubFile -and $sub.Kind -ne 'bitmap') {
-    $sf = 'subtitles=filename=sub.ass:fontsdir=fonts'
+    # (sub.ass, or the file of subtitles switched to while it plays: Request-TrackSwitch)
+    $sf = "subtitles=filename=$([System.IO.Path]::GetFileName($item.SubFile)):fontsdir=fonts"
     if ($item.SubIsSrt) { $sf += ":force_style='FontName=$($script:FallbackFontName),FontSize=20,Outline=1.6,Shadow=0.6,MarginV=18'" }
     if ($start -gt 0.5) {
       $post.Add("setpts=PTS+$(Format-Num $start)/TB")
@@ -5831,9 +6043,9 @@ function Resolve-Cmd($c, [string]$kind, [ref]$why) {
   }
   if ($cmd -eq 'resume' -and $kind -eq 'hold') { $cmd = 'start' }
   $fits = switch ($kind) {
-    'content' { @('pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'sync', 'lost', 'restart', 'playnow') }
-    'paused' { @('resume', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow') }
-    'hold' { @('start', 'pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow') }
+    'content' { @('pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'sync', 'lost', 'restart', 'playnow', 'audio', 'subs') }
+    'paused' { @('resume', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow', 'audio', 'subs') }
+    'hold' { @('start', 'pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow', 'audio', 'subs') }
     default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest', 'lang', 'forget', 'menu') }
   }
   # The waiting screen while a torrent episode downloads for its turn: S S gives that episode up.
@@ -6328,7 +6540,8 @@ function Open-ViewerPreview {
 
 # Keyboard. Space = pause / continue (or start now), Left / Right = 10 s back / forward (with Shift: 30 s),
 # S twice = next video, R twice = resync everyone, Q twice = stop, + = search / add in a second window,
-# F2 = control window. Text dragged / pasted / typed into the window + Enter = add it (or search for it).
+# F2 = control window, F3 / F4 = next audio track / subtitles. Text dragged / pasted / typed into the window + Enter =
+# add it (or search for it).
 function Read-KeyCommand([string]$kind) {
   if (-not $script:HasConsole) { return $null }
   $keys = New-Object System.Collections.Generic.List[System.ConsoleKeyInfo]
@@ -6359,6 +6572,8 @@ function Read-KeyCommand([string]$kind) {
       ([ConsoleKey]::DownArrow) { $script:Armed = $null; return (New-Cmd 'seek' -30) }
       ([ConsoleKey]::UpArrow) { $script:Armed = $null; return (New-Cmd 'seek' 30) }
       ([ConsoleKey]::F2) { $script:Armed = $null; Show-Panel; return $null }
+      ([ConsoleKey]::F3) { $script:Armed = $null; return (New-Cmd 'audio' 'next') }
+      ([ConsoleKey]::F4) { $script:Armed = $null; return (New-Cmd 'subs' 'next') }
       ([ConsoleKey]::Add) { $script:Armed = $null; Open-AddWindow ''; return $null }
       ([ConsoleKey]::OemPlus) { $script:Armed = $null; Open-AddWindow ''; return $null }
       ([ConsoleKey]::Escape) { $script:Armed = $null; return $null }
@@ -7138,13 +7353,32 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $s = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up; UpcomingIds = [int[]]$upIds
       UpcomingNames = [string[]]$upNames; UpcomingInfo = [string[]]$upInfo; UpcomingTotal = [Math]::Max(0, $script:Queue.Count - $from)
       Link = $script:ShownLink; QuestLink = $quest; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
-      Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip }
+      Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip; Tracks = $null }
+    if ($media -and $media.Info -and ($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold')) { try { $s.Tracks = Get-PanelTracks $media } catch {} }
     $m = $null
     try { $m = Get-PanelMenuState } catch {}
     if ($m) { foreach ($k in $m.Keys) { $s[$k] = $m[$k] } }
     $script:PanelState = $s
     Update-ControlPanel $script:PanelState
   } catch { $script:PanelShown = $false }
+}
+
+# The control window's Audio / Subtitles menus for what plays: @{ Audio / Subs (each track's label), AudioShort /
+# SubsShort (shorter, for the buttons), A / S (what plays, -1 = none, or the pick about to go on the air: Busy) }, or
+# $null when it has nothing to choose. The labels are made once per video.
+$script:PanelTrackCache = $null
+function Get-PanelTracks($media) {
+  $c = $script:PanelTrackCache
+  if (-not $c -or -not [object]::ReferenceEquals($c.Item, $media)) {
+    $tl = Get-TrackLists $media
+    $c = @{ Item = $media; Tl = $tl
+      Audio = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ }); AudioShort = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ $true })
+      Subs = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ }); SubsShort = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ $true }) }
+    $script:PanelTrackCache = $c
+  }
+  if ($c.Audio.Count -lt 2 -and $c.Subs.Count -eq 0) { return $null }
+  $pk = Get-TrackPicks $media $c.Tl
+  return @{ Audio = $c.Audio; AudioShort = $c.AudioShort; Subs = $c.Subs; SubsShort = $c.SubsShort; A = [int]$pk.A; S = [int]$pk.S; Busy = [bool]$pk.Busy }
 }
 
 # The Settings menu's items for the control window: the same list as M here (Get-MenuItems), with the choices of
@@ -7279,6 +7513,9 @@ function Invoke-Source {
           'lost' { $requested = 'lost'; $target = $viewers }
           'resync' { $requested = 'resync'; $target = $viewers }
           'restart' { $requested = 'restart'; $target = $cur }
+          # (Not right away: Step-TrackSwitch below, once its subtitles are ready.)
+          'audio' { Request-TrackSwitch $Media 'audio' $c.Arg }
+          'subs' { Request-TrackSwitch $Media 'subs' $c.Arg }
           default { $requested = $c.Cmd }
         }
         if ($requested) {
@@ -7295,6 +7532,17 @@ function Invoke-Source {
           }
         }
       }
+    }
+    # Audio / subtitles switched to: a playing video starts again from this moment with them.
+    if ($script:TrackSwitch -and -not $requested -and (Step-TrackSwitch $Media)) {
+      if ($Kind -eq 'content') {
+        $requested = 'restart'
+        $target = $Start + $pos
+        $pr = Read-Progress $progFile
+        if ($pr) { $target = $Start + [Math]::Max(0.0, $pr.Time - $off) }
+        Send-Key $proc 'q'
+        $quitSentAt = $now
+      } else { Say (T '  OK: the video goes on with them.') 'Gray' }
     }
     if ($Kind -eq 'paused' -and -not $requested -and ($now - $t0).TotalMinutes -ge $script:PauseMaxMinutes) {
       $requested = 'timeout'; Stop-Proc $proc; $quitSentAt = $now
@@ -7512,6 +7760,7 @@ function Show-Controls {
   Say (T '  Controls:  Space = pause / continue    Left / Right = 10 s back / forward (Shift: 30 s)') 'DarkCyan'
   Say (T '             S S = next video    Q Q = stop (then pick something else)    R R = resync everyone') 'DarkCyan'
   Say (T '             + = search / add in a second window    F2 = control window with preview') 'DarkCyan'
+  Say (T '             F3 = next audio track    F4 = next subtitles (or off)') 'DarkCyan'
   Say (T '             M + Enter = settings menu (while nothing plays)') 'DarkCyan'
 }
 
