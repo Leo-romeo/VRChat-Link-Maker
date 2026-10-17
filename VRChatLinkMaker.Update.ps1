@@ -120,17 +120,97 @@ function Install-Update($latest) {
   }
 }
 
-# Called by Main once config.json is read. $true = updated: Main returns and the tool starts again.
-function Invoke-UpdateCheck {
+# The check runs on a runspace of its own (Start-UpdateCheck, at start), so the start never waits for GitHub. What it
+# found is said once it is in (Receive-UpdateCheck): a green line here and a green bar in the control window. The
+# question comes only when asked for: U + Enter on the start screen, or a click on the window's bar.
+$script:UpdateJob = $null
+$script:UpdateFound = $null   # the newer version found: Version, Tag, Notes ($null = none, or not known yet)
+$script:UpdateSaid = $false
+$script:UpdateNote = $null    # what to say here about the check, once nothing else is being typed
+
+function Test-UpdateCheckOn {
   if (-not $script:Interactive -or $env:VRCLM_NO_UPDATE) { return $false }
   if ("$(Get-Prop $script:Cfg 'Updates')" -match '^(?i)\s*(off|no|false|0)\s*$') { return $false }
   if ([System.IO.Directory]::Exists((PathJoin $script:ToolDir '.git'))) { return $false }
-  $cur = ConvertTo-UpdateVersion $script:Version
+  return $true
+}
+
+# Called by Main once config.json is read.
+function Start-UpdateCheck {
+  $script:UpdateJob = $null
+  if (-not (Test-UpdateCheckOn)) { return }
+  try {
+    $defs = (@('Invoke-Web', 'ConvertFrom-JsonDict', 'ConvertTo-UpdateVersion', 'Get-LatestVersion') | ForEach-Object {
+        'function ' + $_ + ' {' + (Get-Item ('function:' + $_)).ScriptBlock.ToString() + '}' }) -join "`n"
+    $work = {
+      param($defs, $ua, $repo)
+      $script:WebUA = $ua
+      $script:WebCookies = New-Object System.Net.CookieContainer
+      $script:UpdateRepo = $repo
+      . ([scriptblock]::Create($defs))
+      try { return @{ Latest = (Get-LatestVersion); Error = '' } } catch { return @{ Latest = $null; Error = $_.Exception.Message } }
+    }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($work).AddArgument($defs).AddArgument($script:WebUA).AddArgument($script:UpdateRepo)
+    $script:UpdateJob = @{ Ps = $ps; Run = $ps.BeginInvoke(); Until = [DateTime]::UtcNow.AddSeconds(20) }
+  } catch { $script:UpdateJob = $null }
+}
+
+# Takes the check's answer when it is in (never waits). -Quiet: nothing is said in the console yet (the control window
+# still gets its bar); the next call without it says it.
+function Receive-UpdateCheck([switch]$Quiet) {
+  $j = $script:UpdateJob
+  if ($j) {
+    if (-not $j.Run.IsCompleted) {
+      if ([DateTime]::UtcNow -lt $j.Until) { return }
+      $script:UpdateJob = $null
+      try { [void]$j.Ps.BeginStop($null, $null) } catch {}
+      return
+    }
+    $script:UpdateJob = $null
+    $r = $null
+    try { $r = @($j.Ps.EndInvoke($j.Run))[0] } catch {}
+    try { $j.Ps.Dispose() } catch {}
+    if ($r -and $r.Error) { $script:UpdateNote = T 'Couldn''t check for a new version: {0}' ([string]$r.Error) }
+    $latest = $null
+    if ($r) { $latest = $r.Latest }
+    $cur = ConvertTo-UpdateVersion $script:Version
+    if ($latest -and $cur -and $latest.Version -gt $cur -and "$(Get-Prop $script:Cfg 'SkipVersion')" -ne $latest.Tag) {
+      $script:UpdateFound = $latest
+      try {
+        $b = $script:UiBus
+        if ($b) { $b.Notice = @{ Text = (T '{0} is out: click here to update.' $latest.Tag); Tip = (T 'A new version is out: {0} (this one is {1}).' $latest.Version.ToString() $script:Version); Color = 'Green'; Cmd = 'update'; Seq = [DateTime]::UtcNow.Ticks } }
+      } catch {}
+    }
+  }
+  if ($Quiet) { return }
+  if ($script:UpdateNote) { Say $script:UpdateNote 'DarkGray'; $script:UpdateNote = $null }
+  if ($script:UpdateFound -and -not $script:UpdateSaid) {
+    $script:UpdateSaid = $true
+    Say (T 'A new version is out: {0} (this one is {1}). U + Enter on the start screen = update.' $script:UpdateFound.Version.ToString() $script:Version) 'Green'
+  }
+}
+
+# The check and the question at once, waiting for GitHub (as before the check moved to the background; Main no longer
+# uses it). $true = updated.
+function Invoke-UpdateCheck {
+  if (-not (Test-UpdateCheckOn)) { return $false }
   $latest = $null
   try { $latest = Get-LatestVersion }
   catch { Say (T 'Couldn''t check for a new version: {0}' $_.Exception.Message) 'DarkGray'; return $false }
+  $cur = ConvertTo-UpdateVersion $script:Version
   if (-not $latest -or -not $cur -or $latest.Version -le $cur) { return $false }
   if ("$(Get-Prop $script:Cfg 'SkipVersion')" -eq $latest.Tag) { return $false }
+  $script:UpdateFound = $latest
+  return (Invoke-UpdateOffer)
+}
+
+# U + Enter on the start screen (or a click on the window's bar): the release notes and the question. $true = updated:
+# the tool ends and starts again.
+function Invoke-UpdateOffer {
+  $latest = $script:UpdateFound
+  if (-not $latest) { return $false }
+  try { if ($script:UiBus) { $script:UiBus.Notice = $null; $script:UiBus.UpdateReq = $false } } catch {}
   Say ''
   Say (T 'A new version is out: {0} (this one is {1}).' $latest.Version.ToString() $script:Version) 'Green'
   if ($latest.Notes) {
@@ -144,6 +224,7 @@ function Invoke-UpdateCheck {
     else { $script:Cfg | Add-Member -NotePropertyName 'SkipVersion' -NotePropertyValue $latest.Tag }
     try { Save-Config $script:Cfg } catch {}
     Say (T 'OK, you won''t be asked about {0} again.' $latest.Tag) 'Gray'
+    $script:UpdateFound = $null
     return $false
   }
   if ($c -ne 0) { return $false }

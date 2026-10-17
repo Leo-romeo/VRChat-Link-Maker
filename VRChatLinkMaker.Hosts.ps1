@@ -487,13 +487,21 @@ function Get-HostKbps($p) {
 # VLC test link and the host's warnings. $pcLink = the PC link as the world's player gets it (with ?retry=-1 etc.);
 # empty = $script:ShownLink (when it belongs to this host) or the profile's PcUrl. The caller draws the frame
 # around it, adds the Stream / Live mode and world-player control hints and copies the link.
-function Show-HostLinks($p, [string]$pcLink = '') {
+# -Short: only the header, the link and the Quest link (Show-Links' short form after the first time).
+function Show-HostLinks($p, [string]$pcLink = '', [switch]$Short) {
   if (-not $pcLink) {
     $pcLink = $p.PcUrl
     $sl = "$($script:ShownLink)"
     if ($sl -and $p.PcUrl -and $sl.StartsWith($p.PcUrl, [System.StringComparison]::OrdinalIgnoreCase)) { $pcLink = $sl }
   }
   Say (T '  YOUR VRCHAT LINK  (via {0})' $p.Name) 'White'
+  if ($Short) {
+    Say ''
+    Say "      $pcLink" 'Green'
+    Say ''
+    if ($p.QuestUrl) { Say (T '  Quest / Android viewers use:  {0}' $p.QuestUrl) 'Gray' }
+    return
+  }
   if ($p.Trusted) {
     Say (T '  Trusted by VRChat: plays in every instance (Public ones too), nobody has to change a setting.') 'DarkGreen'
   } else {
@@ -3297,6 +3305,7 @@ function Measure-EncodeSpeed([string]$venc, [int]$kbps, [int]$ak) {
 #    the network's share is Speed / EncodeSpeed), StreamKbps (what was really sent, audio included), EffectiveKbps
 #    (video that got through: video bitrate x NetSpeed), EncodeSpeed, Error.
 function Measure-PushSpeed([string]$url, [string]$fmt, [int]$kbps, [int]$seconds = 30) {
+  if (-not $script:VEnc -and (Get-Command Complete-EncoderChoice -CommandType Function -ErrorAction SilentlyContinue)) { Complete-EncoderChoice }
   $venc = "$($script:VEnc)"
   if (-not $venc) { $venc = 'libx264' }
   $ak = 128

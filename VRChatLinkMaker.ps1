@@ -537,6 +537,31 @@ namespace VRCLinkMaker {
     public static bool Flash(IntPtr h) { return DoFlash(h, 3 | 12); }   // FLASHW_ALL | FLASHW_TIMERNOFG
     public static bool StopFlash(IntPtr h) { return DoFlash(h, 0); }
     public static bool ConsoleInFront() { IntPtr c = GetConsoleWindow(); return c != IntPtr.Zero && c == GetForegroundWindow(); }
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool on);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll", EntryPoint = "SendMessageW")] static extern IntPtr SendMessagePtr(IntPtr h, int msg, IntPtr w, IntPtr l);
+    // The control window to the front at start, only while this tool's console is in front (it was just started, nothing
+    // else was clicked since): Windows lets the window with the keyboard's input take the front, so this thread shares
+    // the console's input for that moment.
+    public static bool ToFront(IntPtr h) {
+      IntPtr c = GetConsoleWindow();
+      IntPtr fg = GetForegroundWindow();
+      if (c == IntPtr.Zero || fg != c) return false;
+      uint pid;
+      uint other = GetWindowThreadProcessId(fg, out pid);
+      uint me = GetCurrentThreadId();
+      bool att = other != 0 && other != me && AttachThreadInput(me, other, true);
+      try { BringWindowToTop(h); return SetForegroundWindow(h); } finally { if (att) AttachThreadInput(me, other, false); }
+    }
+    // The console's icon (WM_SETICON, small or big); returns the one it had before (Zero = none).
+    public static IntPtr ConsoleIcon(IntPtr icon, bool big) {
+      IntPtr c = GetConsoleWindow();
+      if (c == IntPtr.Zero) return IntPtr.Zero;
+      return SendMessagePtr(c, 0x80, (IntPtr)(big ? 1 : 0), icon);
+    }
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
     // DWMWA_USE_IMMERSIVE_DARK_MODE: 20 since Windows 10 2004, 19 in 1809-1909; false where Windows has neither.
     public static bool DarkTitle(IntPtr h) {
@@ -687,14 +712,43 @@ function Find-Exe([string]$name) {
   return $null
 }
 
+# winget's own output (progress bars, source notes) goes to log.txt, not on the screen; only a failure shows its last
+# lines. Meanwhile the status line counts the seconds.
 function Invoke-Winget([string]$id) {
   $wg = Get-Command winget -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $wg) { return $false }
-  Say (T 'Installing {0} with winget (can take a minute)...' $id) 'Gray'
+  $name = $id
+  if ($id -eq 'Gyan.FFmpeg') { $name = 'ffmpeg' } elseif ($id -eq 'yt-dlp.yt-dlp') { $name = 'yt-dlp' }
+  Say (T 'Installing {0} with winget (1 to 3 minutes)...' $name) 'Gray'
   $psi = New-StartInfo $wg.Path @('install', '-e', '--id', $id, '--accept-source-agreements', '--accept-package-agreements')
-  Write-StartLog $psi
-  $p = [System.Diagnostics.Process]::Start($psi)
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.RedirectStandardInput = $true
+  $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+  $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+  $p = Start-Child $psi   # (hidden, in the job; Write-StartLog notes it)
+  try { $p.StandardInput.Close() } catch {}
+  $errT = $p.StandardError.ReadToEndAsync()
+  $outT = $p.StandardOutput.ReadToEndAsync()
+  $t0 = Get-Date
+  while (-not $p.WaitForExit(250)) {
+    Invoke-PanelPump
+    Show-Status (T '  Installing {0} with winget... {1} s' $name ([int]((Get-Date) - $t0).TotalSeconds))
+  }
   $p.WaitForExit()
+  Clear-StatusLine
+  $text = ''
+  try { $text = [string]$outT.Result + "`n" + [string]$errT.Result } catch {}
+  # (Progress bars and spinners are not worth keeping: lines with words in them are.)
+  $lines = @(@($text -split "[`r`n]+") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '[A-Za-z]{3}' -and $_ -notmatch '[\u2580-\u259F]' })
+  $code = 0
+  try { $code = $p.ExitCode } catch {}
+  Write-LogLine ('  (winget install ' + $id + ': exit code ' + $code + ')')
+  foreach ($l in @($lines | Select-Object -Last 60)) { Write-LogLine ('    ' + $l) }
+  if ($code -ne 0) {
+    Say (T 'winget couldn''t install {0} (exit code {1}). What it said last:' $name $code) 'Yellow'
+    foreach ($l in @($lines | Select-Object -Last 6)) { Say ('    ' + $l) 'Gray' }
+  }
   Update-PathFromRegistry
   return $true
 }
@@ -1043,28 +1097,81 @@ function Clear-OldTemp {
 }
 
 # ------------------------------------------------------------------ encoders
-function Test-Encoder([string]$enc) {
-  # Same settings as the real stream at the most a session can ask of it (1080p at the highest frame rate it may run
-  # at, with that level), so an old graphics card / driver fails here instead of mid-stream.
+# Same settings as the real stream at the most a session can ask of it (1080p at the highest frame rate it may run
+# at, with that level), so an old graphics card / driver fails here instead of mid-stream.
+function Get-EncoderTestArgs([string]$enc) {
   $pix = 'yuv420p'
   if ($enc -eq 'h264_qsv') { $pix = 'nv12' }
   $fps = Get-TopStreamFps
   $argv = @('-hide_banner', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', "color=c=black:s=1920x1080:r=$(Format-Num $fps):d=1", '-vf', "format=$pix")
   $argv += Get-VideoEncArgs $enc 1700 $fps -Width 1920 -Height 1080
   $argv += @('-f', 'null', '-')
-  $r = Invoke-Capture $script:FFmpeg $argv
+  return $argv
+}
+
+function Test-Encoder([string]$enc) {
+  $r = Invoke-Capture $script:FFmpeg (Get-EncoderTestArgs $enc)
   return ($r.ExitCode -eq 0)
 }
 
-function Select-VideoEncoder {
+# config.json's "Encoder" -> @{ Want (as written); Cand (the ffmpeg encoder to try first) }.
+function Get-EncoderWish {
   $want = "$($script:Cfg.Encoder)".Trim().ToLowerInvariant()
   $map = @{ 'nvenc' = 'h264_nvenc'; 'nvidia' = 'h264_nvenc'; 'amf' = 'h264_amf'; 'amd' = 'h264_amf'; 'qsv' = 'h264_qsv'; 'intel' = 'h264_qsv'; 'cpu' = 'libx264'; 'x264' = 'libx264'; 'libx264' = 'libx264' }
   $cand = 'h264_nvenc'
   if ($map.ContainsKey($want)) { $cand = $map[$want] } elseif ($want -like 'h264_*') { $cand = $want }
+  return @{ Want = $want; Cand = $cand }
+}
+
+# The first test (NVENC: its best settings) starts at once in the background; Select-VideoEncoder takes its answer
+# (about a second saved on every start). A failed one goes on with the next settings as before.
+$script:EncTest = $null
+function Start-EncoderTest {
+  $script:EncTest = $null
+  try {
+    $w = Get-EncoderWish
+    if ($w.Cand -eq 'libx264') { return }
+    if ($w.Cand -eq 'h264_nvenc') { $script:NvTier = 3 }
+    $script:EncTest = @{ Cand = $w.Cand; Bg = (Start-Background $script:FFmpeg (Get-EncoderTestArgs $w.Cand)) }
+  } catch { $script:EncTest = $null }
+}
+
+# The background test's answer for $cand: $true / $false, or $null (none ran).
+function Receive-EncoderTest([string]$cand) {
+  $t = $script:EncTest
+  $script:EncTest = $null
+  if (-not $t -or $t.Cand -ne $cand) { return $null }
+  try {
+    if (-not $t.Bg.Proc.WaitForExit(30000)) { Stop-Proc $t.Bg.Proc; return $null }
+    $t.Bg.Proc.WaitForExit()
+    return ($t.Bg.Proc.ExitCode -eq 0)
+  } catch { return $null }
+}
+
+# The encoder for this session, if not chosen yet (Main, after the link block; a speed test before that takes it too).
+function Complete-EncoderChoice {
+  if ($script:VEnc) { return }
+  $script:VEnc = Select-VideoEncoder
+  Say (T 'Encoding with: {0}' (Get-EncoderName $script:VEnc)) 'DarkGray'
+  Add-StartMark 'encoder'
+}
+
+function Select-VideoEncoder {
+  $w = Get-EncoderWish
+  $want = $w.Want
+  $cand = $w.Cand
+  $pre = Receive-EncoderTest $cand
   if ($cand -eq 'h264_nvenc') {
     # Best settings first; older graphics cards / drivers lack two-pass and temporal AQ.
-    foreach ($tier in 3, 2, 1) { $script:NvTier = $tier; if (Test-Encoder $cand) { return $cand } }
-  } elseif ($cand -ne 'libx264' -and (Test-Encoder $cand)) { return $cand }
+    foreach ($tier in 3, 2, 1) {
+      $script:NvTier = $tier
+      if ($tier -eq 3 -and $null -ne $pre) { if ($pre) { return $cand } else { continue } }
+      if (Test-Encoder $cand) { return $cand }
+    }
+  } elseif ($cand -ne 'libx264') {
+    if ($null -eq $pre) { $pre = Test-Encoder $cand }
+    if ($pre) { return $cand }
+  }
   if ($want -ne 'auto' -and $cand -ne 'libx264') { Say (T 'The ''{0}'' encoder doesn''t work on this PC - using the CPU instead.' $want) 'Yellow' }
   return 'libx264'
 }
@@ -1873,6 +1980,8 @@ function Get-MenuItems([switch]$WithMenu) {
     # D works while a video plays too: it opens a window of its own (Read-Entries, Add-TypedLine; the control window has
     # its own item). ("skachat'" = U+0441 U+043A U+0430 U+0447 U+0430 U+0442 U+044C)
     @{ Id = 'download'; Label = (T 'Download videos to this PC (no stream)...'); Letter = 'D'; Need = ''; Re = '^\s*(?:d|download|\u0432|\u0441\u043a\u0430\u0447\u0430\u0442\u044c)\s*$' },
+    # (? itself is read by Read-Entries: it also prints all the start screen's keys.)
+    @{ Id = 'help'; Label = (T 'Link help'); Letter = '?'; Need = ''; Re = '' },
     @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' }
   )
   if ($WithMenu) { $items += @{ Id = 'menu'; Label = (T 'Settings'); Letter = 'M'; Need = ''; Re = '^\s*(?:m|menu|\u044c)\s*$' } }
@@ -1903,6 +2012,7 @@ function Invoke-MenuAction([string]$id, $pick = $null) {
     'newlink' { Invoke-NewLinkMenu }
     'lang' { if ($null -ne $pick) { Invoke-LanguageMenu $pick } else { Invoke-LanguageMenu } }
     'forget' { Clear-AskedPrefs }
+    'help' { if ($script:Cfg) { Show-Links -Full }; $script:EntryHelpFull = $true }
     'download' { Open-DownloadWindow }
     'menu' { Invoke-SettingsMenu }
   }
@@ -1975,32 +2085,52 @@ function Read-Entries([string]$Prefill = '') {
     $script:EntryLine = ''
     Say ''
     Say $ask 'Cyan'
-    if (Get-Command Find-SiteContent -CommandType Function -ErrorAction SilentlyContinue) {
+    $hostKeys = ((Test-HostModule) -and $script:HostP -and -not $side)
+    # (All the keys the first time in this window and after ?, then the short form.)
+    $full = (-not $script:EntryHelpShown) -or $script:EntryHelpFull
+    $script:EntryHelpShown = $true
+    $script:EntryHelpFull = $false
+    if (-not $full) {
+      if ($dlm) {
+        Say (T '  - a title, a link, a magnet or a .torrent file, then Enter')
+        Say (T '  - Enter alone = open the folder with the downloads')
+      } else {
+        Say (T '  - a title, a link, a magnet or dropped files, then Enter')
+        Say (T '  - Enter alone = pick files')
+      }
+      $letters = @(@(Get-MenuItems -WithMenu) | Where-Object { $_.Letter -and $_.Letter -ne '?' -and (Test-MenuItemOn $_) } | ForEach-Object { $_.Letter })
+      if ($side) { Say (T '  - ? = all keys,  Esc = close this window') 'DarkGray' }
+      else { Say (T '  - ? = all keys and menus ({0}, Back / Forward),  Q + Enter = end' ($letters -join ' ')) 'DarkGray' }
+    }
+    if ($full -and (Get-Command Find-SiteContent -CommandType Function -ErrorAction SilentlyContinue)) {
       Say (T '  - Type a title (anime, film, series - in Russian or English) and press Enter to search for it')
     }
-    Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
-    if ($dlm) {
-      Say (T '  - or paste a magnet link or a .torrent file')
-      Say (T '  - or just press Enter to open the folder with the downloads')
-    } else {
-      Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
-      Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
-      Say (T '  - or just press Enter to pick files')
+    if ($full) {
+      Say (T '  - or paste a link (a video, Dream Cast, AniLiberty, AnimeVost, AnimeGO, AnimeLib, WPARTY, Kodik...) and press Enter')
+      if ($dlm) {
+        Say (T '  - or paste a magnet link or a .torrent file')
+        Say (T '  - or just press Enter to open the folder with the downloads')
+      } else {
+        Say (T '  - or paste a magnet link or a .torrent file (it downloads first, then plays)')
+        Say (T '  - or drag video files (or a whole folder) into this window, then press Enter')
+        Say (T '  - or just press Enter to pick files')
+      }
+      if ((Test-HasTranslations) -and -not $side) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
+      if ($hostKeys) { Say (T '  - H = where to stream (Topaz / this PC / your VPS),  T = test your upload speed,  N = new link') 'DarkGray' }
+      if (-not $side) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
+      if (-not $dlm) { Say (T '  - D = download videos to this PC instead (no stream; a window of its own)') 'DarkGray' }
+      if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
+      if ($side) { Say (T '  - ? = this list again') 'DarkGray' } else { Say (T '  - ? = this list again, with the full link help') 'DarkGray' }
+      if ($script:UpdateFound -and -not $side) { Say (T '  - U = update to {0}' $script:UpdateFound.Tag) 'Green' }
+      if ($side) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
     }
-    if ((Test-HasTranslations) -and -not $side) { Say (T '  - or type L and press Enter to change the language') 'DarkGray' }
-    $hostKeys = ((Test-HostModule) -and $script:HostP -and -not $side)
-    if ($hostKeys) { Say (T '  - H = where to stream (Topaz / this PC / your VPS),  T = test your upload speed,  N = new link') 'DarkGray' }
-    if (-not $side) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
-    if (-not $dlm) { Say (T '  - D = download videos to this PC instead (no stream; a window of its own)') 'DarkGray' }
-    if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
-    if ($side) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
     $line = ''
     $picked = $null
     # (The control window's input box answers this question too: a line, or files picked / dropped there.)
     $la = $null
     if ($keys) {
       $script:NavAskSeq++
-      $la = @{ Id = $script:AskIdPrefix + $script:NavAskSeq; Kind = 'line'; Title = $ask; Deadline = $null }
+      $la = @{ Id = $script:AskIdPrefix + $script:NavAskSeq; Kind = 'line'; Title = $ask; Deadline = $null; Start = (-not $side) }
       $b = $script:UiBus
       if ($b) { $x = $null; while ($b.Answers.TryDequeue([ref]$x)) {}; $b.Ask = $la }
     }
@@ -2056,6 +2186,17 @@ function Read-Entries([string]$Prefill = '') {
     }
     # Q + Enter (or "quit"; on a Russian keyboard layout the Q key types U+0439) = end.
     if ($line -match '^\s*(?:q|quit|\u0439)\s*$') { return @($script:QuitMark) }
+    # ? + Enter (or "help"; the ? key on a Russian layout types a comma with Shift): all the keys, and the full link help.
+    if ($line -match '^\s*(?:\?|help|,)\s*$') {
+      $script:EntryHelpFull = $true
+      if (-not $side -and $script:Cfg -and $script:ShownLink) { Show-Links -Full }
+      continue
+    }
+    # U + Enter: the newer version found at start (Receive-UpdateCheck) is offered (the U key types U+0433 in Russian).
+    if (-not $side -and $script:UpdateFound -and $line -match '^\s*(?:u|update|\u0433)\s*$') {
+      if (Invoke-UpdateOffer) { return @($script:QuitMark) }
+      continue
+    }
     # The menu letters (Get-MenuItems): H / V / T / N / L, D = a download window, and M = the settings menu.
     $mi = Get-MenuItemFor $line
     if ($mi -and $mi.Id -eq 'download') {
@@ -4878,6 +5019,8 @@ function Wait-Pump([double]$seconds) {
 # While this thread waits (a question, a pause) the window gets its state from here.
 function Invoke-PanelPump {
   if (-not $script:PanelShown) { return }
+  if ($null -ne $script:PanelWaitUntil) { Confirm-PanelStarted; if (-not $script:PanelShown) { return } }
+  if ($script:UpdateJob) { try { Receive-UpdateCheck -Quiet } catch {} }
   try {
     # (While a question waits nothing else updates the window: on / off and the link follow here.)
     $s = $script:PanelState
@@ -5129,6 +5272,11 @@ function Wait-AskInput($Ask) {
     if ($win) {
       $w = Receive-UiAnswer ([string]$Ask.Id)
       if ($w) { return $w }
+      # (A click on the window's "is out" bar: as if U + Enter was typed on the start screen.)
+      if ($Ask.Start -and $script:UpdateFound -and $script:UiBus.UpdateReq) {
+        $script:UiBus.UpdateReq = $false
+        return @{ Window = $true; Nav = ''; Text = 'u'; Pick = $null; Yes = $null; Files = $null; Prefilled = $false }
+      }
     }
     Test-UiQuit
     if ($Ask.Deadline -and [DateTime]::UtcNow -ge [DateTime]$Ask.Deadline) { return @{ Timeout = $true; Nav = ''; Text = '' } }
@@ -6052,7 +6200,7 @@ function Resolve-Cmd($c, [string]$kind, [ref]$why) {
     'content' { @('pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'sync', 'lost', 'restart', 'playnow', 'audio', 'subs') }
     'paused' { @('resume', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow', 'audio', 'subs') }
     'hold' { @('start', 'pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow', 'audio', 'subs') }
-    default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest', 'lang', 'forget', 'menu') }
+    default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest', 'lang', 'forget', 'help', 'menu') }
   }
   # The waiting screen while a torrent episode downloads for its turn: S S gives that episode up.
   if ($kind -eq 'waiting' -and (Get-WaitingSkipItem)) { $fits = @($fits) + @('skip') }
@@ -8267,11 +8415,38 @@ function Initialize-StreamSettings {
   $script:ShownLink = Get-ShownLink
 }
 
-function Show-Links {
+# The link block. In full the first time a link is shown (config.json "LinkHelpFor" remembers which one, as a short
+# hash), after a host change, with -Full (? on the start screen, "Link help" in the menu); after that the short form:
+# the link, the Quest link, the quality line and how to get the rest.
+function Show-Links([switch]$Full) {
   $c = $script:Cfg
+  $seen = ''
+  try {
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    $seen = ([BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$script:ShownLink))) -replace '-', '').Substring(0, 12)
+  } catch {}
+  if (-not $Full -and (-not $seen -or [string](Get-Prop $c 'LinkHelpFor') -ne $seen)) { $Full = $true }
+  if ($Full -and $seen -and [string](Get-Prop $c 'LinkHelpFor') -ne $seen) {
+    try {
+      if ($c.PSObject.Properties['LinkHelpFor']) { $c.LinkHelpFor = $seen } else { $c | Add-Member -NotePropertyName 'LinkHelpFor' -NotePropertyValue $seen }
+      Save-Config $c
+    } catch {}
+  }
   Say ''
   Say ('=' * 70) 'DarkCyan'
-  if ($script:HostP) {
+  if (-not $Full) {
+    if ($script:HostP) { Show-HostLinks $script:HostP $script:ShownLink -Short }
+    else {
+      Say (T '  YOUR VRCHAT LINK  (via {0})' (T $c.Server)) 'White'
+      Say ''
+      Say "      $($script:ShownLink)" 'Green'
+      Say ''
+      if ($c.QuestUrl) { Say (T '  Quest / Android viewers use:  {0}' $c.QuestUrl) 'Gray' }
+    }
+    Show-StreamQuality
+    Say (T '  ? + Enter = the full link help (world-player commands, VLC, untrusted-URL notes).') 'DarkGray'
+  }
+  elseif ($script:HostP) {
     Show-HostLinks $script:HostP $script:ShownLink
   } else {
     Say (T '  YOUR VRCHAT LINK  (via {0})' (T $c.Server)) 'White'
@@ -8281,9 +8456,11 @@ function Show-Links {
     if ($c.QuestUrl) { Say (T '  Quest / Android viewers use:  {0}' $c.QuestUrl) 'Gray' }
     if ($c.VlcUrl) { Say (T '  To test it on your PC in VLC: {0}' $c.VlcUrl) 'Gray' }
   }
-  Say (T '  Put the world''s video player in Stream / Live mode and paste the link.') 'Gray'
-  Say (T '  The link stays the same every time you use this tool.') 'Gray'
-  if ($script:VrcLog) {
+  if ($Full) {
+    Say (T '  Put the world''s video player in Stream / Live mode and paste the link.') 'Gray'
+    Say (T '  The link stays the same every time you use this tool.') 'Gray'
+  }
+  if ($Full -and $script:VrcLog) {
     $sep = '?'
     if ($script:ShownLink -match '\?') { $sep = '&' }
     Say ''
@@ -8291,9 +8468,10 @@ function Show-Links {
     Say (T '  at the end:  {0}pause  {0}play  {0}back (10 s back)  {0}next  {0}sync (everyone reconnects)' $sep) 'Gray'
     Say (T '  The TV''s own pause / play buttons work too (ProTV, iwaSync3, YamaPlayer).') 'Gray'
   }
-  Show-StreamQuality
+  if ($Full) { Show-StreamQuality }
   Say ('=' * 70) 'DarkCyan'
-  if ($script:IsWin -and -not $env:VRCLM_AUTO) {
+  # (VRCLM_NO_CLIPBOARD: the test rig's interactive runs leave the clipboard alone.)
+  if ($script:IsWin -and -not $env:VRCLM_AUTO -and -not $env:VRCLM_NO_CLIPBOARD) {
     try { Set-Clipboard -Value $script:ShownLink; Say (T '  (The link is copied to your clipboard.)') 'DarkGray' } catch {}
   }
 }
@@ -8441,7 +8619,7 @@ function Invoke-HostMenu([string]$Pick = '') {
       Stop-HostServer
       Set-ActiveHost
       Reset-VrcPlayer
-      Show-Links
+      Show-Links -Full
       Start-Standby
     }
   } finally { $script:PromptOk = $was }
@@ -8471,7 +8649,7 @@ function Use-VpsCode([string]$line) {
     Stop-HostServer
     Set-ActiveHost
     Reset-VrcPlayer
-    Show-Links
+    Show-Links -Full
     Start-Standby
   } finally { $script:PromptOk = $was }
 }
@@ -8544,7 +8722,7 @@ function Invoke-NewLinkMenu {
         Set-ActiveHost
       }
       Reset-VrcPlayer
-      Show-Links
+      Show-Links -Full
       Start-Standby
     }
   } finally { $script:PromptOk = $was }
@@ -9185,7 +9363,56 @@ function Invoke-DownloadMain([string[]]$entries) {
   }
 }
 
+# How long the start takes (seconds since this process started; VRCLM_LAUNCH_TICKS, UTC ticks, can give an earlier
+# moment, e.g. when the .bat started). Add-StartMark notes a step; Show-StartupTime says it once the start screen is up.
+$script:LaunchAt = $null
+$script:StartMarks = New-Object System.Collections.ArrayList
+$script:StartTimed = $false
+function Get-StartupSeconds {
+  if ($null -eq $script:LaunchAt) {
+    $t = [DateTime]::UtcNow
+    try { $t = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime() } catch {}
+    try { if ($env:VRCLM_LAUNCH_TICKS) { $t = New-Object DateTime ([long]$env:VRCLM_LAUNCH_TICKS), ([System.DateTimeKind]::Utc) } } catch {}
+    $script:LaunchAt = $t
+  }
+  return ([DateTime]::UtcNow - $script:LaunchAt).TotalSeconds
+}
+function Add-StartMark([string]$name, $at = $null) {
+  if ($script:StartTimed) { return }
+  try {
+    $s = 0.0
+    if ($at -is [DateTime]) { [void](Get-StartupSeconds); $s = ($at - $script:LaunchAt).TotalSeconds } else { $s = Get-StartupSeconds }
+    [void]$script:StartMarks.Add(@($name, $s))
+  } catch {}
+}
+function Get-StartMark([string]$name) {
+  foreach ($m in $script:StartMarks) { if ($m[0] -eq $name) { return [double]$m[1] } }
+  return -1.0
+}
+# "Ready in 3.1 s (window at 0.9 s, on the air at 2.8 s)" in the console, and every step in log.txt.
+function Show-StartupTime {
+  if ($script:StartTimed) { return }
+  Add-StartMark 'ready'
+  $script:StartTimed = $true
+  try {
+    $f = { param($x) ([Math]::Round([double]$x, 1)).ToString('0.0', $script:Inv) }
+    $win = Get-StartMark 'window'
+    if ($win -lt 0 -and $script:PanelSync -and $script:PanelSync.ReadyAt -is [DateTime]) { $win = ($script:PanelSync.ReadyAt - $script:LaunchAt).TotalSeconds }
+    $air = Get-StartMark 'on air'
+    $ready = Get-StartMark 'ready'
+    $parts = @()
+    if ($win -ge 0) { $parts += (T 'window at {0} s' (& $f $win)) }
+    if ($air -ge 0) { $parts += (T 'on the air at {0} s' (& $f $air)) }
+    $line = T 'Ready in {0} s' (& $f $ready)
+    if ($parts.Count -gt 0) { $line += ' (' + ($parts -join ', ') + ')' }
+    Say ('  ' + $line + '.') 'DarkGray'
+    Write-LogLine ('  (startup: ' + ((@($script:StartMarks) | ForEach-Object { $_[0] + ' ' + (& $f $_[1]) }) -join ', ') + ')')
+  } catch {}
+}
+
 function Main {
+  [void](Get-StartupSeconds)
+  Add-StartMark 'main'
   Initialize-Language (Get-LanguageSetting)
   # (The control window is "VRChat Link Maker": this console says what it is, so the two differ in the taskbar.)
   try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - console') } catch {}
@@ -9240,14 +9467,27 @@ function Main {
     Select-Language
   }
   $script:Cfg = Get-Config
+  Add-StartMark 'config'
   # How long the waiting screen stays on with nothing queued (config.json "IdleMinutes"; the rig's VRCLM_IDLE_MIN wins).
   if (-not $env:VRCLM_IDLE_MIN) { $script:IdleMinutes = [double](Get-NumSetting 'IdleMinutes' 15 3 600) }
-  if ((Get-Command Invoke-UpdateCheck -CommandType Function -ErrorAction SilentlyContinue) -and (Invoke-UpdateCheck)) { return }
+  # A newer version is looked for in the background: the start doesn't wait for GitHub (Receive-UpdateCheck says it).
+  if (Get-Command Start-UpdateCheck -CommandType Function -ErrorAction SilentlyContinue) { Start-UpdateCheck }
+  # The control window opens first ("Starting..."), so what the checks below say, and their questions, are in it too.
+  $script:PanelShown = $false
+  if ($script:Interactive -and (Get-BoolSetting 'ControlWindow' $true) -and (Get-Command Open-ControlPanel -CommandType Function -ErrorAction SilentlyContinue)) {
+    [void](Initialize-Helper)   # (the window comes to the front and gives the console its icon through it)
+    try { $script:PanelShown = [bool](Open-ControlPanel -NoWait -Front) } catch {}
+    if ($script:PanelShown) {
+      $script:PanelState = @{ Mode = 'starting'; Prompt = $true; Link = ''; Status = '' }
+      Update-ControlPanel $script:PanelState
+    }
+  }
   if (Test-HostModule) {
     # Older config.json files get "Host" / "StreamKey" (same link as before) and the self-host settings.
     try { if (Initialize-HostConfig) { Save-Config $script:Cfg } } catch { Say (T 'Couldn''t update config.json: {0}' $_.Exception.Message) 'Yellow' }
   }
   Initialize-Tools
+  Add-StartMark 'tools'
   $script:VideoKbps = [int]$script:Cfg.VideoKbps
   if ($script:VideoKbps -lt 200) { $script:VideoKbps = 1350 }
   if (-not (Test-HostModule) -and $script:Cfg.IngestUrl -match '(?i)topaz\.chat' -and $script:VideoKbps -eq 1700 -and [int]$script:Cfg.AudioKbps -eq 128) {
@@ -9258,20 +9498,22 @@ function Main {
   $script:BaseKbps = $script:VideoKbps
   Initialize-StreamSettings
   Update-StreamQuality
+  # (The encoder test runs while the fonts and the waiting screen get ready; Select-VideoEncoder takes its answer.)
+  Start-EncoderTest
   Initialize-Fonts
   Initialize-Slate
-  $script:VEnc = Select-VideoEncoder
-  Say (T 'Encoding with: {0}' (Get-EncoderName $script:VEnc)) 'DarkGray'
   Set-ActiveHost
+  Add-StartMark 'host'
   Start-WorldPlayerControl
   Show-Links
-  if ($script:Interactive -and (Get-BoolSetting 'ControlWindow' $true) -and (Get-Command Open-ControlPanel -CommandType Function -ErrorAction SilentlyContinue)) {
-    $script:PanelShown = $false
-    try { $script:PanelShown = [bool](Open-ControlPanel) } catch {}
-  }
+  Add-StartMark 'links'
+  # (The encoder test's answer only now: it ran meanwhile, during the host check and the link block.)
+  Complete-EncoderChoice
+  if ($script:PanelShown) { Confirm-PanelStarted }
   if ($script:Interactive -or $env:VRCLM_STANDBY) {
     # On the air right away (with the waiting screen), so the link works in the world's player from now on.
     Start-Standby
+    if (Test-RelayAlive) { Add-StartMark 'on air' }
     if (Test-RelayAlive) { Say (T '  The stream is on the air (waiting screen), so you can put the link in the world''s player now.') 'DarkGray' }
   }
   # The control window shows the link and the waiting screen (or 'Off') during the questions below too, with Next /
@@ -9280,6 +9522,7 @@ function Main {
     Update-Panel 'waiting' $null 0 ''
     if ($script:PanelState) { $script:PanelState.Prompt = $true; try { Update-ControlPanel $script:PanelState } catch {} }
   }
+  if (Get-Command Receive-UpdateCheck -CommandType Function -ErrorAction SilentlyContinue) { Receive-UpdateCheck }
 
   $script:PromptOk = $true
   try {
@@ -9288,12 +9531,16 @@ function Main {
     $prefill = ''
     if ($entries.Count -eq 1) { $prefill = [string]$entries[0] }
     $again = ($script:Interactive -and ($script:HasConsole -or $script:KeySource))
+    Show-StartupTime
     while ($true) {
       if ($entries.Count -eq 0) {
         $entries = @(Read-Entries $prefill)
         $prefill = $script:EntryLine
       }
-      if ($entries -contains $script:QuitMark) { $script:EndReason = T 'Nothing to stream.'; Say $script:EndReason 'Yellow'; return }
+      if ($entries -contains $script:QuitMark) {
+        if ($script:RestartAfterUpdate) { return }   # (U on the start screen updated the tool: it starts again)
+        $script:EndReason = T 'Nothing to stream.'; Say $script:EndReason 'Yellow'; return
+      }
       [void](Invoke-NavFlow -Name 'start' -Origin 'start' -Snap $script:SiteAnswerVars -Body {
           [void](Add-Entries $entries $false)
           if ($script:Queue.Count -gt 0) { Show-Queue; Invoke-ResumeOffer }
@@ -9349,9 +9596,11 @@ try {
   if ($script:KeepPanel) { try { Show-EndedPanel } catch {} }
   Stop-Everything
 }
+# (The console's own icon back: Set-PanelStartLook gave it the window's.)
+if ((Get-Command Restore-ConsoleIcon -CommandType Function -ErrorAction SilentlyContinue) -and -not $script:KeepPanel) { Restore-ConsoleIcon }
 if ($script:RestartAfterUpdate -and (Restart-AfterUpdate)) { exit 0 }
 # (Exit code 0 also after an error here: the window showed it, so the .bat need not pause as well.)
-if ($script:KeepPanel) { Wait-EndedPanel; exit 0 }
+if ($script:KeepPanel) { Wait-EndedPanel; if (Get-Command Restore-ConsoleIcon -CommandType Function -ErrorAction SilentlyContinue) { Restore-ConsoleIcon }; exit 0 }
 if ($script:Interactive -and -not $script:NoPause) {
   # From the .bat: after an error its own pause keeps the window open (exit code 1); after a normal end the window
   # closes by itself. Started some other way, the window waits for Enter as before.
