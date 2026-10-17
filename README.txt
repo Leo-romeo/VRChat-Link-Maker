@@ -633,6 +633,10 @@ All of these are optional.
   ControlWindow       true (the default) opens the control window.
   IdleMinutes         15. With nothing queued, the waiting screen ends after
               this many minutes (3 to 600).
+  SummaryStep         true (the default): after the questions for a show with
+              2 or more episodes, one line sums them up ("Overlord II,
+              AniLibria, episodes 1-13") - Enter = go, Esc = back.
+              false skips it.
   AskTimeoutSec       60. A question about the next video asked while viewers
               wait (audio / subtitles, which player, installing yt-dlp,
               downloading rqbit) takes the suggested answer after this many

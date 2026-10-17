@@ -6036,9 +6036,10 @@ function Expand-NyaaGroup([string]$u) {
   return $items
 }
 
-# One result as a line of the list: Title (Year) - kind - extra [source]
+# One result as a line of the list: Title (Year) - kind - extra [source]. The whole title (the part that tells two releases apart is often at its end: year, "BATCH", "1080p"): the console
+# wraps a long row under itself (Format-AskOption), the control window's list shows it whole on hover.
 function Format-SearchRow($r) {
-  $s = Get-ShortText ([string]$r.Title) 70
+  $s = Get-ShortText ((([string]$r.Title) -replace '\s+', ' ').Trim()) 200
   if ($r.Year) { $s += " ($($r.Year))" }
   if ($r.Kind) { $s += " - $($r.Kind)" }
   if ($r.Extra) { $s += " - $($r.Extra)" }
@@ -6070,6 +6071,7 @@ function Invoke-ContentSearch([string]$query, [switch]$AskPlayer) {
   catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
   if ($items.Count -eq 0) { return @() }
   if ($AskPlayer) { Read-HandoverPlayer $items }
+  if (Get-Command Confirm-SiteSummary -CommandType Function -ErrorAction SilentlyContinue) { Confirm-SiteSummary $items ([string]$row.Title) }
   if (@($items | Where-Object { $_.Kind -ne 'torrent' }).Count -eq 0) {
     # Torrents ([EN] rows): their own links (magnets, .torrent files) with the episodes, so the streaming window
     # doesn't look the site up again (a wait while a video plays). Several links: an array.

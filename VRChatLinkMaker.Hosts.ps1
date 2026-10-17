@@ -3503,6 +3503,8 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
     $out.Result = $u
     if (-not $u.Ok) { Say (T 'The speed test did not work ({0}).' $u.Error) 'Yellow'; return $out }
     Say (T 'Upload: {0} Mbps.' (Format-Num ([Math]::Round($u.Kbps / 1000.0, 1)))) 'Green'
+    # (Kept for the menu's "Upload speed test (last: ...)", Save-SpeedTestLast.)
+    if (-not $NoSave -and (Test-HostFn 'Save-SpeedTestLast')) { Save-SpeedTestLast $p.Id $u.Kbps }
     $counts = @(2, 5, 10)
     $opts = @()
     $vals = @()
@@ -3568,6 +3570,7 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   }
   Say (T 'Result: {0}x real time, about {1} kbps of video got through.' (Format-Num ([Math]::Round($r.NetSpeed, 2))) $r.EffectiveKbps) 'Green'
   if ($r.NetSpeed -ge 0.95) { Say (T 'The whole test stream got through, so the line may take even more.') 'DarkGray' }
+  if (-not $NoSave -and -not $Target -and (Test-HostFn 'Save-SpeedTestLast')) { Save-SpeedTestLast $p.Id $r.EffectiveKbps }
   $rec = Get-Floor50 ([Math]::Min($r.EffectiveKbps * 0.8, $maxK))
   if ($rec -lt $minK) {
     Say (T 'That is below {0} kbps, the lowest this tool uses for this host: expect stutter.' $minK) 'Yellow'

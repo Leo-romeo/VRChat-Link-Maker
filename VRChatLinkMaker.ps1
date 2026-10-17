@@ -1522,7 +1522,9 @@ function Get-SidecarAudio([string]$videoPath, [string[]]$more = @()) {
   return $res.ToArray()
 }
 
-function Get-TrackLabel($t, [bool]$short = $false) {
+# A track's name. $short: without channels / [default] (the Now streaming line); -List: also a long staff list cut to
+# its first two names and "N more" (the audio / subtitles lists; the whole name stays in the log and on hover).
+function Get-TrackLabel($t, [bool]$short = $false, [switch]$List) {
   $parts = @()
   $ln = $null
   if ($t.Lang) {
@@ -1530,7 +1532,7 @@ function Get-TrackLabel($t, [bool]$short = $false) {
     if (-not $ln -and $t.Lang -notmatch '^(?i)und$') { $ln = $t.Lang.ToUpperInvariant() }
   }
   if ($ln) { $parts += (T $ln) }
-  if ($t.Title -and $t.Title -ne $ln -and $t.Title -ne (T $ln)) { $parts += $t.Title }
+  if ($t.Title -and $t.Title -ne $ln -and $t.Title -ne (T $ln)) { if ($List) { $parts += (Get-StaffShort ([string]$t.Title)) } else { $parts += $t.Title } }
   if ($parts.Count -eq 0) { if ($t.Kind -eq 'audio') { $parts += (T 'Audio track') } else { $parts += (T 'Subtitle track') } }
   $s = $parts -join ' - '
   if (-not $short) {
@@ -1539,6 +1541,27 @@ function Get-TrackLabel($t, [bool]$short = $false) {
     if ($t.Default -and $t.Kind -ne 'external') { $s += (T '   [default]') }
   }
   return $s
+}
+
+# "AniLibria (Anzen, Lupin, Silv, Hekomi, Kari)" -> "AniLibria (Anzen, Lupin and 3 more)": a list of 3 or more names (in
+# the last brackets, or the whole title) cut to two; then at most 80 characters.
+function Get-StaffShort([string]$title) {
+  $s = ($title -replace '\s+', ' ').Trim()
+  $cut = {
+    param([string]$x)
+    $names = @($x -split '\s*(?:,|;|\s&\s|\s/\s)\s*' | Where-Object { $_ })
+    if ($names.Count -lt 3) { return $null }
+    return (T '{0}, {1} and {2} more' $names[0] $names[1] ($names.Count - 2))
+  }
+  $m = [regex]::Match($s, '^(.*[\(\[])([^\(\)\[\]]+)([\)\]])\s*$')
+  if ($m.Success) {
+    $c = & $cut $m.Groups[2].Value
+    if ($c) { $s = $m.Groups[1].Value + $c + $m.Groups[3].Value }
+  } else {
+    $c = & $cut $s
+    if ($c) { $s = $c }
+  }
+  return (Get-ShortText $s 80)
 }
 
 # Signs / songs only (not the whole dialogue): also Russian titles ("Nadpisi", "Znaki"; .NET regex escapes keep this file ASCII).
@@ -1613,13 +1636,14 @@ function Find-TrackMatch($tracks, [string]$lang, [string]$title, [bool]$signs, [
 # inside a flow it gets a "0) Back / Cancel (or Esc)" line (when 0 isn't "None") and marks your earlier answer.
 # -Key: the step's name; -Values: what each option stands for (kept instead of the position, so a re-run finds the
 # same pick in a changed list); -Esc: the index Esc gives on a one-off question (marked "<- Esc"); -NoneLabel: the
-# whole "0) ..." line instead of "0) None".
+# whole "0) ..." line instead of "0) None"; -Gaps: the options with a blank line before them in the console.
 function Read-Choice {
   [CmdletBinding(PositionalBinding = $false)]
   param([Parameter(Position = 0)][string]$title, [Parameter(Position = 1)][string[]]$options, [Parameter(Position = 2)][int]$default,
     [Parameter(Position = 3)][bool]$allowNone, [string]$Key = '', [object[]]$Values = $null, [object]$Esc = $null, [string]$NoneLabel = '',
-    [switch]$EnterDefault)
+    [switch]$EnterDefault, [int[]]$Gaps = @())
   $a = New-NavAsk 'choice' $title $Key
+  $a.Gaps = @($Gaps)   # (the console's list has a blank line before these options: the settings menu's groups)
   $a.EnterDefault = [bool]$EnterDefault   # (just Enter = $default even when it was answered before: Right arrow = that)
   $a.Options = @($options)
   $a.Default = $default
@@ -1694,7 +1718,7 @@ function Select-Tracks($item) {
     $tr = Invoke-NavFlow -Name 'tracks' -Own -Body {
       $ap = $aPos
       if ($audio.Count -gt 1) {
-        $labels = @($audio | ForEach-Object { Get-TrackLabel $_ })
+        $labels = @($audio | ForEach-Object { Get-TrackLabel $_ -List })
         $ap = Read-Choice (T 'Which audio track?') $labels $aPos $false -Key 'audio'
       }
       $at = $null
@@ -1702,7 +1726,7 @@ function Select-Tracks($item) {
       $sp = Get-DefaultSubPos $subs $at
       if ($sp -lt 0) { $sp = $sitePos }
       if ($subs.Count -gt 0) {
-        $labels = @($subs | ForEach-Object { Get-TrackLabel $_ })
+        $labels = @($subs | ForEach-Object { Get-TrackLabel $_ -List })
         $sp = Read-Choice (T 'Which subtitles? (they get drawn into the picture)') $labels $sp $true -Key 'subs'
       }
       @{ A = $ap; S = $sp }
@@ -1923,7 +1947,13 @@ function Resolve-Entries([string[]]$entries) {
       continue
     }
     if (Test-SiteLink $u) {
-      try { foreach ($it in @(Expand-SiteLink $u)) { if ($it) { [void]$items.Add($it) } } }
+      try {
+        $script:LastDub = $null; $script:LastEps = $null; $script:LastPlayer = $null
+        $its = @(Expand-SiteLink $u | Where-Object { $_ })
+        # (Not for a link that brings its answers along, #vrclm=: they were summed up where they were given.)
+        if (-not (Split-SiteChoice $u)[1]) { Confirm-SiteSummary $its }
+        foreach ($it in $its) { [void]$items.Add($it) }
+      }
       catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $u 70) $_.Exception.Message) 'Yellow' }
       continue
     }
@@ -2002,8 +2032,19 @@ function Get-MenuItems([switch]$WithMenu) {
     @{ Id = 'download'; Label = (T 'Download videos to this PC (no stream)...'); Letter = 'D'; Need = ''; Re = '^\s*(?:d|download|\u0432|\u0441\u043a\u0430\u0447\u0430\u0442\u044c)\s*$' },
     # (? itself is read by Read-Entries: it also prints all the start screen's keys.)
     @{ Id = 'help'; Label = (T 'Link help'); Letter = '?'; Need = ''; Re = '' },
-    @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' }
+    @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' },
+    @{ Id = 'more'; Label = (T 'More settings...'); Letter = ''; Need = ''; Re = '' },
+    @{ Id = 'config'; Label = (T 'Open config.json'); Letter = ''; Need = ''; Re = '' }
   )
+  # In groups (the console's list has a blank line between them, the window's menu a separator): Stream, This session,
+  # Tool. The speed test says its last result, so it can be skipped.
+  $order = @{ host = 0; res = 0; speedtest = 0; newlink = 0; help = 0; forget = 1; lang = 2; download = 2; more = 2; config = 2 }
+  $names = @('stream', 'session', 'tool')
+  foreach ($it in $items) {
+    $it.Group = $names[$order[$it.Id]]
+    if ($it.Id -eq 'speedtest') { $last = Get-SpeedTestLastText; if ($last) { $it.Label = T 'Upload speed test (last: {0})' $last } }
+  }
+  $items = @(foreach ($g in $names) { $items | Where-Object { $_.Group -eq $g } })
   if ($WithMenu) { $items += @{ Id = 'menu'; Label = (T 'Settings'); Letter = 'M'; Need = ''; Re = '^\s*(?:m|menu|\u044c)\s*$' } }
   return $items
 }
@@ -2033,6 +2074,8 @@ function Invoke-MenuAction([string]$id, $pick = $null) {
     'lang' { if ($null -ne $pick) { Invoke-LanguageMenu $pick } else { Invoke-LanguageMenu } }
     'forget' { Clear-AskedPrefs }
     'help' { if ($script:Cfg) { Show-Links -Full }; $script:EntryHelpFull = $true }
+    'more' { if ($null -ne $pick) { Invoke-MoreSettings ([string]$pick) } else { Invoke-MoreSettings } }
+    'config' { Open-ConfigFile }
     'download' { Open-DownloadWindow }
     'menu' { Invoke-SettingsMenu }
   }
@@ -2070,6 +2113,7 @@ function Invoke-SettingsMenu {
   $items = @(Get-MenuItems | Where-Object { Test-MenuItemOn $_ })
   $labels = @($items | ForEach-Object { if ($_.Letter) { $_.Label + '   (' + $_.Letter + ')' } else { $_.Label } })
   $ids = @($items | ForEach-Object { $_.Id })
+  $gaps = @(for ($i = 1; $i -lt $items.Count; $i++) { if ($items[$i].Group -ne $items[$i - 1].Group) { $i } })
   $was = $script:PromptOk
   $script:PromptOk = $true
   try {
@@ -2078,7 +2122,7 @@ function Invoke-SettingsMenu {
       $r = Invoke-NavFlow -Name 'settings' -Origin 'menu' -Cfg -Body {
         $st.Task = $false
         Say ''
-        $i = Read-Choice (T 'Settings') $labels -1 $true -Key 'menu' -Values $ids -NoneLabel (T '   0) Back (or Esc)') -EnterDefault
+        $i = Read-Choice (T 'Settings') $labels -1 $true -Key 'menu' -Values $ids -NoneLabel (T '   0) Back (or Esc)') -Gaps $gaps -EnterDefault
         if ($i -ge 0) { $st.Task = $true; Invoke-MenuAction $ids[$i] }
       }
       if ($r.Nav -eq 'home' -and $st.Task) { continue }
@@ -2703,6 +2747,61 @@ function Get-PlayerPref($item) {
   # (Kept for the session only when someone answered: a question that timed out asks again next time.)
   if ($script:AskTimeouts -eq $tos) { $script:PlayerPref = $pick }
   return $pick
+}
+
+# The summary step after a show's questions: "Overlord II, AniLibria, episodes 1-13, player Auto" with Go / Back, so a
+# wrong voice-over or episode range shows up before it goes on the air. Only for 2 or more episodes from a site (a file
+# or a single video skips it), only when questions were asked in this flow (Back has somewhere to go), and not when
+# "SummaryStep": false is in config.json. $title: the show's name (else taken from the first episode's name).
+function Confirm-SiteSummary($items, [string]$title = '') {
+  $site = @(@($items) | Where-Object { $_ -and $_.Kind -eq 'site' })
+  if ($site.Count -lt 2 -or $script:DownloadMode) { return }
+  if (-not (Get-BoolSetting 'SummaryStep' $true)) { return }
+  $f = $script:Nav
+  if (-not $f -or $f.Sealed -or $f.Tape.Count -eq 0 -or -not (Test-CanAsk)) { return }
+  $parts = @()
+  if (-not $title) { $title = Get-SummaryTitle ([string]$site[0].Name) }
+  if ($title) { $parts += (Get-ShortText $title 60) }
+  if ($script:LastDub) { $parts += [string]$script:LastDub }
+  $nums = @($script:LastEps)
+  if ($nums.Count -eq 0) { $parts += (T '{0} episodes' $site.Count) }
+  elseif ($nums.Count -eq 1) { $parts += (T 'episode {0}' $nums[0]) }
+  else { $parts += (T 'episodes {0}' (Format-EpisodeRanges $nums)) }
+  $pl = ''
+  if ($script:LastPlayer) { $pl = [string]$script:LastPlayer }
+  elseif ($script:PlayerPref) { $pl = [string]$script:PlayerPref }
+  else { $v = "$(Get-Prop $script:Cfg 'Player')".Trim().ToLowerInvariant(); if ($v -and $v -ne 'ask') { $pl = $v } }
+  if ($pl -eq 'auto') { $parts += (T 'player Auto') } elseif ($pl) { $parts += (T 'player {0}' (Get-ProviderTitle $pl)) }
+  Say ''
+  # (Esc or 0 = back to the last question; just Enter = go.)
+  [void](Read-Choice ($parts -join ', ') @((T 'Go')) 0 $false -Key 'summary')
+}
+
+# "Overlord II - episode 3" -> "Overlord II" (the name New-SiteItem got: '{0} - episode {1}').
+function Get-SummaryTitle([string]$name) {
+  $fmt = [regex]::Escape((T '{0} - episode {1}')) -replace '\\\{0}', '(?<t>.+)' -replace '\\\{1}', '.+'
+  $m = [regex]::Match($name, '^' + $fmt + '$')
+  if ($m.Success) { return $m.Groups['t'].Value }
+  return $name
+}
+
+# @('1','2','3','5','7','8') -> "1-3, 5, 7-8" (names that aren't numbers as they are); at most 60 characters.
+function Format-EpisodeRanges($nums) {
+  $out = @()
+  $a = $null; $b = $null
+  foreach ($x in @($nums)) {
+    $n = 0
+    if ([int]::TryParse([string]$x, [ref]$n)) {
+      if ($null -ne $b -and $n -eq $b + 1) { $b = $n; continue }
+      if ($null -ne $a) { if ($a -eq $b) { $out += "$a" } else { $out += "$a-$b" } }
+      $a = $n; $b = $n
+    } else {
+      if ($null -ne $a) { if ($a -eq $b) { $out += "$a" } else { $out += "$a-$b" }; $a = $null; $b = $null }
+      $out += [string]$x
+    }
+  }
+  if ($null -ne $a) { if ($a -eq $b) { $out += "$a" } else { $out += "$a-$b" } }
+  return (Get-ShortText ($out -join ', ') 60)
 }
 
 # A second window (it hands what it found to the streaming one, which can't ask while a video plays) asks here which
@@ -5355,7 +5454,7 @@ function Publish-UiAsk($a, [bool]$canHome = $false) {
   if (-not $title) { $title = [string]$a.Prompt }
   if ($kind -eq 'yesno') { $title = $title -replace '\s*\[[^\[\]]{1,8}/[^\[\]]{1,8}\]\s*:?\s*$', '' }
   $v = @{ Id = [string]$a.Id; Kind = $kind; Title = $title.Trim(); Options = [string[]]@(); AllowNone = $false; NoneLabel = ''; Default = $null
-    Prev = $null; Crumb = ([string]$a.Crumb).Trim(); BackMode = [string]$a.BackMode; CanBack = [bool]$a.CanBack; BackLabel = [string]$a.BackLabel
+    Prev = $null; Crumb = ([string]$a.CrumbFull).Trim(); BackMode = [string]$a.BackMode; CanBack = [bool]$a.CanBack; BackLabel = [string]$a.BackLabel
     CanHome = $canHome; EscLabel = ''; CanForward = [bool]$a.CanForward; Secret = [bool]$a.Secret; Prefill = ''; All = ''; Deadline = $a.Deadline; TimeoutLabel = ''
     Key = [string]$a.Key; Context = @() }
   if ($a.Context) { $v.Context = @($a.Context) }
@@ -5551,8 +5650,9 @@ function Get-NavRootLabel([string]$origin) {
   return (T 'Start')
 }
 
-# "  Start > Frieren > Season 2 > AniLibria", cut from the left to the window's width; secrets show as ***.
-function Get-NavCrumb($f, [int]$count = -1) {
+# "  Start > Frieren > Season 2 > AniLibria", cut from the left to the console's width (-NoCut: whole, for the control
+# window's card, where it wraps); secrets show as ***.
+function Get-NavCrumb($f, [int]$count = -1, [switch]$NoCut) {
   $parts = @(Get-NavRootLabel $f.Origin)
   if ($count -lt 0) { $count = $f.Tape.Count }
   for ($i = 0; $i -lt $count; $i++) {
@@ -5560,12 +5660,34 @@ function Get-NavCrumb($f, [int]$count = -1) {
     if ($e.Secret) { $parts += '***' } else { $parts += (Get-NavShort ([string]$e.Label)) }
   }
   $s = '  ' + ($parts -join ' > ')
+  if ($NoCut) { return $s }
   $w = Get-ConsoleWidth
   if ($s.Length -gt $w) { $s = '  ...' + $s.Substring($s.Length - ($w - 5)) }
   return $s
 }
 
 function Show-NavHint([string]$text) { if ($text) { Say $text 'DarkGray' } }
+
+# A numbered option that is wider than the console goes on in lines indented under its text (a long search title
+# stays readable, instead of the console breaking it at its left edge).
+function Format-AskOption([string]$num, [string]$text) {
+  $w = (Get-ConsoleWidth) - $num.Length
+  if ($text.Length -le $w -or $w -lt 20) { return ($num + $text) }
+  $pad = ' ' * $num.Length
+  $lines = @()
+  $line = ''
+  foreach ($word in ($text -split ' ')) {
+    while ($word.Length -gt $w) {
+      if ($line) { $lines += $line; $line = '' }
+      $lines += $word.Substring(0, $w); $word = $word.Substring($w)
+    }
+    if (-not $line) { $line = $word }
+    elseif ($line.Length + 1 + $word.Length -le $w) { $line += ' ' + $word }
+    else { $lines += $line; $line = $word }
+  }
+  if ($line) { $lines += $line }
+  return ($num + ($lines -join ([Environment]::NewLine + $pad)))
+}
 
 # Episodes from typed text ('' = from $defPos to the end): "5", "3-8", "3-", "1,4 7", en / em dashes, decimals.
 function ConvertFrom-EpisodeText($list, [int]$defPos, [string]$ans) {
@@ -5690,7 +5812,12 @@ function Show-AskBody($a) {
       Say ($l + (Get-AskMarks $a -1))
     }
     $opts = @($a.Options)
-    for ($i = 0; $i -lt $opts.Count; $i++) { Say (('   {0}) {1}' -f ($i + 1), $opts[$i]) + (Get-AskMarks $a $i)) }
+    for ($i = 0; $i -lt $opts.Count; $i++) {
+      if (@($a.Gaps) -contains $i) { Say '' }
+      # (Search rows: whole titles, wrapped under themselves when wider than the console.)
+      if ($a.Key -eq 'search') { Say (Format-AskOption ('   {0}) ' -f ($i + 1)) ([string]$opts[$i] + (Get-AskMarks $a $i))) }
+      else { Say (('   {0}) {1}' -f ($i + 1), $opts[$i]) + (Get-AskMarks $a $i)) }
+    }
     if ($nav -and -not $zero -and -not ($a.AllowNone -and $a.NoneLabel)) { Show-NavHint (Get-AskEscHint $a) }   # (a NoneLabel says it)
   } elseif ($a.Kind -eq 'episodes') {
     Say $a.Title 'Cyan'
@@ -5863,7 +5990,8 @@ function Invoke-Ask($a) {
   $a.CanForward = [bool]$a.Prev
   $a.NavOn = ($a.CanBack -or $a.CanForward)
   $a.Crumb = ''
-  if ($step -and $n -gt 0) { $a.Crumb = Get-NavCrumb $f $n }
+  $a.CrumbFull = ''
+  if ($step -and $n -gt 0) { $a.Crumb = Get-NavCrumb $f $n; $a.CrumbFull = Get-NavCrumb $f $n -NoCut }
   $a.Context = Get-AskContext
   Show-AskBody $a
   $limit = Get-AskTimeout
@@ -6226,7 +6354,7 @@ function Resolve-Cmd($c, [string]$kind, [ref]$why) {
     'content' { @('pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'sync', 'lost', 'restart', 'playnow', 'audio', 'subs') }
     'paused' { @('resume', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow', 'audio', 'subs') }
     'hold' { @('start', 'pause', 'seek', 'seekto', 'skip', 'stop', 'quit', 'resync', 'playnow', 'audio', 'subs') }
-    default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest', 'lang', 'forget', 'help', 'menu') }
+    default { @('stop', 'quit', 'resync', 'host', 'newlink', 'res', 'speedtest', 'lang', 'forget', 'help', 'more', 'config', 'menu') }
   }
   # The waiting screen while a torrent episode downloads for its turn: S S gives that episode up.
   if ($kind -eq 'waiting' -and (Get-WaitingSkipItem)) { $fits = @($fits) + @('skip') }
@@ -7664,8 +7792,8 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
   } catch { $script:PanelShown = $false }
 }
 
-# The control window's Audio / Subtitles menus for what plays: @{ Audio / Subs (each track's label), AudioShort /
-# SubsShort (shorter, for the buttons), A / S (what plays, -1 = none, or the pick about to go on the air: Busy) }, or
+# The control window's Audio / Subtitles menus for what plays: @{ Audio / Subs (each track's label, staff lists cut),
+# AudioFull / SubsFull (the whole names: the menus' tooltips), AudioShort / SubsShort (shorter, for the buttons), A / S (what plays, -1 = none, or the pick about to go on the air: Busy) }, or
 # $null when it has nothing to choose. The labels are made once per video.
 $script:PanelTrackCache = $null
 function Get-PanelTracks($media) {
@@ -7673,13 +7801,13 @@ function Get-PanelTracks($media) {
   if (-not $c -or -not [object]::ReferenceEquals($c.Item, $media)) {
     $tl = Get-TrackLists $media
     $c = @{ Item = $media; Tl = $tl
-      Audio = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ }); AudioShort = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ $true })
-      Subs = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ }); SubsShort = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ $true }) }
+      Audio = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ -List }); AudioFull = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ }); AudioShort = [string[]]@($tl.Audio | ForEach-Object { Get-TrackLabel $_ $true })
+      Subs = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ -List }); SubsFull = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ }); SubsShort = [string[]]@($tl.Subs | ForEach-Object { Get-TrackLabel $_ $true }) }
     $script:PanelTrackCache = $c
   }
   if ($c.Audio.Count -lt 2 -and $c.Subs.Count -eq 0) { return $null }
   $pk = Get-TrackPicks $media $c.Tl
-  return @{ Audio = $c.Audio; AudioShort = $c.AudioShort; Subs = $c.Subs; SubsShort = $c.SubsShort; A = [int]$pk.A; S = [int]$pk.S; Busy = [bool]$pk.Busy }
+  return @{ Audio = $c.Audio; AudioFull = $c.AudioFull; AudioShort = $c.AudioShort; Subs = $c.Subs; SubsFull = $c.SubsFull; SubsShort = $c.SubsShort; A = [int]$pk.A; S = [int]$pk.S; Busy = [bool]$pk.Busy }
 }
 
 # The Settings menu's items for the control window: the same list as M here (Get-MenuItems), with the choices of
@@ -7690,17 +7818,20 @@ $script:PanelLangs = $null
 function Get-PanelMenuState {
   $hid = ''
   if ($script:HostP) { $hid = [string]$script:HostP.Id }
-  $key = '{0}|{1}|{2}|{3}|{4}|{5}' -f $script:Lang, $hid, (Get-HeightSetting), (Get-KbpsCeiling), $script:StreamFpsNum, [bool](Test-HostModule)
+  # (More settings: their current values are in the labels, so a change there makes it again too.)
+  $more = @(Get-MoreSettingChoices)
+  $key = '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}' -f $script:Lang, $hid, (Get-HeightSetting), (Get-KbpsCeiling), $script:StreamFpsNum, [bool](Test-HostModule),
+    (Get-SpeedTestLastText), (@($more | ForEach-Object { $_.Label }) -join [char]31)
   $c = $script:PanelMenuCache
   if ($c -and $c.Key -ceq $key) { return $c.Value }
   # (Made again e.g. when the first video sets the frame rate: no file reads then, the languages are kept from the first time.)
   if ($null -eq $script:PanelLangs) { $script:PanelLangs = @(); try { $script:PanelLangs = @(Get-Languages) } catch {} }
   $items = @()
   foreach ($it in @(Get-MenuItems)) {
-    if ($it.Id -eq 'download') { continue }   # (the window has it apart: it opens the download window itself, any time)
+    # (download: the window makes that item itself, it opens the download window any time.)
     $on = $false
     if ($it.Need -eq 'lang') { $on = (@($script:PanelLangs).Count -gt 1) } else { $on = [bool](Test-MenuItemOn $it) }
-    $items += @{ Id = [string]$it.Id; Label = [string]$it.Label; On = $on }
+    $items += @{ Id = [string]$it.Id; Label = [string]$it.Label; On = $on; Group = [string]$it.Group }
   }
   $hosts = @()
   if ((Test-HostModule) -and $script:HostIds) {
@@ -7715,8 +7846,8 @@ function Get-PanelMenuState {
   foreach ($r in @(Get-ResolutionChoices)) { $res += @{ Value = [string]$r.Value; Label = [string]$r.Label; Tip = '' } }
   $langs = @()
   foreach ($l in $script:PanelLangs) { $langs += @{ Value = [string]$l.Code; Label = [string]$l.Name; Tip = '' } }
-  $v = @{ Menu = $items; Choices = @{ host = $hosts; res = $res; lang = $langs }
-    Chosen = @{ host = $hid; res = [string](Get-HeightSetting); lang = [string]$script:Lang } }
+  $v = @{ Menu = $items; Choices = @{ host = $hosts; res = $res; lang = $langs; more = $more }
+    Chosen = @{ host = $hid; res = [string](Get-HeightSetting); lang = [string]$script:Lang; more = '' } }
   $script:PanelMenuCache = @{ Key = $key; Value = $v }
   return $v
 }
@@ -8833,6 +8964,166 @@ function Invoke-SpeedTestMenu {
   } finally { $script:PromptOk = $was }
 }
 
+# The last speed test for the host streamed to now, as "9.2 Mbps, 10-14" (empty: none yet). Saved in config.json
+# ("SpeedTestLast": its host, Mbps and date) so the menu can say it and the test can be skipped.
+function Get-SpeedTestLastText {
+  $l = Get-Prop $script:Cfg 'SpeedTestLast'
+  if (-not $l -or -not $script:HostP -or "$(Get-Prop $l 'Host')" -ne [string]$script:HostP.Id) { return '' }
+  $mb = 0.0
+  if (-not [double]::TryParse("$(Get-Prop $l 'Mbps')", [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mb) -or $mb -le 0) { return '' }
+  $d = [datetime]::MinValue
+  $day = ''
+  if ([datetime]::TryParseExact("$(Get-Prop $l 'Date')", 'yyyy-MM-dd', $script:Inv, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { $day = $d.ToString((T 'MM-dd'), $script:Inv) }
+  $s = T '{0} Mbps' (Format-Num ([Math]::Round($mb, 1)))
+  if ($day) { $s += ', ' + $day }
+  return $s
+}
+
+function Save-SpeedTestLast([string]$hostId, [double]$kbps) {
+  if ($kbps -le 0 -or -not $script:Cfg) { return }
+  $v = [pscustomobject][ordered]@{ Host = $hostId; Mbps = [Math]::Round($kbps / 1000.0, 1); Date = (Get-Date).ToString('yyyy-MM-dd', $script:Inv) }
+  Set-CfgValue 'SpeedTestLast' $v
+  try { Save-Config $script:Cfg } catch { Write-LogLine ('  (speed test result not saved: ' + $_.Exception.Message + ')') }
+}
+
+# Sets (or adds) one value of config.json in memory; Save-Config writes it.
+function Set-CfgValue([string]$name, $value) {
+  if ($script:Cfg.PSObject.Properties[$name]) { $script:Cfg.$name = $value }
+  else { $script:Cfg | Add-Member -NotePropertyName $name -NotePropertyValue $value }
+}
+
+# ------------------------------------------------------------------ More settings (config.json values in the menu)
+# The config.json values worth changing without editing the file. Kind: bool | num (Min, Max, Default, Unit, Zero = what
+# 0 means) | text. Apply: what makes the new value count right away (the rest read config.json each time they need it).
+function Get-MoreSettings {
+  return @(
+    @{ Key = 'WaitForPlayers'; Kind = 'bool'; Default = $true; Label = (T 'Wait for the players before a video starts')
+      Apply = { $script:HoldOn = Get-BoolSetting 'WaitForPlayers' $true; $script:HoldOnDrop = $script:HoldOn } },
+    @{ Key = 'StartDelaySeconds'; Kind = 'num'; Min = 0; Max = 30; Default = 3; Unit = 's'; Zero = ''; Label = (T 'Start delay')
+      Apply = { $script:StartDelay = Get-NumSetting 'StartDelaySeconds' 3 0 30 } },
+    @{ Key = 'ViewerDelaySeconds'; Kind = 'num'; Min = 1; Max = 15; Default = 5; Unit = 's'; Zero = ''; Label = (T 'Viewer delay')
+      Apply = { $script:ViewerDelay = Get-NumSetting 'ViewerDelaySeconds' 5 1 15 } },
+    @{ Key = 'ResyncWhenBehindSeconds'; Kind = 'num'; Min = 0; Max = 600; Default = 8; Unit = 's'; Zero = (T 'off'); Label = (T 'Resync by itself when players are behind by')
+      Apply = { $script:DriftResync = Get-NumSetting 'ResyncWhenBehindSeconds' 8 0 600 } },
+    @{ Key = 'WorldPlayerControl'; Kind = 'bool'; Default = $true; Label = (T 'Pause and skip from the world''s video player')
+      Apply = { if (Get-BoolSetting 'WorldPlayerControl' $true) { if (-not $script:VrcLog) { Start-WorldPlayerControl } } else { $script:VrcLog = $null } } },
+    @{ Key = 'AskTimeoutSec'; Kind = 'num'; Min = 0; Max = 86400; Default = 60; Unit = 's'; Zero = (T 'never'); Label = (T 'Questions while on the air answer themselves after') },
+    @{ Key = 'IdleMinutes'; Kind = 'num'; Min = 3; Max = 600; Default = 15; Unit = 'min'; Zero = ''; Label = (T 'End the stream when nothing is queued for')
+      Apply = { if (-not $env:VRCLM_IDLE_MIN) { $script:IdleMinutes = [double](Get-NumSetting 'IdleMinutes' 15 3 600) } } },
+    @{ Key = 'DownloadFolder'; Kind = 'text'; Default = ''; Label = (T 'Download folder') },
+    @{ Key = 'SubLang'; Kind = 'text'; Default = 'ru,en'; Label = (T 'Preferred subtitle languages') }
+  )
+}
+
+# A setting's value now, as shown: "on", "3 s", "off", a folder.
+function Get-MoreSettingText($d) {
+  if ($d.Kind -eq 'bool') { if (Get-BoolSetting $d.Key ([bool]$d.Default)) { return (T 'on') } else { return (T 'off') } }
+  if ($d.Kind -eq 'num') {
+    $n = Get-NumSetting $d.Key ([double]$d.Default) ([double]$d.Min) ([double]$d.Max)
+    if ($n -eq 0 -and $d.Zero) { return [string]$d.Zero }
+    if ($d.Unit -eq 'min') { return (T '{0} min' (Format-Num $n)) }
+    return (T '{0} s' (Format-Num $n))
+  }
+  if ($d.Key -eq 'DownloadFolder') { return (Get-DownloadRoot) }
+  $v = "$(Get-Prop $script:Cfg $d.Key)".Trim()
+  if (-not $v) { $v = [string]$d.Default }
+  return $v
+}
+
+# The list's lines ("Start delay: 3 s"), also the control window's More settings submenu: @{ Value; Label; Tip }, the
+# last one Open config.json.
+function Get-MoreSettingChoices {
+  $out = @()
+  foreach ($d in @(Get-MoreSettings)) {
+    $out += @{ Value = [string]$d.Key; Label = (T '{0}: {1}' $d.Label (Get-ShortText (Get-MoreSettingText $d) 50)); Tip = [string]$d.Key }
+  }
+  $out += @{ Value = 'config'; Label = (T 'Open config.json (all the other settings)'); Tip = '' }
+  return $out
+}
+
+# More settings: a list of the values with what they are now; a pick asks for the new value (Back goes to the list) and
+# saves it at once. $Pick: the setting already picked in the control window.
+function Invoke-MoreSettings([string]$Pick = '') {
+  if (-not $script:Cfg) { return }
+  $was = $script:PromptOk
+  $script:PromptOk = $true
+  try {
+    [void](Invoke-NavFlow -Name 'more' -Origin 'menu' -Cfg -Body {
+        $key = $Pick
+        if (-not $key) {
+          $ch = @(Get-MoreSettingChoices)
+          Say ''
+          # (0 / Esc = back to the Settings list; just Enter = out of the menu.)
+          $i = Read-Choice (T 'More settings (saved in config.json)') @($ch | ForEach-Object { $_.Label }) -1 $false -Key 'more' -Values @($ch | ForEach-Object { $_.Value }) -Gaps @($ch.Count - 1) -EnterDefault
+          if ($i -lt 0) { return }
+          $key = [string]$ch[$i].Value
+        }
+        if ($key -eq 'config') { Open-ConfigFile; return }
+        $d = @(Get-MoreSettings | Where-Object { $_.Key -eq $key }) | Select-Object -First 1
+        if ($d) { Set-MoreSetting $d }
+      })
+  } finally { $script:PromptOk = $was }
+}
+
+# Asks for one setting's new value (just Enter keeps it) and saves it.
+function Set-MoreSetting($d) {
+  $now = Get-MoreSettingText $d
+  $new = $null
+  if ($d.Kind -eq 'bool') {
+    $on = Get-BoolSetting $d.Key ([bool]$d.Default)
+    $cur = 1
+    if ($on) { $cur = 0 }
+    $i = Read-Choice ([string]$d.Label) @((T 'Yes'), (T 'No')) $cur $false -Key ('set-' + $d.Key)
+    $new = ($i -eq 0)
+    if ($new -eq $on) { Say (T '  Kept: {0}.' $now) 'Gray'; return }
+  } elseif ($d.Kind -eq 'num') {
+    while ($true) {
+      $p = T '{0} - now {1}. A number from {2} to {3} (just Enter = keep it)' $d.Label $now (Format-Num $d.Min) (Format-Num $d.Max)
+      if ($d.Zero) { $p = T '{0} - now {1}. A number from {2} to {3}, 0 = {4} (just Enter = keep it)' $d.Label $now (Format-Num $d.Min) (Format-Num $d.Max) $d.Zero }
+      $t = Read-HostLine $p -Key ('set-' + $d.Key)
+      if (-not $t) { Say (T '  Kept: {0}.' $now) 'Gray'; return }
+      $n = 0.0
+      if ([double]::TryParse(($t -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$n) -and $n -ge $d.Min -and $n -le $d.Max) { $new = $n; break }
+      Say (T '   That isn''t a number from {0} to {1} - try again.' (Format-Num $d.Min) (Format-Num $d.Max)) 'Yellow'
+    }
+    if ($new -eq [Math]::Floor($new)) { $new = [int]$new }
+  } else {
+    $hint = T '"-" = the default'
+    if ($d.Key -eq 'SubLang') { $hint = T 'language codes, best first, e.g. ru,en; "-" = the default' }
+    if ($d.Key -eq 'DownloadFolder') { $hint = T 'a folder; "-" = the default (Downloads\VRChat Link Maker)' }
+    $t = Read-HostLine (T '{0} - now {1}. Type a new one ({2}; just Enter = keep it)' $d.Label $now $hint) -Key ('set-' + $d.Key)
+    if (-not $t) { Say (T '  Kept: {0}.' $now) 'Gray'; return }
+    $new = $t.Trim().Trim('"').Trim()
+    if ($new -eq '-') { $new = '' }
+    if ($d.Key -eq 'SubLang' -and $new -and $new -notmatch '^[A-Za-z]{2,3}(\s*[,; ]\s*[A-Za-z]{2,3})*$') {
+      Say (T '   Language codes look like ru or en - not saved.') 'Yellow'; return
+    }
+  }
+  Set-CfgValue $d.Key $new
+  # (Saved: no Back undoes it. The control window's menu shows the new value the next time it opens.)
+  Lock-NavStep
+  try { Save-Config $script:Cfg } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red'; return }
+  if ($d.Apply) { try { & $d.Apply } catch { Write-LogLine ('  (setting not applied: ' + $_.Exception.Message + ')') } }
+  Say (T '  Saved: {0} = {1}.' $d.Label (Get-MoreSettingText $d)) 'Green'
+}
+
+# config.json in Notepad, for the settings the menus don't have. This window keeps its own copy and writes it back
+# whenever a setting changes, so edits there count only when made while the tool is closed.
+function Open-ConfigFile {
+  $f = $script:ConfigPath
+  if (-not $f -or -not [System.IO.File]::Exists($f)) { Say (T '  There is no config.json yet.') 'Yellow'; return }
+  # (Not from a test rig, which dot-sources this file or runs it unattended: no Notepad on the desktop.)
+  if ($env:VRCLM_NO_MAIN -or $env:VRCLM_AUTO) { Write-LogLine ('  (config.json not opened here: ' + $f + ')'); return }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'notepad.exe'
+    $psi.Arguments = '"' + $f + '"'
+    $psi.UseShellExecute = $true
+    [void][System.Diagnostics.Process]::Start($psi)
+    Say (T '  Opened config.json. Edit it with the tool closed: while it runs, the tool saves its own copy over it.') 'Gray'
+  } catch { Say (T '  Couldn''t open {0}: {1}' $f $_.Exception.Message) 'Yellow' }
+}
+
 # The resolution menu (V). Another picture size means a new stream, so it reconnects (players follow, as after a resync).
 function Invoke-ResolutionMenu($Pick = $null) {
   $was = $script:PromptOk
@@ -9052,6 +9343,7 @@ function Get-AddHandover([string[]]$entries) {
           $its = @(Expand-SiteLink $t)
           if ($its.Count -eq 0) { continue }
           Read-HandoverPlayer $its
+          Confirm-SiteSummary $its
           $choice = Get-SiteChoiceText $its
           if ($choice) { $t = $t + '#vrclm=' + $choice }
         } catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText $t 70) $_.Exception.Message) 'Yellow'; continue }
