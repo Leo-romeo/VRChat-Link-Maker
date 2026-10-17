@@ -1081,5 +1081,11 @@
   "  Saved: {0} = {1}.": "  Сохранено: {0} = {1}.",
   "  There is no config.json yet.": "  Файла config.json пока нет.",
   "  Opened config.json. Edit it with the tool closed: while it runs, the tool saves its own copy over it.": "  config.json открыт. Меняйте его, когда программа закрыта: пока она работает, она записывает поверх свою копию.",
-  "Stream: where to, picture size, speed test, new link. This session: ask again, the clock, always on top. Tool: language, downloading videos, more settings, config.json, log.txt. And End stream. The settings work while nothing plays; their questions show here and in the console window.": "Трансляция: куда, размер картинки, проверка скорости, новая ссылка. Этот сеанс: спросить снова, часы, поверх всех окон. Программа: язык, скачивание видео, другие настройки, config.json, log.txt. И завершение трансляции. Настройки работают, пока ничего не играет; их вопросы появляются здесь и в окне консоли."
+  "Stream: where to, picture size, speed test, new link. This session: ask again, the clock, always on top. Tool: language, downloading videos, more settings, config.json, log.txt. And End stream. The settings work while nothing plays; their questions show here and in the console window.": "Трансляция: куда, размер картинки, проверка скорости, новая ссылка. Этот сеанс: спросить снова, часы, поверх всех окон. Программа: язык, скачивание видео, другие настройки, config.json, log.txt. И завершение трансляции. Настройки работают, пока ничего не играет; их вопросы появляются здесь и в окне консоли.",
+  "Downloading {0} of {1}: {2}, {3}%": "Скачивается {0} из {1}: {2}, {3}%",
+  "Downloading {0} of {1}: {2}": "Скачивается {0} из {1}: {2}",
+  "Download {0}/{1}, {2}% - VRChat Link Maker": "Скачивание {0}/{1}, {2}% - VRChat Link Maker",
+  "Download {0}/{1} - VRChat Link Maker": "Скачивание {0}/{1} - VRChat Link Maker",
+  "Click to open the folder.": "Нажмите, чтобы открыть папку.",
+  "Hotkey Ctrl+Alt+{0} is taken by another program, so it does nothing.": "Сочетание Ctrl+Alt+{0} занято другой программой, поэтому оно не работает."
 }

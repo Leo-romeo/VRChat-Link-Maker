@@ -209,7 +209,7 @@ function New-ControlPanel {
     AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null; AskDigits = ''; AskDigitsAt = [DateTime]::MinValue
     Wide = $null; Page = 'queue'; PageBack = 'queue'; ClockOn = $false; ListNames = @(); ListInfo = @(); QHot = -1; QHotBtn = ''; QOn = $false
     AskRows = @(); AskHot = -1; AskTags = $false; LogAtEnd = $true; Icon = $null; ListTotal = 0; QPress = $null; AskCtxLines = @()
-    WarmAt = [DateTime]::MinValue; LogAll = $null; LogWarnOnly = $false; LogUnread = 0; NoteSeq = 0; NowOff = 0; BannerKind = ''; QHotTip = ''
+    WarmAt = [DateTime]::MinValue; LogAll = $null; LogWarnOnly = $false; LogUnread = 0; NoteSeq = 0; NowOff = 0; BannerKind = ''; QHotTip = ''; DlDir = ''; DlOpened = ''; HotWin = $null
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -370,6 +370,8 @@ function New-ControlPanel {
   $bn.Add_Click({
       try {
         $q = $script:Panel
+        # (The grey download bar: its folder opens.)
+        if ($q.BannerKind -eq 'dl') { Open-PanelDownloadFolder; return }
         # (The "is out" bar: the start screen asks about the update, Wait-AskInput.)
         if ($q.BannerCmd -eq 'update') { $b = Get-PanelBus; if ($b) { $b.UpdateReq = $true } }
         $q.IdleHushUntil = [DateTime]::UtcNow.AddSeconds(5); Hide-PanelBanner; Add-PanelCommand 'seen'
@@ -1747,6 +1749,31 @@ function Update-PanelNote {
   if (([DateTime]::UtcNow - [DateTime]$n['At']).TotalSeconds -lt 15) { Show-PanelBanner ([string]$n['Text']) ([string]$n['Color']) }
 }
 
+# A download window runs (State.DlText, from its progress file): the same bar in grey, unless a warning shows. A click
+# opens the folder the videos go to.
+function Show-PanelDlBanner([string]$text, [string]$dir) {
+  $q = $script:Panel
+  $q.DlDir = $dir
+  $bn = $q.Banner
+  if ($bn.Visible -and $q.BannerKind -ne 'dl') { return }
+  if ($q.BannerKind -ne 'dl' -or $bn.Text -cne $text) {
+    $bn.BackColor = (New-PanelColor 52 56 64); $bn.ForeColor = (New-PanelColor 200 205 212)
+    $bn.Text = $text
+    $q.BannerKind = 'dl'
+    $q.Tips.SetToolTip($bn, $text + "`r`n" + (T 'Click to open the folder.'))
+  }
+  $q.BannerUntil = [DateTime]::UtcNow.AddSeconds(6)
+  if (-not $bn.Visible) { $bn.Visible = $true }
+}
+
+function Open-PanelDownloadFolder {
+  $q = $script:Panel
+  $d = [string]$q.DlDir
+  if (-not $d -or -not [System.IO.Directory]::Exists($d)) { return }
+  $q.DlOpened = $d
+  try { [void][System.Diagnostics.Process]::Start('explorer.exe', '"' + $d + '"') } catch {}
+}
+
 function Hide-PanelBanner {
   $q = $script:Panel
   $q.BannerKind = ''
@@ -2715,6 +2742,7 @@ function Open-ControlPanel([switch]$NoWait, [switch]$Front) {
       Ready = $false; ReadyAt = $null; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
       Log = $bus.Log; Backlog = $backlog; LogPath = $logPath; ToolFile = [string]$script:ScriptFile
       StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts; Front = [bool]$Front
+      Hotkeys = $(try { [bool](Get-BoolSetting 'Hotkeys' $false) } catch { $false })
     })
     $self = $script:PanelSelf
     if (-not $self) { $self = $script:PanelFile }
@@ -2747,6 +2775,8 @@ function Confirm-PanelStarted {
   if ($sync -and $sync.Ready -and -not $sync.Closed) {
     $script:PanelWaitUntil = $null
     if ($sync.ReadyAt -is [DateTime] -and (Get-Command Add-StartMark -CommandType Function -ErrorAction SilentlyContinue)) { Add-StartMark 'window' $sync.ReadyAt }
+    # ("ConsoleStart": "minimized": the console goes down once the window is there.)
+    if (Get-Command Invoke-ConsoleStart -CommandType Function -ErrorAction SilentlyContinue) { Invoke-ConsoleStart }
     return
   }
   if ($sync -and -not $sync.Closed -and [DateTime]::UtcNow -lt $script:PanelWaitUntil) { return }
@@ -2801,7 +2831,7 @@ function Start-PanelUi($sync) {
     $timer.Interval = 100
     $timer.Add_Tick({ Invoke-PanelTick })
     $q.Timer = $timer
-    $q.Form.Add_Shown({ try { $script:PanelSync.ReadyAt = [DateTime]::UtcNow; $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {}; try { $script:Panel.LookUntil = [DateTime]::UtcNow.AddSeconds(10); Set-PanelStartLook } catch {} })
+    $q.Form.Add_Shown({ try { $script:PanelSync.ReadyAt = [DateTime]::UtcNow; $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {}; try { $script:Panel.LookUntil = [DateTime]::UtcNow.AddSeconds(10); Set-PanelStartLook } catch {}; try { if ($script:PanelSync.Hotkeys) { Start-PanelHotkeys } } catch {} })
     $timer.Start()
     [System.Windows.Forms.Application]::Run($q.Form)
   } finally {
@@ -2832,6 +2862,7 @@ function Invoke-PanelTick {
   try { Update-PanelNotice } catch { Write-PanelWarning $_ }
   try { Update-PanelNote } catch { Write-PanelWarning $_ }
   try { Update-PanelBanner } catch { Write-PanelWarning $_ }
+  try { Update-PanelHotkeys } catch { Write-PanelWarning $_ }
 }
 
 # New message lines for the pane (at most 300 per tick). Past 1500 lines it drops the oldest down to 1200 (at once, not
@@ -2994,9 +3025,84 @@ function Restore-ConsoleIcon {
   } catch {}
 }
 
+# ------------------------------------------------------------------ global hotkeys (config.json "Hotkeys": true, off by default)
+# Ctrl+Alt+Space pause / continue, Ctrl+Alt+Left / Right seek 10 s, Ctrl+Alt+N next. RegisterHotKey for a message-only
+# NativeWindow of this thread: its WM_HOTKEY ids queue up and the 100 ms timer runs them (Update-PanelHotkeys). Another
+# program that owns a key makes only that one hotkey fail (one warning).
+$script:PanelHotkeySource = @'
+using System;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+namespace VRCLinkMaker {
+  public class PanelHotkeyWindow : NativeWindow, IDisposable {
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    public readonly ConcurrentQueue<int> Pressed = new ConcurrentQueue<int>();
+    readonly System.Collections.Generic.List<int> ids = new System.Collections.Generic.List<int>();
+    public PanelHotkeyWindow() { CreateParams cp = new CreateParams(); cp.Parent = (IntPtr)(-3); CreateHandle(cp); }
+    public bool Register(int id, uint mods, uint vk) {
+      if (Handle == IntPtr.Zero || !RegisterHotKey(Handle, id, mods | 0x4000, vk)) return false;
+      ids.Add(id); return true;
+    }
+    protected override void WndProc(ref Message m) {
+      if (m.Msg == 0x0312) { Pressed.Enqueue(m.WParam.ToInt32()); return; }
+      base.WndProc(ref m);
+    }
+    public void Dispose() {
+      if (Handle != IntPtr.Zero) { foreach (int id in ids) UnregisterHotKey(Handle, id); DestroyHandle(); }
+      ids.Clear();
+    }
+  }
+}
+'@
+
+function Start-PanelHotkeys {
+  $q = $script:Panel
+  if ($q.HotWin) { return }
+  try {
+    if (-not ('VRCLinkMaker.PanelHotkeyWindow' -as [type])) {
+      Add-Type -TypeDefinition $script:PanelHotkeySource -ReferencedAssemblies System.Windows.Forms
+    }
+    $w = New-Object VRCLinkMaker.PanelHotkeyWindow
+    $q.HotWin = $w
+    $K = [System.Windows.Forms.Keys]
+    # (MOD_ALT 1 + MOD_CONTROL 2; the id is what Invoke-PanelHotkey switches on.)
+    foreach ($h in @(@(1, [int]$K::Space, 'Space'), @(2, [int]$K::Left, 'Left'), @(3, [int]$K::Right, 'Right'), @(4, [int]$K::N, 'N'))) {
+      if (-not $w.Register([int]$h[0], [uint32]3, [uint32]$h[1])) { Write-PanelWarning ((T 'Hotkey Ctrl+Alt+{0} is taken by another program, so it does nothing.' $h[2])) }
+    }
+  } catch { Write-PanelWarning $_ }
+}
+
+function Stop-PanelHotkeys {
+  $q = $script:Panel
+  if ($null -eq $q -or -not $q.HotWin) { return }
+  try { $q.HotWin.Dispose() } catch {}
+  $q.HotWin = $null
+}
+
+# What a hotkey does: the same as its button (and the same only when that button works right now).
+function Invoke-PanelHotkey([int]$id) {
+  $p = $script:Panel
+  switch ($id) {
+    1 { if ($p.Big.Enabled -and $p.Mode -ne 'waiting' -and $p.Mode -ne 'ended') { Add-PanelCommand 'toggle' } }
+    2 { if ($p.Back10.Enabled) { Add-PanelCommand 'seek' (-10) } }
+    3 { if ($p.Fwd10.Enabled) { Add-PanelCommand 'seek' 10 } }
+    4 { if ($p.Next.Enabled) { Add-PanelCommand 'skip' } }
+  }
+}
+
+function Update-PanelHotkeys {
+  $q = $script:Panel
+  if ($null -eq $q -or -not $q.HotWin) { return }
+  $id = 0
+  while ($q.HotWin.Pressed.TryDequeue([ref]$id)) { Invoke-PanelHotkey $id }
+}
+
 function Remove-PanelResources {
   $q = $script:Panel
   if ($null -eq $q) { return }
+  try { Stop-PanelHotkeys } catch {}
   try { Remove-PanelImage } catch {}
   try { if ($q.Form -and -not $q.Form.IsDisposed) { $q.Form.Dispose() } } catch {}
   foreach ($x in @($q.Tips, $q.Font, $q.Bold, $q.Small, $q.Sym, $q.SymS, $q.BigFont, $q.Mono, $q.Icon)) { try { if ($x) { $x.Dispose() } } catch {} }
@@ -3010,6 +3116,7 @@ function Remove-PanelResources {
 # is, apart) and UpcomingTotal (how many wait in all: the rows stop at 20), Link, QuestLink ('' = none), Clock (bool), CanSeek (bool), Quality / QualityLow / QualityTip (the chip
 # right of the title), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu), Tracks ($null, or the audio
 # tracks and subtitles of what plays: Audio / Subs / AudioShort / SubsShort (labels), A / S (-1 = none), Busy),
+# DlText / DlDir (a download window runs: the grey bar's text and the folder a click opens),
 # Prompt (bool: the start screen and its questions, nothing plays yet: Next / Stop / Resync and the Settings items off;
 # the input row answers the start screen's '>' only). An open question (bus.Ask, the card) turns the input row and the
 # Up next buttons and menu off.
@@ -3042,6 +3149,9 @@ function Update-PanelView($s) {
       if (-not $q.Banner.Visible -or $q.Banner.Text -cne $iw) { Show-PanelBanner $iw 'Yellow' -Force }
       $q.BannerUntil = $now.AddSeconds(5)
     }
+    $dlt = [string]$s['DlText']
+    if ($dlt) { Show-PanelDlBanner $dlt ([string]$s['DlDir']) }
+    elseif ($q.BannerKind -eq 'dl') { Hide-PanelBanner }
     $title = [string]$s['Title']
     if (-not $title) { $title = T 'Nothing is playing' }
     if ($script:PanelLast['title'] -cne $title) { $q.Tips.SetToolTip($q.Title, $title) }

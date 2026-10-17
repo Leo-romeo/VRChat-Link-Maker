@@ -7717,6 +7717,103 @@ function Show-Panel {
 
 $script:PanelDlAt = [DateTime]::MinValue
 $script:PanelDlTexts = @{}
+# ------------------------------------------------------------------ download progress (a download window -> the control window)
+# A download window writes download-progress-<pid>.txt in DataDir (about once a second while it downloads, removed when
+# it is done); the streaming tool's main loop reads it every 2 s into the control window's grey banner (Get-DownloadBanner),
+# and the window's own title shows it too, so the taskbar says how far it is.
+function Get-DownloadPct($item) {
+  try {
+    if ($item.DlKind -eq 'torrent') {
+      $dl = $item.Dl; $t = $item.Torrent
+      if ($dl -and $dl.LastBytes -ge 0 -and $t -and $t.Bytes -gt 0) { return [int][Math]::Min(99, [Math]::Floor(100.0 * $dl.Done / $t.Bytes)) }
+    } elseif ($item.DlKind -eq 'ffmpeg' -and $item.DlDir -and $item.Stream -and $item.Stream.Duration -gt 0) {
+      $pr = Read-Progress (PathJoin $item.DlDir 'progress.txt')
+      if ($pr -and $pr.Time -gt 0) { return [int][Math]::Min(99, [Math]::Floor(100 * $pr.Time / $item.Stream.Duration)) }
+    }
+  } catch {}
+  return -1
+}
+
+function Get-DownloadProgressFile { return (PathJoin $script:DataDir ('download-progress-' + $PID + '.txt')) }
+
+$script:DlProgAt = [DateTime]::MinValue
+function Write-DownloadProgress($item, [int]$n, [int]$total, [switch]$Force) {
+  $now = [DateTime]::UtcNow
+  if (-not $Force -and ($now - $script:DlProgAt).TotalSeconds -lt 1) { return }
+  $script:DlProgAt = $now
+  try {
+    $pct = Get-DownloadPct $item
+    $name = (([string]$item.Name) -replace '[\r\n]+', ' ').Trim()
+    $dir = $script:LastDownloadDir
+    if (-not $dir) { $dir = Get-DownloadRoot }
+    $lines = @(('Index=' + $n), ('Total=' + $total), ('Pct=' + $pct), ('Name=' + $name), ('Dir=' + $dir))
+    $tmp = (Get-DownloadProgressFile) + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, ($lines -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+    [System.IO.File]::Copy($tmp, (Get-DownloadProgressFile), $true)
+    [System.IO.File]::Delete($tmp)
+    if ($pct -ge 0) { $Host.UI.RawUI.WindowTitle = (T 'Download {0}/{1}, {2}% - VRChat Link Maker' $n $total $pct) }
+    else { $Host.UI.RawUI.WindowTitle = (T 'Download {0}/{1} - VRChat Link Maker' $n $total) }
+  } catch {}
+}
+
+function Clear-DownloadProgress {
+  try { [System.IO.File]::Delete((Get-DownloadProgressFile)) } catch {}
+  try { [System.IO.File]::Delete((Get-DownloadProgressFile) + '.tmp') } catch {}
+  $script:DlProgAt = [DateTime]::MinValue
+  try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - download') } catch {}
+}
+
+# The newest live download window's progress as @{ Text; Dir }, or $null (none, or its file is stale: the window died).
+function Get-DownloadBanner {
+  try {
+    $best = $null; $bestAt = [DateTime]::MinValue
+    foreach ($f in [System.IO.Directory]::GetFiles([string]$script:DataDir, 'download-progress-*.txt')) {
+      $at = [System.IO.File]::GetLastWriteTimeUtc($f)
+      $age = ([DateTime]::UtcNow - $at).TotalSeconds
+      if ($age -gt 60) { try { [System.IO.File]::Delete($f) } catch {}; continue }
+      if ($age -gt 10 -or $at -le $bestAt) { continue }
+      $pid2 = 0
+      if ([System.IO.Path]::GetFileNameWithoutExtension($f) -match '(\d+)$') { $pid2 = [int]$Matches[1] }
+      if ($pid2 -gt 0 -and -not (Get-Process -Id $pid2 -ErrorAction SilentlyContinue)) { continue }
+      $best = $f; $bestAt = $at
+    }
+    if (-not $best) { return $null }
+    $h = @{}
+    foreach ($l in [System.IO.File]::ReadAllLines($best, [System.Text.Encoding]::UTF8)) {
+      $k = $l.IndexOf('='); if ($k -gt 0) { $h[$l.Substring(0, $k)] = $l.Substring($k + 1) }
+    }
+    if (-not $h['Index'] -or -not $h['Total']) { return $null }
+    $name = Get-ShortText ([string]$h['Name']) 40
+    $pct = -1; [void][int]::TryParse([string]$h['Pct'], [ref]$pct)
+    if ($pct -ge 0) { $txt = T 'Downloading {0} of {1}: {2}, {3}%' $h['Index'] $h['Total'] $name $pct }
+    else { $txt = T 'Downloading {0} of {1}: {2}' $h['Index'] $h['Total'] $name }
+    return @{ Text = $txt; Dir = [string]$h['Dir'] }
+  } catch { return $null }
+}
+
+$script:DlBannerAt = [DateTime]::MinValue
+$script:DlBanner = $null
+function Get-DownloadBannerCached {
+  if ($script:DownloadMode) { return $null }
+  if (([DateTime]::UtcNow - $script:DlBannerAt).TotalSeconds -ge 2) { $script:DlBannerAt = [DateTime]::UtcNow; $script:DlBanner = Get-DownloadBanner }
+  return $script:DlBanner
+}
+
+# ConsoleStart "minimized" (config.json): the console goes to the taskbar once the control window shows. SW_MINIMIZE
+# on GetConsoleWindow, no helper DLL. Everything still works in the console when it is restored.
+function Invoke-ConsoleStart {
+  try {
+    if (-not $script:IsWin -or -not $script:HasConsole) { return }
+    if ("$(Get-Prop $script:Cfg 'ConsoleStart')" -notmatch '^\s*(?i:min)') { return }
+    Add-Type -Namespace VRCLinkMaker -Name ConsoleWin -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@
+    $h = [VRCLinkMaker.ConsoleWin]::GetConsoleWindow()
+    if ($h -ne [IntPtr]::Zero) { [void][VRCLinkMaker.ConsoleWin]::ShowWindow($h, 6) }
+  } catch {}
+}
+
 function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
   if (-not $script:PanelShown) { return }
   $script:PanelState = $null
@@ -7787,6 +7884,8 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $m = $null
     try { $m = Get-PanelMenuState } catch {}
     if ($m) { foreach ($k in $m.Keys) { $s[$k] = $m[$k] } }
+    $db = Get-DownloadBannerCached
+    if ($db) { $s.DlText = $db.Text; $s.DlDir = $db.Dir }
     $script:PanelState = $s
     Update-ControlPanel $script:PanelState
   } catch { $script:PanelShown = $false }
@@ -9685,6 +9784,7 @@ function Invoke-Downloads($items) {
       }
       $script:DownloadBusy = $true
       Show-Status (T '  Looking for the video...')
+      Write-DownloadProgress $it ($i + 1) $script:Queue.Count -Force
       while ($it.State -ne 'ready' -and $it.State -ne 'failed') {
         Step-Download $it
         if ($it.State -eq 'ready' -or $it.State -eq 'failed') { break }
@@ -9695,6 +9795,7 @@ function Invoke-Downloads($items) {
           if ($it.DlKind -eq 'ffmpeg' -and $it.DlDir) { $txt += ', ' + (Format-Bytes (Get-DirBytes $it.DlDir)) }
         }
         if ($txt) { Show-Status ('  ' + $txt + '   ' + (T '(Esc = stop)')) }
+        Write-DownloadProgress $it ($i + 1) $script:Queue.Count
         Update-KeepAwake
         if (Test-DownloadStopKey) { $stopped = $true; break }
         Start-Sleep -Milliseconds 250
@@ -9737,6 +9838,7 @@ function Invoke-Downloads($items) {
     Set-CtrlCAsKey $false
     $script:DownloadBusy = $false
     Clear-StatusLine
+    Clear-DownloadProgress
     # (What wasn't reached or was stopped: its download, its folder, its torrent's share in rqbit.)
     foreach ($it in @($script:Queue)) { Remove-ItemFiles $it }
     $script:Queue.Clear()
