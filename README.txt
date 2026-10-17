@@ -620,6 +620,12 @@ All of these are optional.
               (not recommended: the picture may not come).
   Clock       false. true shows the video time in a corner of the picture.
   ControlWindow       true (the default) opens the control window.
+  ConsoleStart        "normal" (the default). "minimized" minimizes this console
+              window once the control window shows (restore it from the taskbar).
+  Hotkeys             false (the default). true turns on global keys that work
+              while VRChat has the focus: Ctrl+Alt+Space pause / continue,
+              Ctrl+Alt+Left / Right back / forward 10 seconds, Ctrl+Alt+N next.
+              (A key another program already owns is skipped, with a warning.)
   IdleMinutes         15. With nothing queued, the waiting screen ends after
               this many minutes (3 to 600).
   AskTimeoutSec       60. A question about the next video asked while viewers

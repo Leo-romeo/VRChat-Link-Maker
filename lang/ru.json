@@ -989,5 +989,11 @@
   "Close the window": "Закрыть окно",
   "Start again (under the picture) to stream more, or close this window.": "Чтобы показать ещё что-нибудь, нажмите «Запустить снова» под картинкой или закройте это окно.",
   "Stream ended at {0}. On the air for {1}. Log: {2}": "Трансляция закончилась в {0}. В эфире {1}. Журнал: {2}",
-  "End the stream": "Завершить трансляцию"
+  "End the stream": "Завершить трансляцию",
+  "Downloading {0} of {1}: {2}, {3}%": "Скачивается {0} из {1}: {2}, {3}%",
+  "Downloading {0} of {1}: {2}": "Скачивается {0} из {1}: {2}",
+  "Download {0}/{1}, {2}% - VRChat Link Maker": "Скачивание {0}/{1}, {2}% - VRChat Link Maker",
+  "Download {0}/{1} - VRChat Link Maker": "Скачивание {0}/{1} - VRChat Link Maker",
+  "Click to open the folder.": "Нажмите, чтобы открыть папку.",
+  "Hotkey Ctrl+Alt+{0} is taken by another program, so it does nothing.": "Сочетание Ctrl+Alt+{0} занято другой программой, поэтому оно не работает."
 }
