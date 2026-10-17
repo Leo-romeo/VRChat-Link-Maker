@@ -25,6 +25,8 @@ $script:HostSecretRe = '^[A-Za-z0-9._~-]+$'   # passwords / passphrases: nothing
 $script:VpsSafeRe = '^[A-Za-z0-9_-]+$'          # what the server's config takes (Assert-MtxSecret): the further streams' secrets
 $script:VpsCodePrefix = 'vrclm-vps1:'
 $script:VpsMaxStreams = 10                      # streams on one VPS in all, this PC's own one included
+$script:VpsFileKeyRe = '^[A-Za-z0-9_-]{43}$'    # a stream's FileKey (New-FileKey): signs its uploads to the file service
+$script:VpsFilesVersion = 1                      # the vrclm-files version this tool's install.sh puts on the VPS (/healthz)
 # Cyrillic letters for Test-AnswerYes (these files stay plain ASCII): "d" of "da" (yes), and "n" (what the Y key types
 # on a Russian keyboard layout).
 $script:HostYesDa = '[' + [char]0x0434 + [char]0x0414 + ']'
@@ -70,6 +72,19 @@ function New-HostSecret([int]$len) {
     return $sb.ToString()
   } finally { $rng.Dispose() }
 }
+
+# A stream's FileKey: 32 random bytes as base64url without padding (43 characters). It signs that stream's uploads to the
+# file service on the VPS (vrclm-files); the key itself never travels.
+function New-FileKey {
+  $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+  try {
+    $bytes = New-Object byte[] 32
+    $rng.GetBytes($bytes)
+    return [Convert]::ToBase64String($bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+  } finally { $rng.Dispose() }
+}
+
+function Test-FileKey($k) { return ($k -is [string] -and $k -cmatch $script:VpsFileKeyRe) }
 
 function Test-LinkToken($t) { return ($t -is [string] -and $t -match '^[A-Za-z0-9_-]{22,64}$' -and -not $t.StartsWith('~')) }
 
@@ -301,6 +316,17 @@ function Initialize-HostConfig {
     Set-HostField $v $k $pp ([ref]$chg)
   }
   if ("$($v.SrtPassphrase)" -ceq "$($v.ReadPassphrase)") { Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg) }
+  # FileKey signs this PC's uploads to the file service. A guest gets it in its connection code (an older code has none:
+  # then it stays empty until a new code is pasted).
+  $fk = "$(Get-Prop $v 'FileKey')"
+  if (-not (Test-FileKey $fk)) {
+    if ("$(Get-Prop $v 'Role')".Trim() -ieq 'guest') { $fk = '' }
+    else {
+      if ($fk) { [void]$remade.Add('FileKey') }
+      $fk = New-FileKey
+    }
+  }
+  Set-HostField $v 'FileKey' $fk ([ref]$chg)
   if ($remade.Count -gt 0 -and "$(Get-Prop $v 'Address')") {
     if ("$(Get-Prop $v 'Role')" -eq 'guest') { Say (T 'config.json: Vps {0} wasn''t valid, so a new one was made. The VPS doesn''t know it: ask whoever manages the server for the connection code and paste it again (H -> My VPS).' ($remade -join ', ')) 'Yellow' }
     else { Say (T 'config.json: Vps {0} wasn''t valid, so a new one was made. Your VPS doesn''t know it: paste install.sh on the server again, or the connection code again.' ($remade -join ', ')) 'Yellow' }
@@ -312,6 +338,13 @@ function Initialize-HostConfig {
   Set-HostField $v 'RtspPort' $ports[1] ([ref]$chg)
   Set-HostField $v 'RtmpPort' $ports[2] ([ref]$chg)
   Set-HostField $v 'HlsPort' $ports[3] ([ref]$chg)
+  # The file service's TCP port (0 = install.sh leaves the file service out). Not one of the stream ports.
+  $fp = ConvertTo-HostInt (Get-Prop $v 'FilePort') 80 0 65535
+  if ($fp -ne 0 -and $fp -in @($ports[1], $ports[2], $ports[3])) { $fp = 80 }
+  if ($fp -in @($ports[1], $ports[2], $ports[3])) { $fp = 0 }
+  Set-HostField $v 'FilePort' $fp ([ref]$chg)
+  # One link for the whole session (/s/<token>/now.m3u8): off until VRChat's players are known to reload it right.
+  Set-HostField $v 'FileSameLink' (ConvertTo-HostBool (Get-Prop $v 'FileSameLink') $false) ([ref]$chg)
   $push = "$(Get-Prop $v 'Push')".Trim().ToLowerInvariant()
   if ($push -notin @('srt', 'rtmp')) { $push = 'srt' }
   Set-HostField $v 'Push' $push ([ref]$chg)
@@ -619,8 +652,10 @@ function Set-SelfHostNameInteractive($s) {
 # Vps.Role 'owner' = this PC set the server up: its install.sh (New-VpsSetupBundle) carries every stream. 'guest' = this
 # PC got one stream as a connection code from that PC: it streams, but never writes install.sh (that would wipe the rest).
 # A connection code is "vrclm-vps1:" + base64url of a small JSON: the address, the ports and one stream's secrets
-# (a, sp, rp, mp, hp, h; n = name, t, u, p, s). A "whole server" code adds r (the read passphrase), m (MaxReaders) and
-# x (the further streams), so another PC of the same person can manage the server too.
+# (a, sp, rp, mp, hp, h; n = name, t, u, p, s; fk = the stream's FileKey, fp = the file service's port). A "whole
+# server" code adds r (the read passphrase), m (MaxReaders) and x (the further streams), so another PC of the same
+# person can manage the server too. (fk and fp came with the file service: older tools ignore them, and a code without
+# them still works for streaming.)
 # Codes are as secret as the vps-setup files: they are shown with Write-Host only (Say would put them into log.txt).
 
 function Test-VpsSecret([string]$s, [int]$min, [int]$max, [string]$re = $script:VpsSafeRe) {
@@ -662,6 +697,9 @@ function Repair-VpsStream($e, [string]$defName, $seenTok, $seenUser, [string]$re
   $pp = "$(Get-Prop $e 'SrtPassphrase')"
   if (-not (Test-VpsSecret $pp 16 79) -or $pp -ceq $readPass) { $pp = New-HostSecret 32 }
   Set-HostField $e 'SrtPassphrase' $pp $chg
+  $fk = "$(Get-Prop $e 'FileKey')"
+  if (-not (Test-FileKey $fk)) { $fk = New-FileKey }
+  Set-HostField $e 'FileKey' $fk $chg
 }
 
 # Vps.Streams = $list (always an array, so config.json keeps its [ ] with a single stream too).
@@ -673,17 +711,18 @@ function Set-VpsStreamList($v, $list, [ref]$chg) {
 }
 
 # This PC's stream first, then (on the PC that manages the server) the further ones -> Name, Token, PublishUser,
-# PublishPass, SrtPassphrase, Own.
+# PublishPass, SrtPassphrase, FileKey, Own.
 function Get-VpsStreams($v) {
   $list = New-Object System.Collections.ArrayList
   [void]$list.Add([pscustomobject]@{ Name = (ConvertTo-VpsStreamName (Get-Prop $v 'Name')); Token = "$(Get-Prop $v 'Token')"
-      PublishUser = "$(Get-Prop $v 'PublishUser')"; PublishPass = "$(Get-Prop $v 'PublishPass')"; SrtPassphrase = "$(Get-Prop $v 'SrtPassphrase')"; Own = $true
+      PublishUser = "$(Get-Prop $v 'PublishUser')"; PublishPass = "$(Get-Prop $v 'PublishPass')"; SrtPassphrase = "$(Get-Prop $v 'SrtPassphrase')"
+      FileKey = "$(Get-Prop $v 'FileKey')"; Own = $true
     })
   if ("$(Get-Prop $v 'Role')" -ne 'guest') {
     foreach ($e in @(Get-Prop $v 'Streams')) {
       if ($e -isnot [System.Management.Automation.PSCustomObject]) { continue }
       [void]$list.Add([pscustomobject]@{ Name = "$(Get-Prop $e 'Name')"; Token = "$(Get-Prop $e 'Token')"; PublishUser = "$(Get-Prop $e 'PublishUser')"
-          PublishPass = "$(Get-Prop $e 'PublishPass')"; SrtPassphrase = "$(Get-Prop $e 'SrtPassphrase')"; Own = $false
+          PublishPass = "$(Get-Prop $e 'PublishPass')"; SrtPassphrase = "$(Get-Prop $e 'SrtPassphrase')"; FileKey = "$(Get-Prop $e 'FileKey')"; Own = $false
         })
     }
   }
@@ -697,13 +736,17 @@ function ConvertTo-VpsConnectCode($v, $stream, [bool]$manage = $false) {
     h = [bool](ConvertTo-HostBool (Get-Prop $v 'Hls') $false)
     n = "$($stream.Name)"; t = "$($stream.Token)"; u = "$($stream.PublishUser)"; p = "$($stream.PublishPass)"; s = "$($stream.SrtPassphrase)"
   }
+  if (Test-FileKey "$($stream.FileKey)") { $o.fk = "$($stream.FileKey)" }
+  $o.fp = ConvertTo-HostInt (Get-Prop $v 'FilePort') 80 0 65535
   if ($manage) {
     $o.r = "$(Get-Prop $v 'ReadPassphrase')"
     $o.m = ConvertTo-HostInt (Get-Prop $v 'MaxReaders') 30 1 1000
     $x = New-Object System.Collections.ArrayList
     foreach ($e in @(Get-VpsStreams $v)) {
       if ($e.Own -or $e.Token -eq $stream.Token) { continue }
-      [void]$x.Add([ordered]@{ n = $e.Name; t = $e.Token; u = $e.PublishUser; p = $e.PublishPass; s = $e.SrtPassphrase })
+      $xe = [ordered]@{ n = $e.Name; t = $e.Token; u = $e.PublishUser; p = $e.PublishPass; s = $e.SrtPassphrase }
+      if (Test-FileKey "$($e.FileKey)") { $xe.fk = "$($e.FileKey)" }
+      [void]$x.Add($xe)
     }
     $o.x = $x.ToArray()
   }
@@ -714,13 +757,15 @@ function ConvertTo-VpsConnectCode($v, $stream, [bool]$manage = $false) {
 
 function Test-VpsCodeText([string]$s) { return ($s -match '(?i)vrclm-vps\d*:') }
 
-# One stream inside a code -> Name, Token, PublishUser, PublishPass, SrtPassphrase (checked with the same rules as
+# One stream inside a code -> Name, Token, PublishUser, PublishPass, SrtPassphrase, FileKey ('' = none in the code)
+# (checked with the same rules as
 # config.json: Initialize-HostConfig for this PC's own stream, Repair-VpsStream for the further ones).
 function ConvertFrom-VpsCodeStream($e, [bool]$own, [string]$bad) {
   if ($e -isnot [System.Management.Automation.PSCustomObject]) { throw $bad }
   $r = [pscustomobject]@{ Name = (ConvertTo-VpsStreamName (Get-Prop $e 'n')); Token = "$(Get-Prop $e 't')"; PublishUser = "$(Get-Prop $e 'u')"
-    PublishPass = "$(Get-Prop $e 'p')"; SrtPassphrase = "$(Get-Prop $e 's')"
+    PublishPass = "$(Get-Prop $e 'p')"; SrtPassphrase = "$(Get-Prop $e 's')"; FileKey = "$(Get-Prop $e 'fk')"
   }
+  if ($r.FileKey -and -not (Test-FileKey $r.FileKey)) { throw $bad }
   if ($own) { $ok = ($r.PublishUser -match '^[A-Za-z0-9._-]{1,32}$') -and (Test-VpsSecret $r.PublishPass 12 64 $script:HostSecretRe) -and (Test-VpsSecret $r.SrtPassphrase 16 79 $script:HostSecretRe) }
   else { $ok = ($r.PublishUser -match '^[A-Za-z0-9_-]{1,32}$') -and (Test-VpsSecret $r.PublishPass 16 64) -and (Test-VpsSecret $r.SrtPassphrase 16 79) }
   if (-not $ok -or $r.PublishUser -ieq 'any' -or -not (Test-LinkToken $r.Token)) { throw $bad }
@@ -728,7 +773,7 @@ function ConvertFrom-VpsCodeStream($e, [bool]$own, [string]$bad) {
 }
 
 # Pasted text with a connection code in it -> the settings it carries (Address, SrtPort, RtspPort, RtmpPort, HlsPort, Hls,
-# Name, Token, PublishUser, PublishPass, SrtPassphrase, Manage; for a whole-server code ReadPassphrase, MaxReaders and
+# Name, Token, PublishUser, PublishPass, SrtPassphrase, FileKey, FilePort, Manage; for a whole-server code ReadPassphrase, MaxReaders and
 # Streams too). Throws a message in plain words when it isn't a usable code.
 function ConvertFrom-VpsConnectCode([string]$text) {
   $bad = T 'That connection code is incomplete or damaged - copy all of it again (it is one long line).'
@@ -758,7 +803,8 @@ function ConvertFrom-VpsConnectCode([string]$text) {
   $k = [ordered]@{
     Address = $addr; SrtPort = $ports.sp; RtspPort = $ports.rp; RtmpPort = $ports.mp; HlsPort = $ports.hp
     Hls = [bool](ConvertTo-HostBool (Get-Prop $o 'h') $false); Name = $main.Name; Token = $main.Token; PublishUser = $main.PublishUser
-    PublishPass = $main.PublishPass; SrtPassphrase = $main.SrtPassphrase; Manage = $false; ReadPassphrase = ''; MaxReaders = 30; Streams = @()
+    PublishPass = $main.PublishPass; SrtPassphrase = $main.SrtPassphrase; FileKey = $main.FileKey
+    FilePort = (ConvertTo-HostInt (Get-Prop $o 'fp') 80 0 65535); Manage = $false; ReadPassphrase = ''; MaxReaders = 30; Streams = @()
   }
   $rp = Get-Prop $o 'r'
   if ($null -ne $rp) {
@@ -782,15 +828,22 @@ function ConvertFrom-VpsConnectCode([string]$text) {
 # Takes a code's settings over ($k from ConvertFrom-VpsConnectCode). This PC's own preferences (Push, VideoKbps) stay.
 function Import-VpsConnectCode($v, $k) {
   $chg = $false
-  foreach ($f in @('Address', 'SrtPort', 'RtspPort', 'RtmpPort', 'HlsPort', 'Hls', 'Name', 'Token', 'PublishUser', 'PublishPass', 'SrtPassphrase')) {
+  foreach ($f in @('Address', 'SrtPort', 'RtspPort', 'RtmpPort', 'HlsPort', 'Hls', 'Name', 'Token', 'PublishUser', 'PublishPass', 'SrtPassphrase', 'FileKey', 'FilePort')) {
     Set-HostField $v $f $k.$f ([ref]$chg)
   }
+  # (A whole-server code from an older tool has no file keys: this PC manages the server now, so it makes them; its
+  # install.sh then carries them.)
+  if ($k.Manage -and -not (Test-FileKey $k.FileKey)) { Set-HostField $v 'FileKey' (New-FileKey) ([ref]$chg) }
   $list = @()
   if ($k.Manage) {
     Set-HostField $v 'Role' 'owner' ([ref]$chg)
     Set-HostField $v 'ReadPassphrase' $k.ReadPassphrase ([ref]$chg)
     Set-HostField $v 'MaxReaders' ([int]$k.MaxReaders) ([ref]$chg)
-    $list = @($k.Streams | ForEach-Object { [pscustomobject][ordered]@{ Name = $_.Name; Token = $_.Token; PublishUser = $_.PublishUser; PublishPass = $_.PublishPass; SrtPassphrase = $_.SrtPassphrase } })
+    $list = @($k.Streams | ForEach-Object {
+        $fk = $_.FileKey
+        if (-not (Test-FileKey $fk)) { $fk = New-FileKey }
+        [pscustomobject][ordered]@{ Name = $_.Name; Token = $_.Token; PublishUser = $_.PublishUser; PublishPass = $_.PublishPass; SrtPassphrase = $_.SrtPassphrase; FileKey = $fk }
+      })
   } else {
     Set-HostField $v 'Role' 'guest' ([ref]$chg)
     # (A guest never uses it; it only has to differ from the publish passphrase.)
@@ -807,6 +860,7 @@ function Reset-VpsOwnSecrets($v) {
   Set-HostField $v 'PublishPass' (New-HostSecret 24) ([ref]$chg)
   Set-HostField $v 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
   Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg)
+  Set-HostField $v 'FileKey' (New-FileKey) ([ref]$chg)
   Set-HostField $v 'Name' '' ([ref]$chg)
   Set-HostField $v 'Role' 'owner' ([ref]$chg)
   Set-VpsStreamList $v @() ([ref]$chg)
@@ -965,7 +1019,177 @@ function Test-VpsReady($p) {
     return $false
   }
   if ($r.State -eq 'idle') { Say (T '  Your VPS is ready.') 'DarkGray' }
+  if ((Get-VpsDelivery) -ne 'stream') { [void](Show-VpsFileCheck) }
   return $true
+}
+
+# ------------------------------------------------------------------ my VPS: the file service (vrclm-files)
+# vps/vrclm_files.py runs on the VPS next to MediaMTX (install.sh puts it there) and hosts episodes as HLS files.
+# Anyone may GET /v/<id>/...; everything else is signed with the stream's FileKey:
+#   X-Vrclm-Sig = hex HMAC-SHA256(FileKey, "VRCLM1\n" + stream + "\n" + method + "\n" + path + "\n" + unix time + "\n" +
+#   hex sha256(body)), with X-Vrclm-Stream (the stream's token), X-Vrclm-Time and X-Vrclm-Sha256. The server takes a
+#   time within 5 min of its clock. Uploading files (F2) builds on these functions.
+
+# The Delivery setting (F2 adds it to the menus): 'stream' (today), 'file', 'ask' or 'auto'.
+function Get-VpsDelivery {
+  $d = "$(Get-Prop $script:Cfg 'Delivery')".Trim().ToLowerInvariant()
+  if ($d -in @('file', 'ask', 'auto')) { return $d }
+  return 'stream'
+}
+
+function ConvertFrom-Base64Url([string]$s) {
+  $b = $s.Replace('-', '+').Replace('_', '/')
+  return [Convert]::FromBase64String($b + ('=' * ((4 - $b.Length % 4) % 4)))
+}
+
+function ConvertTo-HexString([byte[]]$bytes) { return ([BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant() }
+
+function Get-Sha256Hex([byte[]]$bytes) {
+  $h = [System.Security.Cryptography.SHA256]::Create()
+  try { return (ConvertTo-HexString $h.ComputeHash($bytes)) } finally { $h.Dispose() }
+}
+
+function Get-VpsFileSignature([string]$key, [string]$stream, [string]$method, [string]$path, [long]$time, [string]$bodySha) {
+  $msg = [System.Text.Encoding]::ASCII.GetBytes("VRCLM1`n$stream`n$method`n$path`n$time`n$bodySha")
+  $h = New-Object System.Security.Cryptography.HMACSHA256 -ArgumentList (, (ConvertFrom-Base64Url $key))
+  try { return (ConvertTo-HexString $h.ComputeHash($msg)) } finally { $h.Dispose() }
+}
+
+# The headers of one signed request ($bodySha = hex sha256 of the body; '' = no body). $time 0 = now.
+function Get-VpsFileHeaders([string]$key, [string]$stream, [string]$method, [string]$path, [string]$bodySha = '', [long]$time = 0) {
+  if (-not $bodySha) { $bodySha = Get-Sha256Hex (New-Object byte[] 0) }
+  if ($time -le 0) { $time = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+  return [ordered]@{ 'X-Vrclm-Stream' = $stream; 'X-Vrclm-Time' = "$time"; 'X-Vrclm-Sha256' = $bodySha
+    'X-Vrclm-Sig' = (Get-VpsFileSignature $key $stream $method $path $time $bodySha) }
+}
+
+# http://<address>[:port] of the file service ('' = no address, or the file service is off).
+function Get-VpsFileBase($v) {
+  $addr = ConvertTo-HostAddress "$(Get-Prop $v 'Address')"
+  $port = ConvertTo-HostInt (Get-Prop $v 'FilePort') 80 0 65535
+  if (-not $addr -or $port -eq 0) { return '' }
+  $b = 'http://' + (Format-HostForUrl $addr)
+  if ($port -ne 80) { $b += ":$port" }
+  return $b
+}
+
+# One small request to the file service -> Code (0 = no connection or no answer), Text, Now (the server's clock on a 401).
+function Invoke-VpsFileHttp([string]$method, [string]$url, $headers = $null, [int]$ms = 5000) {
+  $resp = $null
+  try {
+    $rq = [System.Net.HttpWebRequest]::Create($url)
+    $rq.Method = $method
+    $rq.Timeout = $ms
+    $rq.ReadWriteTimeout = $ms
+    $rq.AllowAutoRedirect = $false
+    $rq.KeepAlive = $false
+    $rq.Proxy = $null
+    $rq.UserAgent = 'VRChatLinkMaker'
+    if ($headers) { foreach ($k in @($headers.Keys)) { $rq.Headers[$k] = "$($headers[$k])" } }
+    try { $resp = $rq.GetResponse() } catch {
+      $we = $_.Exception
+      while ($we -and $we -isnot [System.Net.WebException]) { $we = $we.InnerException }
+      if (-not $we -or -not $we.Response) { return [pscustomobject]@{ Code = 0; Text = $_.Exception.Message; Now = '' } }
+      $resp = $we.Response
+    }
+    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream(), [System.Text.Encoding]::UTF8)
+    $buf = New-Object char[] 262144
+    $n = $sr.ReadBlock($buf, 0, $buf.Length)
+    return [pscustomobject]@{ Code = [int]$resp.StatusCode; Text = (New-Object string($buf, 0, $n)); Now = "$($resp.Headers['X-Vrclm-Now'])" }
+  } catch {
+    return [pscustomobject]@{ Code = 0; Text = $_.Exception.Message; Now = '' }
+  } finally { if ($resp) { try { $resp.Close() } catch {} } }
+}
+
+# Is the file service on the VPS usable for this PC's stream? -> State, Detail, Status (the server's /api/v1/status):
+#   'off' (no address, or FilePort 0), 'down' (no answer), 'missing' (something else answers), 'old' (an older version),
+#   'nokey' (no FileKey: an older connection code), 'badkey' (the server doesn't know this stream's key), 'clock' (this
+#   PC's clock is off by more than 5 min), 'error' (another answer), 'full' (under 256 MB of room left) or 'ok'.
+function Test-VpsFileService($v, [int]$ms = 5000) {
+  $r = [pscustomobject]@{ State = 'off'; Detail = ''; Status = $null }
+  $base = Get-VpsFileBase $v
+  if (-not $base) { return $r }
+  $h = Invoke-VpsFileHttp 'GET' "$base/healthz" $null $ms
+  if ($h.Code -eq 0) { $r.State = 'down'; $r.Detail = $h.Text; return $r }
+  $m = [regex]::Match("$($h.Text)", '^ok vrclm-files (\d{1,6})')
+  if ($h.Code -ne 200 -or -not $m.Success) { $r.State = 'missing'; $r.Detail = "HTTP $($h.Code)"; return $r }
+  if ([int]$m.Groups[1].Value -lt $script:VpsFilesVersion) { $r.State = 'old'; $r.Detail = $m.Value; return $r }
+  $key = "$(Get-Prop $v 'FileKey')"
+  if (-not (Test-FileKey $key)) { $r.State = 'nokey'; return $r }
+  $path = '/api/v1/status'
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+  $s = Invoke-VpsFileHttp 'GET' ($base + $path) (Get-VpsFileHeaders $key "$(Get-Prop $v 'Token')" 'GET' $path '' $now) $ms
+  if ($s.Code -eq 401) {
+    $srv = 0L
+    if ([long]::TryParse($s.Now, [ref]$srv) -and [Math]::Abs($srv - $now) -gt 240) { $r.State = 'clock'; $r.Detail = [string][Math]::Round(($now - $srv) / 60.0) }
+    else { $r.State = 'badkey' }
+    return $r
+  }
+  $st = $null
+  if ($s.Code -eq 200) { try { $st = ConvertFrom-Json $s.Text } catch { $st = $null } }
+  if (-not $st) { $r.State = 'error'; $r.Detail = "HTTP $($s.Code)"; return $r }
+  $r.Status = $st
+  $room = [double]$st.budget_bytes - [double]$st.used_bytes
+  if ($null -ne $st.free_disk_bytes) { $room = [Math]::Min($room, [double]$st.free_disk_bytes - [double]$st.min_free_bytes) }
+  if ($room -lt 256MB) { $r.State = 'full' } else { $r.State = 'ok' }
+  return $r
+}
+
+function Format-VpsGb([double]$bytes) { return ('{0:0.0} GB' -f ($bytes / 1GB)) }
+
+# What's wrong with the file service, in plain words ('' = nothing).
+function Get-VpsFileProblemText($v, $r) {
+  $guest = ("$(Get-Prop $v 'Role')" -eq 'guest')
+  $port = ConvertTo-HostInt (Get-Prop $v 'FilePort') 80 0 65535
+  switch ($r.State) {
+    'down' {
+      if ($guest) { return (T '  The file service on the VPS doesn''t answer (TCP port {0}): ask whoever manages the server to paste the newest install.sh there, and to open TCP port {0} in the cloud firewall.' $port) }
+      return (T '  The file service on your VPS doesn''t answer (TCP port {0}): paste the newest install.sh on the server (it adds the file service), and open TCP port {0} in your cloud provider''s firewall.' $port)
+    }
+    'missing' { return (T '  Something else answers on the VPS''s TCP port {0}, not the file service: paste the newest install.sh on the server (it says what uses that port).' $port) }
+    'old' { return (T '  The file service on the VPS is an older version: paste the newest install.sh on the server again.') }
+    'nokey' { return (T '  Your connection code is from an older VRChat Link Maker and has no file key: ask whoever manages the server for a new code.') }
+    'badkey' {
+      if ($guest) { return (T '  The file service on the VPS doesn''t know your stream''s file key: ask whoever manages the server for a new connection code (they may have to paste install.sh again first).') }
+      return (T '  The file service on your VPS doesn''t know this PC''s file key: paste install.sh on the server again.')
+    }
+    'clock' { return (T '  This PC''s clock is about {0} min off from the VPS, so the file service refuses uploads: turn on "Set time automatically" in Windows'' date and time settings.' $r.Detail) }
+    'error' { return (T '  The file service on the VPS gave an unexpected answer ({0}).' $r.Detail) }
+    'full' { return (T '  The file storage on the VPS is full ({0} of {1} used): new files have to wait until older ones expire.' (Format-VpsGb $r.Status.used_bytes) (Format-VpsGb $r.Status.budget_bytes)) }
+  }
+  return ''
+}
+
+# The health check (the user's "test it once in a while"): what looks wrong in the server's status, as lines.
+function Get-VpsFileHealthLines($st) {
+  $out = New-Object System.Collections.ArrayList
+  if (-not $st) { return $out.ToArray() }
+  if ([double]$st.used_bytes -gt [double]$st.budget_bytes) { [void]$out.Add((T '  The VPS file service uses more than its budget: {0} of {1}.' (Format-VpsGb $st.used_bytes) (Format-VpsGb $st.budget_bytes))) }
+  $keep = [double]$st.keep_hours
+  if ([double]$st.oldest_idle_sec -gt ($keep + 1) * 3600) { [void]$out.Add((T '  A file on the VPS wasn''t watched for {0} h but is still there (files should go after {1} h): is the cleanup working?' ([Math]::Floor([double]$st.oldest_idle_sec / 3600)) $keep)) }
+  $age = $st.cleanup.age_sec
+  if ($null -eq $age -or [double]$age -gt 1800) {
+    if ($null -eq $age) { [void]$out.Add((T '  The VPS file service''s cleanup hasn''t run yet.')) }
+    else { [void]$out.Add((T '  The VPS file service''s cleanup last ran {0} min ago (it should run every 10 min).' ([Math]::Floor([double]$age / 60)))) }
+  }
+  if ($null -ne $st.free_disk_bytes -and [double]$st.free_disk_bytes -lt 1GB) { [void]$out.Add((T '  Only {0} is free on the VPS disk.' (Format-VpsGb $st.free_disk_bytes))) }
+  return $out.ToArray()
+}
+
+# Checks the file service and says what's wrong (yellow; Say also writes it to log.txt) -> Test-VpsFileService's State.
+function Show-VpsFileCheck {
+  $v = Get-Prop $script:Cfg 'Vps'
+  $r = $null
+  try { $r = Test-VpsFileService $v } catch { $r = [pscustomobject]@{ State = 'error'; Detail = $_.Exception.Message; Status = $null } }
+  if ($r.State -eq 'off') { return $r.State }
+  $problem = Get-VpsFileProblemText $v $r
+  if ($problem) { Say $problem 'Yellow' }
+  foreach ($line in @(Get-VpsFileHealthLines $r.Status)) { Say $line 'Yellow' }
+  if ($r.State -eq 'ok') {
+    $st = $r.Status
+    Say (T '  The file service on your VPS is ready: {0} of {1} used, {2} free on its disk.' (Format-VpsGb $st.used_bytes) (Format-VpsGb $st.budget_bytes) (Format-VpsGb ([double]$st.free_disk_bytes))) 'DarkGray'
+  }
+  return $r.State
 }
 
 # After the relay to the VPS broke (Wait-RelayRetry): why, as the server sees it. $sent = the relay had been sending;
@@ -1187,10 +1411,12 @@ function Reset-VpsAllPasswords($v) {
   Set-HostField $v 'PublishPass' (New-HostSecret 24) ([ref]$chg)
   Set-HostField $v 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
   Set-HostField $v 'ReadPassphrase' (New-HostSecret 32) ([ref]$chg)
+  Set-HostField $v 'FileKey' (New-FileKey) ([ref]$chg)
   foreach ($e in @(Get-Prop $v 'Streams')) {
     if ($e -isnot [System.Management.Automation.PSCustomObject]) { continue }
     Set-HostField $e 'PublishPass' (New-HostSecret 24) ([ref]$chg)
     Set-HostField $e 'SrtPassphrase' (New-HostSecret 32) ([ref]$chg)
+    Set-HostField $e 'FileKey' (New-FileKey) ([ref]$chg)
   }
   Save-VpsConfig
   Show-VpsBundle $v -Quiet
@@ -1423,6 +1649,7 @@ function Reset-StreamLink {
       # (New passwords too: a code given out for this PC's own link stops working.)
       $c.Vps.PublishPass = New-HostSecret 24
       $c.Vps.SrtPassphrase = New-HostSecret 32
+      Set-HostField $c.Vps 'FileKey' (New-FileKey) ([ref]$chg)
     }
   }
   try { Save-Config $c } catch { Say (T '  Couldn''t save config.json: {0}' $_.Exception.Message) 'Red' }
@@ -2358,7 +2585,15 @@ function New-VpsSetupBundle($s) {
   $addr = "$(Get-MtxSetting $s 'Address' '<address>')".Trim()
   $utf8 = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText((PathJoin $dir 'mediamtx.yml'), $yml, $utf8)
-  $sh = Get-VpsInstallScript $yml $tcpPorts "$srtPort"
+  # The file service (vrclm-files), unless FilePort is 0.
+  $filePort = ConvertTo-HostInt (Get-Prop $s 'FilePort') 80 0 65535
+  $filesCfg = ''; $filesPy = ''
+  if ($filePort -gt 0) {
+    $filesPy = Get-VpsFilesProgram
+    if ($filesPy) { $filesCfg = New-VpsFilesConfig $s $filePort }
+    if (-not $filesCfg) { $filePort = 0 }
+  }
+  $sh = Get-VpsInstallScript $yml $tcpPorts "$srtPort" $filesCfg $filePort $filesPy
   [System.IO.File]::WriteAllText((PathJoin $dir 'install.sh'), $sh, $utf8)
   $tcpList = ($tcpPorts -split ' ') -join ', '
   $readme = @(
@@ -2375,6 +2610,7 @@ function New-VpsSetupBundle($s) {
     (T '2) Open the ports in Oracle''s cloud firewall: Networking > Virtual cloud networks > your VCN > Security Lists > Default Security List > Add Ingress Rules, source CIDR 0.0.0.0/0:'),
     (T '   - TCP, destination port(s) {0} (the viewers: RTSP for PC, RTMP for Quest)' $tcpList),
     (T '   - UDP, destination port {0} (SRT: the stream from this PC)' $srtPort),
+    $(if ($filePort -gt 0) { T '   - TCP, destination port {0} (the file service: episodes hosted as files)' $filePort } else { $null }),
     (T '3) Install MediaMTX on the VPS:'),
     (T '   - Connect from PowerShell on this PC: ssh -i <the key file> ubuntu@{0}' $addr),
     (T '   - Type: sudo -i   (you are then root)'),
@@ -2392,14 +2628,47 @@ function New-VpsSetupBundle($s) {
     (T 'Security: only this tool can send the stream (user + password, and on SRT an encryption passphrase). Viewers can only watch live/<token>; every other path is refused. Like any stream link, anyone who has the link can watch.'),
     (T 'The server''s address is not trusted by VRChat: everyone who watches, you included, needs "Allow Untrusted URLs", and it doesn''t play in Public or Group Public instances.')
   )
-  [System.IO.File]::WriteAllText((PathJoin $dir 'README-VPS.txt'), (($readme -join "`r`n") + "`r`n"), $utf8)
+  [System.IO.File]::WriteAllText((PathJoin $dir 'README-VPS.txt'), ((@($readme | Where-Object { $null -ne $_ }) -join "`r`n") + "`r`n"), $utf8)
   return $dir
+}
+
+# vps/vrclm_files.py (the file service) as text with LF line endings ('' = not found, e.g. an incomplete copy of the tool).
+function Get-VpsFilesProgram {
+  $dir = $script:ToolDir
+  if (-not $dir) { $dir = $PSScriptRoot }
+  $p = PathJoin (PathJoin $dir 'vps') 'vrclm_files.py'
+  if (-not [System.IO.File]::Exists($p)) { return '' }
+  $t = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::ASCII).Replace("`r`n", "`n")
+  if ($t -match '[^\x09\x0A\x20-\x7E]') { throw 'vps/vrclm_files.py is not plain ASCII' }
+  return $t
+}
+
+# The file service's config (JSON) for install.sh: the port, the address for the same link, and every stream's token
+# and FileKey ('' = no stream has a key).
+function New-VpsFilesConfig($s, [int]$port) {
+  $list = New-Object System.Collections.ArrayList
+  foreach ($st in @(Get-VpsStreams $s)) {
+    if ((Test-FileKey $st.FileKey) -and (Test-LinkToken $st.Token)) { [void]$list.Add([ordered]@{ id = $st.Token; key = $st.FileKey }) }
+  }
+  if ($list.Count -eq 0) { return '' }
+  $addr = ConvertTo-HostAddress "$(Get-Prop $s 'Address')"
+  $base = ''
+  if ($addr) {
+    $base = 'http://' + (Format-HostForUrl $addr)
+    if ($port -ne 80) { $base += ":$port" }
+  }
+  $o = [ordered]@{ port = $port; same_link = [bool](ConvertTo-HostBool (Get-Prop $s 'FileSameLink') $false); public_base = $base; streams = $list.ToArray() }
+  return (ConvertTo-Json -InputObject $o -Depth 4)
 }
 
 # The install script (bash, LF line endings). Written so it can be pasted into an SSH window as root: everything runs in
 # a ( subshell ), so an error ends the script, not the SSH session.
-function Get-VpsInstallScript([string]$yml, [string]$tcpPorts, [string]$udpPorts) {
-  if ($yml -match '(?m)^VRCLM_') { throw 'config text contains a heredoc marker' }
+# With $filesCfg (New-VpsFilesConfig) and $filesPy (Get-VpsFilesProgram) it also installs the file service vrclm-files
+# on TCP $filePort. That part comes after MediaMTX runs, and if it fails MediaMTX stays as it is (a warning only).
+function Get-VpsInstallScript([string]$yml, [string]$tcpPorts, [string]$udpPorts, [string]$filesCfg = '', [int]$filePort = 0, [string]$filesPy = '') {
+  foreach ($t in @($yml, $filesCfg, $filesPy)) { if ($t -match '(?m)^VRCLM_') { throw 'config text contains a heredoc marker' } }
+  $files = ($filesCfg -and $filesPy -and $filePort -ge 1 -and $filePort -le 65535)
+  if (-not $files) { $filePort = 0 }
   $L = New-Object System.Collections.Generic.List[string]
   $L.Add('#!/bin/bash')
   $L.Add("# VRChat Link Maker - installs MediaMTX $($script:MediaMtxVersion) as a locked-down service (Ubuntu 22.04+ / Debian 12+, amd64 or arm64).")
@@ -2413,6 +2682,7 @@ function Get-VpsInstallScript([string]$yml, [string]$tcpPorts, [string]$udpPorts
   $L.Add("SHA_ARM64='$($script:MediaMtxLinuxSha256.arm64)'")
   $L.Add("TCP_PORTS='$tcpPorts'")
   $L.Add("UDP_PORTS='$udpPorts'")
+  $L.Add("FILE_PORT='$filePort'")
   $L.Add(@'
 say() { printf '\n=== %s\n' "$*"; }
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
@@ -2507,44 +2777,57 @@ WantedBy=multi-user.target
 VRCLM_UNIT_EOF
 chmod 0644 /etc/systemd/system/mediamtx.service
 
-say 'Opening the ports in the server firewall'
-add_rule() {  # $1 = iptables | ip6tables, $2 = tcp | udp, $3 = port
-  if "$1" -C INPUT -p "$2" --dport "$3" -m comment --comment vrclm-mediamtx -j ACCEPT >/dev/null 2>&1; then return 0; fi
+add_rule() {  # $1 = iptables | ip6tables, $2 = tcp | udp, $3 = port, $4 = the rule's tag
+  if "$1" -C INPUT -p "$2" --dport "$3" -m comment --comment "$4" -j ACCEPT >/dev/null 2>&1; then return 0; fi
   pos=$("$1" -L INPUT -n --line-numbers | awk '$2 == "REJECT" || $2 == "DROP" { print $1; exit }')
   if [ -n "$pos" ]; then
-    "$1" -I INPUT "$pos" -p "$2" --dport "$3" -m comment --comment vrclm-mediamtx -j ACCEPT
+    "$1" -I INPUT "$pos" -p "$2" --dport "$3" -m comment --comment "$4" -j ACCEPT
   else
-    "$1" -A INPUT -p "$2" --dport "$3" -m comment --comment vrclm-mediamtx -j ACCEPT
+    "$1" -A INPUT -p "$2" --dport "$3" -m comment --comment "$4" -j ACCEPT
   fi
 }
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-  for p in $TCP_PORTS; do ufw allow "$p/tcp" >/dev/null; done
-  for p in $UDP_PORTS; do ufw allow "$p/udp" >/dev/null; done
-  echo "ufw: opened TCP $TCP_PORTS and UDP $UDP_PORTS."
-elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  for p in $TCP_PORTS; do firewall-cmd --quiet --permanent --add-port="$p/tcp"; done
-  for p in $UDP_PORTS; do firewall-cmd --quiet --permanent --add-port="$p/udp"; done
-  firewall-cmd --quiet --reload
-  echo "firewalld: opened TCP $TCP_PORTS and UDP $UDP_PORTS."
-elif command -v iptables >/dev/null 2>&1; then
-  for ipt in iptables ip6tables; do
-    command -v "$ipt" >/dev/null 2>&1 || continue
-    "$ipt" -L INPUT -n >/dev/null 2>&1 || continue
-    for p in $TCP_PORTS; do add_rule "$ipt" tcp "$p"; done
-    for p in $UDP_PORTS; do add_rule "$ipt" udp "$p"; done
-  done
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || echo 'Note: netfilter-persistent could not save the rules.'
-  elif [ -d /etc/iptables ]; then
-    iptables-save > /etc/iptables/rules.v4
-    if command -v ip6tables-save >/dev/null 2>&1; then ip6tables-save > /etc/iptables/rules.v6; fi
+# Old iptables rules with tag $2 for ports other than $3 (e.g. the file service moved to another port).
+drop_old_rules() {  # $1 = iptables | ip6tables, $2 = the tag, $3 = the TCP port that stays
+  "$1" -S INPUT 2>/dev/null | grep -E -- "--comment \"?$2\"? " | grep -v -- "--dport $3 " | sed 's/^-A /-D /' |
+    while read -r rule; do
+      # shellcheck disable=SC2086  # (the rule is a list of iptables words, as iptables -S printed them)
+      "$1" $rule >/dev/null 2>&1 || true
+    done
+}
+open_ports() {  # $1 = TCP ports, $2 = UDP ports, $3 = the rule's tag (iptables)
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    for p in $1; do ufw allow "$p/tcp" comment "$3" >/dev/null; done
+    for p in $2; do ufw allow "$p/udp" comment "$3" >/dev/null; done
+    echo "ufw: opened TCP ${1:--} and UDP ${2:--}."
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for p in $1; do firewall-cmd --quiet --permanent --add-port="$p/tcp"; done
+    for p in $2; do firewall-cmd --quiet --permanent --add-port="$p/udp"; done
+    firewall-cmd --quiet --reload
+    echo "firewalld: opened TCP ${1:--} and UDP ${2:--}."
+  elif command -v iptables >/dev/null 2>&1; then
+    for ipt in iptables ip6tables; do
+      command -v "$ipt" >/dev/null 2>&1 || continue
+      "$ipt" -L INPUT -n >/dev/null 2>&1 || continue
+      if [ "$3" = vrclm-files ]; then drop_old_rules "$ipt" "$3" "$1"; fi
+      for p in $1; do add_rule "$ipt" tcp "$p" "$3"; done
+      for p in $2; do add_rule "$ipt" udp "$p" "$3"; done
+    done
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+      netfilter-persistent save >/dev/null 2>&1 || echo 'Note: netfilter-persistent could not save the rules.'
+    elif [ -d /etc/iptables ]; then
+      iptables-save > /etc/iptables/rules.v4
+      if command -v ip6tables-save >/dev/null 2>&1; then ip6tables-save > /etc/iptables/rules.v6; fi
+    else
+      echo 'Note: the iptables rules are not saved for the next reboot (apt-get install -y iptables-persistent saves them).'
+    fi
+    echo "iptables: opened TCP ${1:--} and UDP ${2:--}."
   else
-    echo 'Note: the iptables rules are not saved for the next reboot (apt-get install -y iptables-persistent saves them).'
+    echo 'No firewall found on the server (nothing to open here).'
   fi
-  echo "iptables: opened TCP $TCP_PORTS and UDP $UDP_PORTS."
-else
-  echo 'No firewall found on the server (nothing to open here).'
-fi
+}
+
+say 'Opening the ports in the server firewall'
+open_ports "$TCP_PORTS" "$UDP_PORTS" vrclm-mediamtx
 
 say 'Starting MediaMTX'
 systemctl daemon-reload
@@ -2558,10 +2841,164 @@ else
   journalctl -u mediamtx -n 30 --no-pager || true
   fail 'MediaMTX did not start (see above).'
 fi
+'@)
+  if ($files) {
+    $L.Add(@'
+
+# ---- the file service (vrclm-files): hosts episodes as HLS files on TCP $FILE_PORT
+# Each step checks for itself (a function called with || runs without set -e). If it fails, MediaMTX keeps running.
+files_py_ok() { "$1" -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1; }
+install_files() {
+  say 'Installing the file service (vrclm-files)'
+  PY=$(command -v python3 || true)
+  if [ -z "$PY" ] || ! files_py_ok "$PY"; then
+    command -v apt-get >/dev/null 2>&1 || { echo 'It needs python3 (3.8 or newer), and there is no apt-get here to install it.'; return 1; }
+    echo 'Installing python3 (3.8 or newer is needed)...'
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y python3 >/dev/null 2>&1 || { apt-get update >/dev/null 2>&1 && apt-get install -y python3 >/dev/null 2>&1; } ||
+      { echo 'Could not install python3 (apt-get install -y python3).'; return 1; }
+    PY=$(command -v python3 || true)
+    { [ -n "$PY" ] && files_py_ok "$PY"; } || { echo 'python3 3.8 or newer is needed.'; return 1; }
+  fi
+  PY=$(readlink -f "$PY") || return 1
+  case "$PY" in /usr/bin/* | /usr/local/bin/* | /bin/*) ;; *) echo "python3 is in an unusual place ($PY)."; return 1 ;; esac
+  "$PY" -I -c 'import http.server, socketserver, json, hmac, hashlib, shutil, secrets' >/dev/null 2>&1 ||
+    { echo "$PY lacks parts of the standard library (apt-get install -y python3)."; return 1; }
+  echo "Using $PY ($("$PY" -V 2>&1))."
+
+  install -d -m 0755 -o root -g root /usr/local/lib/vrclm-files || return 1
+  install -d -m 0700 -o root -g root /etc/vrclm-files || return 1
+  umask 022
+  cat > /usr/local/lib/vrclm-files/vrclm_files.py.new <<'VRCLM_PY_EOF' || return 1
+'@)
+    foreach ($line in ($filesPy.TrimEnd("`n") -split "`n")) { $L.Add($line) }
+    $L.Add(@'
+VRCLM_PY_EOF
+  chown root:root /usr/local/lib/vrclm-files/vrclm_files.py.new && chmod 0644 /usr/local/lib/vrclm-files/vrclm_files.py.new || return 1
+  "$PY" -I -c 'import ast, sys; ast.parse(open(sys.argv[1], "rb").read())' /usr/local/lib/vrclm-files/vrclm_files.py.new ||
+    { echo 'The file service program does not parse with this python3.'; return 1; }
+  mv -f /usr/local/lib/vrclm-files/vrclm_files.py.new /usr/local/lib/vrclm-files/vrclm_files.py || return 1
+  umask 077
+  cat > /etc/vrclm-files/config.json.new <<'VRCLM_CFG_EOF' || return 1
+'@)
+    foreach ($line in ($filesCfg.Replace("`r", '').TrimEnd("`n") -split "`n")) { $L.Add($line) }
+    $L.Add(@'
+VRCLM_CFG_EOF
+  umask 022
+  chmod 0600 /etc/vrclm-files/config.json.new || return 1
+  "$PY" -I /usr/local/lib/vrclm-files/vrclm_files.py --config /etc/vrclm-files/config.json.new --state /nonexistent --check-config ||
+    { echo 'The file service does not accept its settings (see above).'; return 1; }
+  mv -f /etc/vrclm-files/config.json.new /etc/vrclm-files/config.json || return 1
+
+  if ! systemctl is-active --quiet vrclm-files && command -v ss >/dev/null 2>&1 && [ -n "$(ss -Hltn "sport = :$FILE_PORT" 2>/dev/null)" ]; then
+    echo "TCP port $FILE_PORT is already used by another program on this server:"
+    ss -Hltnp "sport = :$FILE_PORT" 2>/dev/null || true
+    echo 'Set "FilePort" under "Vps" in config.json to a free port (or 0 = no file service), then make install.sh again.'
+    return 1
+  fi
+
+  # The settings (with the keys) stay readable by root only; systemd hands the service a private copy. Its files live
+  # in /var/lib/vrclm-files (on disk; /tmp may be in RAM). It runs as a throw-away user with no rights but binding the port.
+  cat > /etc/systemd/system/vrclm-files.service.new <<'VRCLM_UNIT_EOF' || return 1
+[Unit]
+Description=VRChat Link Maker file service (vrclm-files)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+LoadCredential=vrclm-files.json:/etc/vrclm-files/config.json
+ExecStart=@PY@ -I -B /usr/local/lib/vrclm-files/vrclm_files.py --config %d/vrclm-files.json --state /var/lib/vrclm-files
+Restart=always
+RestartSec=3
+DynamicUser=yes
+StateDirectory=vrclm-files
+StateDirectoryMode=0700
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
+MemoryMax=200M
+TasksMax=128
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target
+VRCLM_UNIT_EOF
+  sed -i "s|@PY@|$PY|" /etc/systemd/system/vrclm-files.service.new || return 1
+  chmod 0644 /etc/systemd/system/vrclm-files.service.new || return 1
+  mv -f /etc/systemd/system/vrclm-files.service.new /etc/systemd/system/vrclm-files.service || return 1
+
+  open_ports "$FILE_PORT" '' vrclm-files
+
+  systemctl daemon-reload || return 1
+  systemctl enable vrclm-files >/dev/null 2>&1 || { echo 'Could not enable the vrclm-files service.'; return 1; }
+  systemctl restart vrclm-files || { journalctl -u vrclm-files -n 20 --no-pager || true; return 1; }
+  ok=''
+  for _ in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    if "$PY" -I -c 'import sys, urllib.request as u; o = u.build_opener(u.ProxyHandler({})); sys.exit(0 if o.open("http://127.0.0.1:%s/healthz" % sys.argv[1], timeout=3).read().startswith(b"ok vrclm-files") else 1)' "$FILE_PORT" >/dev/null 2>&1; then ok=1; break; fi
+  done
+  if [ -z "$ok" ]; then
+    journalctl -u vrclm-files -n 20 --no-pager || true
+    echo "The file service does not answer on http://127.0.0.1:$FILE_PORT/healthz (see above)."
+    return 1
+  fi
+  echo "The file service is running on TCP port $FILE_PORT and starts with the server."
+  return 0
+}
+if install_files; then
+  FILES_DONE=1
+else
+  FILES_DONE=''
+  umask 022
+  echo
+  echo 'WARNING: the file service was NOT installed (see above). Streaming works as before; only hosting episodes as files does not.'
+fi
+echo
+if [ -n "$FILES_DONE" ]; then
+  echo "Done. Also open TCP $TCP_PORTS $FILE_PORT and UDP $UDP_PORTS in your cloud provider's firewall (Oracle: the VCN security list)."
+else
+  echo "Done. Also open TCP $TCP_PORTS and UDP $UDP_PORTS in your cloud provider's firewall (Oracle: the VCN security list)."
+fi
+)
+'@)
+  } else {
+    $L.Add(@'
+# (No file service in this setup: one installed by an earlier install.sh is stopped.)
+if [ -f /etc/systemd/system/vrclm-files.service ]; then
+  systemctl disable --now vrclm-files >/dev/null 2>&1 || true
+  echo 'The file service (vrclm-files) is turned off in this setup: it is stopped.'
+fi
 echo
 echo "Done. Also open TCP $TCP_PORTS and UDP $UDP_PORTS in your cloud provider's firewall (Oracle: the VCN security list)."
 )
 '@)
+  }
   return (($L -join "`n").Replace("`r", '') + "`n")
 }
 

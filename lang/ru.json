@@ -989,5 +989,22 @@
   "Close the window": "Закрыть окно",
   "Start again (under the picture) to stream more, or close this window.": "Чтобы показать ещё что-нибудь, нажмите «Запустить снова» под картинкой или закройте это окно.",
   "Stream ended at {0}. On the air for {1}. Log: {2}": "Трансляция закончилась в {0}. В эфире {1}. Журнал: {2}",
-  "End the stream": "Завершить трансляцию"
+  "End the stream": "Завершить трансляцию",
+  "   - TCP, destination port {0} (the file service: episodes hosted as files)": "   - TCP, порт назначения {0} (файловый сервис: серии, выложенные файлами)",
+  "  A file on the VPS wasn't watched for {0} h but is still there (files should go after {1} h): is the cleanup working?": "  Файл на VPS не смотрели {0} ч, но он всё ещё там (файлы должны удаляться через {1} ч): работает ли очистка?",
+  "  Only {0} is free on the VPS disk.": "  На диске VPS свободно всего {0}.",
+  "  Something else answers on the VPS's TCP port {0}, not the file service: paste the newest install.sh on the server (it says what uses that port).": "  На TCP-порту {0} VPS отвечает что-то другое, а не файловый сервис: вставьте на сервере свежий install.sh (он покажет, кто занял порт).",
+  "  The VPS file service uses more than its budget: {0} of {1}.": "  Файловый сервис VPS занимает больше отведённого места: {0} из {1}.",
+  "  The VPS file service's cleanup hasn't run yet.": "  Очистка файлового сервиса VPS ещё ни разу не запускалась.",
+  "  The VPS file service's cleanup last ran {0} min ago (it should run every 10 min).": "  Очистка файлового сервиса VPS запускалась {0} мин назад (должна раз в 10 мин).",
+  "  The file service on the VPS doesn't answer (TCP port {0}): ask whoever manages the server to paste the newest install.sh there, and to open TCP port {0} in the cloud firewall.": "  Файловый сервис на VPS не отвечает (TCP-порт {0}): попросите того, кто управляет сервером, вставить там свежий install.sh и открыть TCP-порт {0} в облачном файрволе.",
+  "  The file service on the VPS doesn't know your stream's file key: ask whoever manages the server for a new connection code (they may have to paste install.sh again first).": "  Файловый сервис на VPS не знает файловый ключ вашего потока: попросите у того, кто управляет сервером, новый код подключения (возможно, ему сначала придётся снова вставить install.sh).",
+  "  The file service on the VPS gave an unexpected answer ({0}).": "  Файловый сервис на VPS ответил неожиданно ({0}).",
+  "  The file service on the VPS is an older version: paste the newest install.sh on the server again.": "  На VPS стоит старая версия файлового сервиса: вставьте на сервере свежий install.sh ещё раз.",
+  "  The file service on your VPS doesn't answer (TCP port {0}): paste the newest install.sh on the server (it adds the file service), and open TCP port {0} in your cloud provider's firewall.": "  Файловый сервис на вашем VPS не отвечает (TCP-порт {0}): вставьте на сервере свежий install.sh (он добавит файловый сервис) и откройте TCP-порт {0} в файрволе облачного провайдера.",
+  "  The file service on your VPS doesn't know this PC's file key: paste install.sh on the server again.": "  Файловый сервис на вашем VPS не знает файловый ключ этого ПК: вставьте install.sh на сервере ещё раз.",
+  "  The file service on your VPS is ready: {0} of {1} used, {2} free on its disk.": "  Файловый сервис на вашем VPS готов: занято {0} из {1}, на диске свободно {2}.",
+  "  The file storage on the VPS is full ({0} of {1} used): new files have to wait until older ones expire.": "  Хранилище файлов на VPS заполнено (занято {0} из {1}): новые файлы подождут, пока не удалятся старые.",
+  "  This PC's clock is about {0} min off from the VPS, so the file service refuses uploads: turn on \"Set time automatically\" in Windows' date and time settings.": "  Часы этого ПК расходятся с VPS примерно на {0} мин, поэтому файловый сервис не принимает загрузки: включите «Установить время автоматически» в настройках даты и времени Windows.",
+  "  Your connection code is from an older VRChat Link Maker and has no file key: ask whoever manages the server for a new code.": "  Ваш код подключения от старой версии VRChat Link Maker, в нём нет файлового ключа: попросите новый код у того, кто управляет сервером."
 }
