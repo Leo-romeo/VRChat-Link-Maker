@@ -116,7 +116,8 @@ function Invoke-PanelKey([System.Windows.Forms.Keys]$keyData) {
   $mods = $keyData -band $K::Modifiers
   if (($code -eq $K::Space -or $code -eq $K::Left -or $code -eq $K::Right) -and -not (Test-PanelKeyOurs $code)) { return $false }
   if ($code -eq $K::Space -and $mods -eq $K::None) {
-    if ($p.Big.Enabled) { Add-PanelCommand 'toggle' }
+    # (Space never ends the stream nor starts a new one: only pause / continue / start now.)
+    if ($p.Big.Enabled -and $p.Mode -ne 'waiting' -and $p.Mode -ne 'ended') { Add-PanelCommand 'toggle' }
     return $true
   }
   if (($code -eq $K::Left -or $code -eq $K::Right) -and ($mods -eq $K::None -or $mods -eq $K::Shift)) {
@@ -203,7 +204,7 @@ function New-ControlPanel {
     Drag = $false; DragPos = 0.0; HoldPos = 0.0; HoldUntil = [DateTime]::MinValue
     StopArmedUntil = [DateTime]::MinValue; CopiedUntil = [DateTime]::MinValue; CopiedBtn = $null
     PrevCheck = [DateTime]::MinValue; PrevTime = [DateTime]::MinValue; PrevMissing = [DateTime]::MinValue
-    InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; CueSet = $false; CueTries = 0; InputParked = $false; InRows = $false; Timer = $null
+    InputOn = $false; CmdOn = $false; ListIds = @(); BannerUntil = [DateTime]::MinValue; IdleHushUntil = [DateTime]::MinValue; EndedError = $false; EndedTry = 0; ModeKey = ''; CueSet = $false; CueTries = 0; InputParked = $false; InRows = $false; Timer = $null
     AskId = ''; AskSent = ''; AskSentAt = [DateTime]::MinValue; AskView = $null; AskFocus = $null; AskFocusPending = $false; AskFlashing = $false
     AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null; AskDigits = ''; AskDigitsAt = [DateTime]::MinValue
     Wide = $null; Page = 'queue'; PageBack = 'queue'; ClockOn = $false; ListNames = @(); ListInfo = @(); QHot = -1; QHotBtn = ''; QOn = $false
@@ -366,7 +367,7 @@ function New-ControlPanel {
   $bn.Margin = New-Object System.Windows.Forms.Padding(2, [int](3 * $k), 2, [int](2 * $k))
   $bn.Cursor = [System.Windows.Forms.Cursors]::Hand
   $bn.Visible = $false
-  $bn.Add_Click({ try { Hide-PanelBanner } catch {} })
+  $bn.Add_Click({ try { $script:Panel.IdleHushUntil = [DateTime]::UtcNow.AddSeconds(5); Hide-PanelBanner; Add-PanelCommand 'seen' } catch {} })
   $p.Banner = $bn
   $root.Controls.Add($bn, 0, 2)
 
@@ -492,8 +493,9 @@ function New-ControlPanel {
   $tr = New-PanelGrid 7 ([int]($fh * 2.5))
   $p.Back30 = New-PanelButton ($rew + ' ' + (T '{0}s' 30)) (T 'Back 30 seconds (Shift+Left)') 'seek' (-30) $p.Sym
   $p.Back10 = New-PanelButton ($rew + ' ' + (T '{0}s' 10)) (T 'Back 10 seconds (Left arrow)') 'seek' (-10) $p.Sym
-  $p.Big = New-PanelButton '' (T 'Space pauses and continues') 'toggle' $null $p.BigFont
+  $p.Big = New-PanelButton '' (T 'Space pauses and continues') '' $null $p.BigFont
   $p.Big.BackColor = $c.Pick
+  $p.Big.Add_Click({ try { Invoke-PanelBig } catch { Write-PanelWarning $_ } })
   $p.Fwd10 = New-PanelButton ((T '{0}s' 10) + ' ' + $fwd) (T 'Forward 10 seconds (Right arrow)') 'seek' 10 $p.Sym
   $p.Fwd30 = New-PanelButton ((T '{0}s' 30) + ' ' + $fwd) (T 'Forward 30 seconds (Shift+Right)') 'seek' 30 $p.Sym
   $p.Next = New-PanelButton ((T 'Next') + ' ' + [char]0x23ED) (T 'Skip to the next video in the list.') 'skip' $null $p.Sym
@@ -518,7 +520,7 @@ function New-ControlPanel {
   })
   # Column widths follow the texts; the middle button gets room for its longest text and a bit more.
   $bigW = 0
-  foreach ($x in @((T 'Pause'), (T 'Continue'), (T 'Start now'))) { $bigW = [Math]::Max($bigW, [System.Windows.Forms.TextRenderer]::MeasureText(([string][char]0x25B6 + ' ' + $x), $p.BigFont).Width) }
+  foreach ($x in @((T 'Pause'), (T 'Continue'), (T 'Start now'), (T 'End stream'), (T 'Start again'))) { $bigW = [Math]::Max($bigW, [System.Windows.Forms.TextRenderer]::MeasureText(([string][char]0x25B6 + ' ' + $x), $p.BigFont).Width) }
   $tr.ColumnStyles.Clear()
   foreach ($b in @($p.Back30, $p.Back10, $p.Big, $p.Fwd10, $p.Fwd30, $p.Next, $p.Stop)) {
     $w = [System.Windows.Forms.TextRenderer]::MeasureText([string]$b.Text, $b.Font).Width + [int](18 * $k)
@@ -690,6 +692,7 @@ function New-ControlPanel {
   $le.Padding = New-Object System.Windows.Forms.Padding([int](16 * $k))
   $le.Text = (T 'Nothing queued yet') + "`r`n`r`n" + (T 'Type a title or paste a link above and press Enter, or drop videos anywhere on this window.')
   $p.ListEmpty = $le
+  $p.ListEmptyText = $le.Text
 
   # Messages (everything the console window shows; right-click copies)
   $lg = New-Object "$WF.ListBox"
@@ -780,7 +783,21 @@ function New-ControlPanel {
   # (A question that came while the window was behind: its answer box gets the focus once the window is in front.)
   # (Not while another tab shows: the focus goes into the question when its tab is clicked, Set-PanelPageFocus.)
   $f.Add_Activated({ try { $q = $script:Panel; if ($q.AskFocusPending -and $q.Ask.Visible) { $q.AskFocusPending = $false; Move-PanelAskFocus } } catch {} })
-  $f.Add_FormClosing({ try { Save-PanelBounds } catch {} })
+  $f.Add_FormClosing({
+    param($sender, $e)
+    try {
+      $q = $script:Panel
+      if (($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -or $e.CloseReason -eq [System.Windows.Forms.CloseReason]::None) -and -not $q.Closed -and -not $script:PanelSync.CloseReq -and $q.Mode -and $q.Mode -ne 'off' -and $q.Mode -ne 'ended') {
+        $c = Show-PanelCloseChoice
+        if ($c -ne 'close') {
+          $e.Cancel = $true
+          if ($c -eq 'end') { $b = Get-PanelBus; if ($b) { $b.QuitReq = $true }; Add-PanelCommand 'quit' }
+          return
+        }
+      }
+    } catch {}
+    try { Save-PanelBounds } catch {}
+  })
   $f.Add_FormClosed({ try { $script:Panel.Closed = $true; $script:PanelSync.Closed = $true; Remove-PanelImage } catch {} })
   Add-PanelKeyHook $f
   Add-PanelDropHook $f
@@ -975,6 +992,62 @@ function Set-PanelCue {
 function Stop-PanelTimer { $q = $script:Panel; if ($q.Timer) { $q.Timer.Stop() } }
 function Start-PanelTimer { $q = $script:Panel; if ($q.Timer -and -not $q.Closed) { $q.Timer.Start() } }
 
+# The window's X while the stream is on: 'end' (End stream), 'close' (only the window; the default) or 'cancel'.
+function Show-PanelCloseChoice {
+  $q = $script:Panel
+  $c = $q.Colors
+  $k = $q.K
+  # (Closed from the taskbar while minimized: the question would be hidden behind it.)
+  try { if ($q.Form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { $q.Form.WindowState = [System.Windows.Forms.FormWindowState]::Normal }; $q.Form.Activate() } catch {}
+  Stop-PanelTimer
+  $d = New-Object System.Windows.Forms.Form
+  try {
+    $d.Text = 'VRChat Link Maker'
+    $d.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $d.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $d.MinimizeBox = $false; $d.MaximizeBox = $false; $d.ShowInTaskbar = $false
+    $d.AutoSize = $true; $d.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $d.BackColor = $c.Back; $d.ForeColor = $c.Text; $d.Font = $q.Font
+    $d.Padding = New-Object System.Windows.Forms.Padding([int](12 * $k))
+    $tl = New-Object System.Windows.Forms.TableLayoutPanel
+    $tl.AutoSize = $true; $tl.ColumnCount = 1; $tl.RowCount = 2
+    $tl.Location = New-Object System.Drawing.Point([int](12 * $k), [int](12 * $k))
+    $lb = New-Object System.Windows.Forms.Label
+    $lb.AutoSize = $true
+    $lb.MaximumSize = New-Object System.Drawing.Size([int](440 * $k), 0)
+    $lb.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, [int](12 * $k))
+    $lb.Text = T 'End the stream, or only close this window? Without the window the stream goes on (F2 in the console window opens it again).'
+    $tl.Controls.Add($lb, 0, 0)
+    $fl = New-Object System.Windows.Forms.FlowLayoutPanel
+    $fl.AutoSize = $true; $fl.WrapContents = $false
+    $fl.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $fl.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $mk = {
+      param($text, $res)
+      $b = New-Object System.Windows.Forms.Button
+      $b.Text = $text; $b.AutoSize = $true; $b.DialogResult = $res
+      $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+      $b.FlatAppearance.BorderColor = $c.Border; $b.BackColor = $c.Button; $b.ForeColor = $c.Text; $b.UseVisualStyleBackColor = $false
+      $b.Padding = New-Object System.Windows.Forms.Padding([int](8 * $k), [int](2 * $k), [int](8 * $k), [int](2 * $k))
+      $b
+    }
+    $bc = & $mk (T 'Cancel') ([System.Windows.Forms.DialogResult]::Cancel)
+    $bw = & $mk (T 'Close the window') ([System.Windows.Forms.DialogResult]::No)
+    $be = & $mk (T 'End the stream') ([System.Windows.Forms.DialogResult]::Yes)
+    $be.BackColor = (New-PanelColor 120 45 45)
+    foreach ($b in @($bc, $bw, $be)) { $fl.Controls.Add($b) }
+    $tl.Controls.Add($fl, 0, 1)
+    $d.Controls.Add($tl)
+    $d.AcceptButton = $bw
+    $d.CancelButton = $bc
+    $d.Add_Shown({ try { $bw.Focus() } catch {} })
+    $r = $d.ShowDialog($q.Form)
+  } finally { $d.Dispose(); Start-PanelTimer }
+  if ($r -eq [System.Windows.Forms.DialogResult]::Yes) { return 'end' }
+  if ($r -eq [System.Windows.Forms.DialogResult]::No) { return 'close' }
+  return 'cancel'
+}
+
 function Confirm-Panel([string]$text) {
   $q = $script:Panel
   Stop-PanelTimer
@@ -1140,7 +1213,7 @@ function Update-PanelMenu {
   [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
   $en = New-PanelMenuItem (T 'End stream...') 'quit'
   # (Also while a question waits, the start screen's '>' included: QuitReq ends the tool from there, see Test-UiQuit.)
-  $en.Enabled = [bool]($s -and (($mode -and $mode -ne 'off' -and -not $prompt) -or $null -ne (Get-PanelAsk)))
+  $en.Enabled = [bool]($s -and $mode -ne 'ended' -and (($mode -and $mode -ne 'off' -and -not $prompt) -or $null -ne (Get-PanelAsk)))
   $en.Add_Click({
     try {
       if (Confirm-Panel (T 'End the stream now? Viewers lose the picture.')) {
@@ -2315,23 +2388,62 @@ function Set-PanelProp([string]$key, $ctrl, [string]$prop, $value) {
   $ctrl.$prop = $value
 }
 
+# The big button's click (Space: Invoke-PanelKey, only pause / continue).
+function Invoke-PanelBig {
+  $q = $script:Panel
+  switch ($q.Mode) {
+    'waiting' {
+      if (Confirm-Panel (T 'End the stream now? Viewers lose the picture.')) {
+        $b = Get-PanelBus
+        if ($b) { $b.QuitReq = $true }
+        Add-PanelCommand 'quit'
+      }
+    }
+    'ended' { $q.Big.Enabled = $false; Add-PanelCommand 'again' }
+    default { Add-PanelCommand 'toggle' }
+  }
+}
+
 function Set-PanelMode([string]$mode) {
   $q = $script:Panel
-  if ($q.Mode -ceq $mode) { return }
+  $key = $mode
+  if ($mode -eq 'ended') { $key = 'ended' + [int]$q.EndedError + '.' + $q.EndedTry }
+  if ($q.ModeKey -ceq $key) { return }
+  $q.ModeKey = $key
   $q.Mode = $mode
   $play = [string][char]0x25B6
   $pause = [string][char]0x23F8
+  $end = [string][char]0x25A0
   switch ($mode) {
     'content'   { $q.Big.Text = $pause + ' ' + (T 'Pause');     $q.Big.Enabled = $true;  $badge = T 'Playing';        $bc = (New-PanelColor 40 140 70) }
     'paused'    { $q.Big.Text = $play + ' ' + (T 'Continue');   $q.Big.Enabled = $true;  $badge = T 'Paused';         $bc = (New-PanelColor 190 130 30) }
     'hold'      { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $true;  $badge = T 'Ready to start'; $bc = (New-PanelColor 40 110 190) }
-    'waiting'   { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $false; $badge = T 'Waiting';        $bc = (New-PanelColor 90 90 100) }
+    'waiting'   { $q.Big.Text = $end + ' ' + (T 'End stream');  $q.Big.Enabled = $true;  $badge = T 'Waiting';        $bc = (New-PanelColor 90 90 100) }
+    'ended'     {
+      $q.Big.Text = $play + ' ' + (T 'Start again'); $q.Big.Enabled = $true; $badge = T 'Ended'; $bc = (New-PanelColor 90 90 100)
+      if ($q.EndedError) { $bc = (New-PanelColor 170 50 50) }
+    }
     'reconnect' { $q.Big.Text = $pause + ' ' + (T 'Pause');     $q.Big.Enabled = $false; $badge = T 'Reconnecting';   $bc = (New-PanelColor 180 70 40) }
     default     { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $false; $badge = T 'Off';            $bc = (New-PanelColor 70 70 78) }
   }
-  if ($q.Big.Enabled) { $q.Big.BackColor = (New-PanelColor 40 90 150) } else { $q.Big.BackColor = $q.Colors.Button }
+  if (-not $q.Big.Enabled) { $q.Big.BackColor = $q.Colors.Button }
+  elseif ($mode -eq 'waiting') { $q.Big.BackColor = (New-PanelColor 120 45 45) }
+  else { $q.Big.BackColor = (New-PanelColor 40 90 150) }
+  $q.Tips.SetToolTip($q.Big, $(switch ($mode) {
+        'waiting' { T 'Ends the stream (asks first). Stop is for a video that plays.' }
+        'ended' { T 'Starts the tool again.' }
+        default { T 'Space pauses and continues' } }))
   $q.Badge.Text = $badge
   $q.Badge.BackColor = $bc
+  # (Up next's hint: once it ended, nothing can be added here any more.)
+  if ($mode -eq 'ended') {
+    $q.ListEmpty.Text = (T 'The stream ended') + "`r`n`r`n" + (T 'Start again (under the picture) to stream more, or close this window.')
+    # (No old warning bar, and no last picture of a stream that is gone.)
+    Hide-PanelBanner
+    Remove-PanelImage
+    $q.Preview.Invalidate()
+  }
+  elseif ($q.ListEmptyText) { $q.ListEmpty.Text = $q.ListEmptyText }
   $q.Badge.ForeColor = [System.Drawing.Color]::White
 }
 
@@ -2339,7 +2451,7 @@ function Set-PanelMode([string]$mode) {
 # whole JPEG (ffmpeg may be in the middle of writing it: then the next try picks it up).
 function Update-PanelPreview([DateTime]$now) {
   $q = $script:Panel
-  if (($now - $q.PrevCheck).TotalMilliseconds -lt 400) { return }
+  if (($now - $q.PrevCheck).TotalMilliseconds -lt 400 -or $q.Mode -eq 'ended') { return }
   $q.PrevCheck = $now
   if ($q.Form.WindowState -eq [System.Windows.Forms.FormWindowState]::Minimized) { return }
   $path = [string]$script:PreviewFile
@@ -2656,11 +2768,20 @@ function Update-PanelView($s) {
     if ([double]::IsNaN($dur) -or [double]::IsInfinity($dur) -or $dur -lt 0) { $dur = 0.0 }
     if ([double]::IsNaN($pos) -or [double]::IsInfinity($pos) -or $pos -lt 0) { $pos = 0.0 }
     $canSeek = [bool]$s['CanSeek']
-    $on = ($mode -ne 'off')
+    $q.EndedError = [bool]$s['EndedError']
+    $q.EndedTry = [int]$s['Try']
+    $on = ($mode -ne 'off' -and $mode -ne 'ended')
     # (Prompt: the tool's own window still asks its start questions, nothing plays yet: no commands meanwhile.)
     $cmdOn = ($on -and -not [bool]$s['Prompt'])
 
     Set-PanelMode $mode
+    # The waiting screen's idle end is near (State.IdleWarn): the yellow bar stays until it is clicked or something
+    # is added; a click tells the main thread someone is there ('seen').
+    if ([bool]$s['IdleWarn'] -and $now -ge $q.IdleHushUntil) {
+      $iw = T 'The stream ends in 2 minutes: nothing is queued. Click here to keep it on.'
+      if (-not $q.Banner.Visible -or $q.Banner.Text -cne $iw) { Show-PanelBanner $iw 'Yellow' }
+      $q.BannerUntil = $now.AddSeconds(5)
+    }
     $title = [string]$s['Title']
     if (-not $title) { $title = T 'Nothing is playing' }
     if ($script:PanelLast['title'] -cne $title) { $q.Tips.SetToolTip($q.Title, $title) }
@@ -2669,7 +2790,8 @@ function Update-PanelView($s) {
     $rel = ($canSeek -and ($mode -eq 'content' -or $mode -eq 'paused' -or $mode -eq 'hold'))
     foreach ($b in @($q.Back30, $q.Back10, $q.Fwd10, $q.Fwd30)) { Set-PanelProp ('en' + $b.GetHashCode()) $b 'Enabled' $rel }
     Set-PanelProp 'next' $q.Next 'Enabled' $cmdOn
-    Set-PanelProp 'stop' $q.Stop 'Enabled' $cmdOn
+    # (On the waiting screen there is nothing to stop: the big button ends the stream there.)
+    Set-PanelProp 'stop' $q.Stop 'Enabled' ($cmdOn -and $mode -ne 'waiting')
     Set-PanelProp 'resync' $q.Resync 'Enabled' $cmdOn
     if ($q.StopArmedUntil -ne [DateTime]::MinValue -and ($now -ge $q.StopArmedUntil -or -not $cmdOn)) {
       $q.StopArmedUntil = [DateTime]::MinValue

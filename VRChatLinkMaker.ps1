@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.12'
+$script:Version = '1.13'
 $script:Args0 = @($args)
 # A download window (D, "Download Videos.bat"): started with --download first, see Invoke-DownloadMain.
 $script:DownloadArg = '--download'
@@ -27,6 +27,10 @@ if ($env:VRCLM_DATA) { $script:DataDir = $env:VRCLM_DATA }
 $script:TempRoot = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'VRCLinkMaker')
 $script:IsWin = ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT)
 $script:Interactive = -not $env:VRCLM_AUTO
+# Started by the .bat (it pauses after an error itself). Read once and removed: the windows this one starts (add,
+# download, a new version) are not started by the .bat.
+$script:FromBat = [bool]$env:VRCLM_FROM_BAT
+if ($env:VRCLM_FROM_BAT) { try { [Environment]::SetEnvironmentVariable('VRCLM_FROM_BAT', $null) } catch {} }
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:IdleMinutes = 15.0
@@ -4704,6 +4708,7 @@ function Start-Relay {
   $script:RelayErr = $script:Relay.StandardError.ReadToEndAsync()
   $script:RelayIn = $script:Relay.StandardInput.BaseStream
   $script:RelayStartedAt = Get-Date
+  if (-not $script:OnAirSince) { $script:OnAirSince = $script:RelayStartedAt }   # (the summary at the end)
   $script:RelayKilled = $false
   $script:RelayHadSent = $false
   $script:LastEnd = -1.0
@@ -4832,12 +4837,13 @@ function Wait-RelayRetry([bool]$video = $true) {
     # My VPS: the server says why (a link it doesn't know, a wrong password, another PC on the same link...).
     $verdict = $null
     try { $verdict = Get-VpsRelayVerdict $sent $endedItself } catch { if ($script:CtrlCQuit) { throw } }
-    if ($verdict -and $verdict.Stop) { Say $verdict.Message 'Red'; return $false }
+    if ($verdict -and $verdict.Stop) { $script:EndReason = $verdict.Message; Say $verdict.Message 'Red'; return $false }
     if ($verdict -and $verdict.Why) { $why = $verdict.Why }
   }
   $script:RelayFails++
   if ($script:RelayFails -gt 7) {
-    Say (T 'Can''t keep a connection to the stream server. Check your internet connection and try again later.') 'Red'
+    $script:EndReason = T 'Can''t keep a connection to the stream server. Check your internet connection and try again later.'
+    Say $script:EndReason 'Red'
     if ($why) { Say "  ($(Get-ShortText $why 110))" 'DarkGray' }
     return $false
   }
@@ -6108,7 +6114,9 @@ function Receive-Commands([string]$kind) {
       $p = $null
       try { $p = Read-PanelCommand } catch {}
       if (-not $p) { break }
+      $script:UserActiveAt = Get-Date
       switch ($p.Cmd) {
+        'seen' { }   # (a click on the yellow bar: only that someone is there, Test-IdleEnd)
         'add' { Open-AddWindow '' }
         # (A title being typed in the input box: its search gets ready, Start-AddWorker. Cancel on its card stops it.)
         'warm' { if ($kind -ne 'waiting') { [void](Start-AddWorker) } }
@@ -6557,6 +6565,7 @@ function Read-KeyCommand([string]$kind) {
       else { Start-Sleep -Milliseconds 5 }
     }
   } catch { if ($keys.Count -eq 0) { return $null } }
+  if ($keys.Count -gt 0) { $script:UserActiveAt = Get-Date }
   foreach ($k in $keys) {
     if (Test-CtrlCKey $k) { $script:TypeBuf = ''; $script:Armed = $null; return (New-Cmd 'quit') }
   }
@@ -7302,7 +7311,11 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
   if (-not $script:PanelShown) { return }
   $script:PanelState = $null
   try {
-    if (-not (Test-ControlPanelOpen)) { $script:PanelShown = $false; return }
+    if (-not (Test-ControlPanelOpen)) {
+      $script:PanelShown = $false
+      if (Test-RelayAlive) { Say (T 'The control window is closed; the stream goes on. F2 opens it again.') 'Gray' }
+      return
+    }
     $title = ''
     if ($media) { $title = $media.Name }
     $dur = 0.0
@@ -7353,7 +7366,7 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $s = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up; UpcomingIds = [int[]]$upIds
       UpcomingNames = [string[]]$upNames; UpcomingInfo = [string[]]$upInfo; UpcomingTotal = [Math]::Max(0, $script:Queue.Count - $from)
       Link = $script:ShownLink; QuestLink = $quest; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
-      Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip; Tracks = $null }
+      Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip; Tracks = $null; IdleWarn = ($kind -eq 'waiting' -and [bool]$script:IdleWarnAt) }
     if ($media -and $media.Info -and ($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold')) { try { $s.Tracks = Get-PanelTracks $media } catch {} }
     $m = $null
     try { $m = Get-PanelMenuState } catch {}
@@ -7426,6 +7439,7 @@ function Get-PanelMenuState {
 # failed, relay, slow, playnow. .Cmd is the command that ended it, .Target the position to go on from (seek / pause).
 function Invoke-Source {
   param([string]$Kind, $Media = $null, [double]$Start = 0, [switch]$UntilNextReady, $Hold = $null)
+  $script:IdleWarnAt = $null   # (its idle minutes start again with each screen, Test-IdleEnd)
   # The screen a resync started with its new connection goes on (no gap in the picture right after players reconnect).
   $src = $script:Src
   $alive = $false
@@ -7546,7 +7560,8 @@ function Invoke-Source {
     }
     if ($Kind -eq 'paused' -and -not $requested -and ($now - $t0).TotalMinutes -ge $script:PauseMaxMinutes) {
       $requested = 'timeout'; Stop-Proc $proc; $quitSentAt = $now
-      Say (T 'The stream was paused for {0} minutes, so it is ending.' ($script:PauseMaxMinutes.ToString($script:Inv))) 'Gray'
+      $script:EndReason = T 'The stream was paused for {0} minutes, so it is ending.' ($script:PauseMaxMinutes.ToString($script:Inv))
+      Say $script:EndReason 'Gray'
     }
     if ($Kind -eq 'hold' -and -not $requested) {
       if (Test-HoldReady $Hold) { $requested = 'start'; Stop-Proc $proc; $quitSentAt = $now }
@@ -7557,13 +7572,16 @@ function Invoke-Source {
       if ($script:Idx -lt $script:Queue.Count) { $nx = $script:Queue[$script:Idx] }
       if ($nx) {
         $idleSince = $now
+        $script:IdleWarnAt = $null
         $script:PromptOk = $script:Interactive
         $script:PrepAsk = -not $script:ChoosingMode   # (startup questions never time out)
         try { Step-Prep $nx } finally { $script:PromptOk = $false; $script:PrepAsk = $false }
         if ($nx.State -eq 'ready' -or $nx.State -eq 'failed') { $requested = 'ready'; Stop-Proc $proc; $quitSentAt = $now }
-      } elseif (($now - $idleSince).TotalMinutes -ge $script:IdleMinutes) {
+      } elseif (Test-IdleEnd ([ref]$idleSince) $now) {
         $requested = 'timeout'; Stop-Proc $proc; $quitSentAt = $now
-        Say (T 'Nothing new was added for {0} minutes, so the stream is ending.' ($script:IdleMinutes.ToString($script:Inv))) 'Gray'
+        $script:IdleWarnAt = $null
+        $script:EndReason = T 'Nothing new was added for {0} minutes, so the stream is ending.' ($script:IdleMinutes.ToString($script:Inv))
+        Say $script:EndReason 'Gray'
       }
     }
     if ($quitSentAt -and ($now - $quitSentAt).TotalSeconds -gt 1.5) { Stop-Proc $proc; $quitSentAt = $null }
@@ -7728,7 +7746,30 @@ function Get-ClampedPos($media, [double]$p) {
   return $p
 }
 
+# The waiting screen with nothing queued: $true once IdleMinutes went by. Two minutes before, a warning (here and as
+# the control window's yellow bar, State.IdleWarn); a key here or a click in the window after it starts the minutes
+# again ($script:UserActiveAt: Read-KeyCommand, Receive-Commands).
+$script:IdleWarnAt = $null
+$script:UserActiveAt = [DateTime]::MinValue
+function Test-IdleEnd([ref]$since, [DateTime]$now) {
+  $left = $script:IdleMinutes - ($now - $since.Value).TotalMinutes
+  if ($script:IdleWarnAt) {
+    if ($script:UserActiveAt -gt $script:IdleWarnAt) {
+      $script:IdleWarnAt = $null
+      $since.Value = $now
+      Say (T '  OK: the stream stays on for another {0} minutes.' ($script:IdleMinutes.ToString($script:Inv))) 'Gray'
+      return $false
+    }
+  } elseif ($script:IdleMinutes -ge 3 -and $left -le 2 -and $left -gt 0) {
+    $script:IdleWarnAt = $now
+    Say (T 'The stream ends in 2 minutes: nothing is queued. Press any key here (or click the yellow bar in the control window) to keep it on.') 'Yellow'
+    return $false
+  }
+  return ($left -le 0)
+}
+
 function Show-NowPlaying($item) {
+  if (-not (Get-Prop $item 'Counted')) { $item | Add-Member -Force -NotePropertyName Counted -NotePropertyValue $true; $script:PlayedCount++ }
   $n = $script:Idx + 1
   $total = $script:Queue.Count
   $dur = ''
@@ -8546,6 +8587,84 @@ function Invoke-ResumeOffer([int]$from = 0) {
   }
 }
 
+# The last line of a session: "Stream ended at 23:10. Streamed 3 videos, on the air for 1 h 12 min. Log: log.txt"
+# ('' when it never went on the air).
+$script:OnAirSince = $null
+$script:PlayedCount = 0
+$script:EndReason = $null
+$script:EndError = $null
+$script:EndSummary = ''
+$script:KeepPanel = $false
+function Get-EndSummary {
+  if (-not $script:OnAirSince) { return '' }
+  try {
+    $now = Get-Date
+    $mins = [int][Math]::Floor(($now - $script:OnAirSince).TotalMinutes)
+    if ($mins -ge 60) { $span = T '{0} h {1} min' ([int][Math]::Floor($mins / 60)) ($mins % 60) } else { $span = T '{0} min' $mins }
+    $at = $now.ToString('HH:mm', $script:Inv)
+    $log = 'log.txt'
+    try { if ($script:DataDir) { $log = [System.IO.Path]::Combine([string]$script:DataDir, 'log.txt') } } catch {}
+    if ($script:PlayedCount -le 0) { return (T 'Stream ended at {0}. On the air for {1}. Log: {2}' $at $span $log) }
+    if ($script:PlayedCount -eq 1) { return (T 'Stream ended at {0}. Streamed 1 video, on the air for {1}. Log: {2}' $at $span $log) }
+    return (T 'Stream ended at {0}. Streamed {1} videos, on the air for {2}. Log: {3}' $at $script:PlayedCount $span $log)
+  } catch { return '' }
+}
+
+# The session is over and the control window stays: badge "Ended" (red after an error), why, and Start again. This
+# console waits for it: the window's X (or Enter here) closes both; Start again opens a new tool, then this one closes.
+function Show-EndedPanel {
+  $why = $script:EndReason
+  if ($script:EndError) { $why = T 'Error: {0}' $script:EndError }
+  if (-not $why) { $why = T 'The stream was ended.' }
+  # (Why on the status line, the summary on the line under it.)
+  $s = @{ Mode = 'ended'; Title = (T 'The stream ended'); Status = $why; Ended = $true; EndedError = [bool]$script:EndError
+    Prompt = $true; Link = ''; QuestLink = ''; Upcoming = @(); UpcomingIds = [int[]]@(); UpcomingTotal = 0; Player = [string]$script:EndSummary; Quality = '' }
+  $script:PanelState = $s
+  Update-ControlPanel $s
+}
+
+function Wait-EndedPanel {
+  if (-not $script:PanelState -or $script:PanelState.Mode -ne 'ended') { Show-EndedPanel }
+  Say (T 'The control window stays open. Close it (or press Enter here) to close this window too.') 'DarkGray'
+  # (Keys typed before the end don't count.)
+  try { if ($script:HasConsole) { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } } catch {}
+  while (Test-ControlPanelOpen) {
+    $p = $null
+    try { $p = Read-PanelCommand } catch {}
+    if ($p -and $p.Cmd -eq 'again') {
+      if (Start-ToolAgain) { break }
+      # (It didn't start: Start again works again.)
+      $s = $script:PanelState.Clone(); $s.Try = [int]$s.Try + 1; $script:PanelState = $s; Update-ControlPanel $s
+    }
+    $enter = $false
+    try { if ($script:HasConsole -and [Console]::KeyAvailable) { $enter = ([Console]::ReadKey($true).Key -eq [ConsoleKey]::Enter) } } catch {}
+    if ($enter) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  try { Close-ControlPanel } catch {}
+}
+
+# Start again (the ended control window): a new tool from the .bat, as a double-click would start it.
+function Start-ToolAgain {
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $bat = [System.IO.Path]::Combine([string]$script:ToolDir, 'Make VRChat Link.bat')
+    if ([System.IO.File]::Exists($bat)) {
+      $psi.FileName = $bat
+      $psi.WorkingDirectory = [string]$script:ToolDir
+    } else {
+      $psi.FileName = 'powershell.exe'
+      $psi.Arguments = Join-CmdArgs @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $script:ScriptFile)
+    }
+    $psi.UseShellExecute = $true
+    [void][System.Diagnostics.Process]::Start($psi)
+    return $true
+  } catch {
+    Say (T 'Couldn''t start the tool again ({0}). Start it again yourself.' $_.Exception.Message) 'Yellow'
+    return $false
+  }
+}
+
 function Stop-Everything {
   Set-CtrlCAsKey $false
   Clear-StatusLine
@@ -8554,7 +8673,7 @@ function Stop-Everything {
   if ($script:Current) { Stop-Proc $script:Current }
   Stop-HostServer
   if (Get-Command Stop-ViewerPreview -CommandType Function -ErrorAction SilentlyContinue) { try { Stop-ViewerPreview } catch {} }
-  if ($script:PanelShown) { try { Close-ControlPanel } catch {} }
+  if ($script:PanelShown -and -not $script:KeepPanel) { try { Close-ControlPanel } catch {} }
   $script:PanelShown = $false
   # Downloads first, as whole trees (yt-dlp's own ffmpeg would go on recording once yt-dlp is gone).
   foreach ($it in $script:Queue) { if ($it.Dl -and $it.Dl.Proc) { try { if (-not $it.Dl.Proc.HasExited) { Stop-ProcessTree $it.Dl.Proc } } catch {} } }
@@ -9121,6 +9240,8 @@ function Main {
     Select-Language
   }
   $script:Cfg = Get-Config
+  # How long the waiting screen stays on with nothing queued (config.json "IdleMinutes"; the rig's VRCLM_IDLE_MIN wins).
+  if (-not $env:VRCLM_IDLE_MIN) { $script:IdleMinutes = [double](Get-NumSetting 'IdleMinutes' 15 3 600) }
   if ((Get-Command Invoke-UpdateCheck -CommandType Function -ErrorAction SilentlyContinue) -and (Invoke-UpdateCheck)) { return }
   if (Test-HostModule) {
     # Older config.json files get "Host" / "StreamKey" (same link as before) and the self-host settings.
@@ -9172,7 +9293,7 @@ function Main {
         $entries = @(Read-Entries $prefill)
         $prefill = $script:EntryLine
       }
-      if ($entries -contains $script:QuitMark) { Say (T 'Nothing to stream.') 'Yellow'; return }
+      if ($entries -contains $script:QuitMark) { $script:EndReason = T 'Nothing to stream.'; Say $script:EndReason 'Yellow'; return }
       [void](Invoke-NavFlow -Name 'start' -Origin 'start' -Snap $script:SiteAnswerVars -Body {
           [void](Add-Entries $entries $false)
           if ($script:Queue.Count -gt 0) { Show-Queue; Invoke-ResumeOffer }
@@ -9211,18 +9332,34 @@ try {
 } catch {
   Say ''
   if ($script:CtrlCQuit) {
-    if ($script:QuitFromWindow) { Say (T 'Ended from the control window.') 'Gray' } else { Say (T 'Stopped (Ctrl+C).') 'Gray' }
+    if ($script:QuitFromWindow) { $script:EndReason = T 'Ended from the control window.' } else { $script:EndReason = T 'Stopped (Ctrl+C).' }
+    Say $script:EndReason 'Gray'
   }
   else {
+    $script:EndError = $_.Exception.Message
     Say (T 'Error: {0}' $_.Exception.Message) 'Red'
     if ($env:VRCLM_DEBUG) { Say ($_.ScriptStackTrace) 'DarkGray' }
   }
 } finally {
+  # (The control window stays, showing why it ended: Show-EndedPanel, at once, so nothing in it looks clickable while
+  # everything stops. Not for an update, which starts a new tool.)
+  $script:KeepPanel = ($script:PanelShown -and -not $script:RestartAfterUpdate -and (Test-ControlPanelOpen))
+  $script:EndSummary = Get-EndSummary
+  if ($script:EndSummary) { Say $script:EndSummary 'Gray' }
+  if ($script:KeepPanel) { try { Show-EndedPanel } catch {} }
   Stop-Everything
 }
 if ($script:RestartAfterUpdate -and (Restart-AfterUpdate)) { exit 0 }
+# (Exit code 0 also after an error here: the window showed it, so the .bat need not pause as well.)
+if ($script:KeepPanel) { Wait-EndedPanel; exit 0 }
 if ($script:Interactive -and -not $script:NoPause) {
-  Say ''
-  [void](Read-Host (T 'Press Enter to close this window'))
+  # From the .bat: after an error its own pause keeps the window open (exit code 1); after a normal end the window
+  # closes by itself. Started some other way, the window waits for Enter as before.
+  if ($script:FromBat -and -not $script:EndError) { Start-Sleep -Seconds 3 }
+  elseif (-not $script:FromBat) {
+    Say ''
+    [void](Read-Host (T 'Press Enter to close this window'))
+  }
 }
+if ($script:EndError) { exit 1 }
 exit 0

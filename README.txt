@@ -234,7 +234,9 @@ WHILE IT'S STREAMING
 - R R makes the stream reconnect, so every player jumps to the live picture
   (takes about 10 seconds). The video waits meanwhile, so nobody misses a bit.
 - Between videos, and after the last one, viewers see a waiting screen, so
-  nobody has to reload. It stops by itself after 15 idle minutes.
+  nobody has to reload. It stops by itself after 15 idle minutes
+  ("IdleMinutes" in config.json); 2 minutes before, it warns, and any key in
+  the console (or a click on the yellow bar in the control window) keeps it on.
 - If your internet drops, it reconnects. The video waits on the "Starting in a
   moment..." screen until the world's player on this PC shows the stream
   again, then carries on from where it was.
@@ -332,6 +334,12 @@ On the right:
 
 Space and the arrow keys work in it too (not while you type in a box or a
 question shows). Don't want it? Set "ControlWindow": false in config.json.
+
+On the waiting screen the big button is End stream (it asks first). The
+window's X while the stream is on asks: End stream, Close the window (the
+stream goes on; F2 opens it again) or Cancel. When the stream ends (by itself,
+an error, or End stream), the window stays open and says why, with Start
+again; closing it closes the console too.
 
 CONTROL IT FROM THE WORLD'S VIDEO PLAYER
 ----------------------------------------
@@ -612,6 +620,8 @@ All of these are optional.
               (not recommended: the picture may not come).
   Clock       false. true shows the video time in a corner of the picture.
   ControlWindow       true (the default) opens the control window.
+  IdleMinutes         15. With nothing queued, the waiting screen ends after
+              this many minutes (3 to 600).
   AskTimeoutSec       60. A question about the next video asked while viewers
               wait (audio / subtitles, which player, installing yt-dlp,
               downloading rqbit) takes the suggested answer after this many
