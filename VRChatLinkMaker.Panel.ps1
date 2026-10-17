@@ -367,7 +367,13 @@ function New-ControlPanel {
   $bn.Margin = New-Object System.Windows.Forms.Padding(2, [int](3 * $k), 2, [int](2 * $k))
   $bn.Cursor = [System.Windows.Forms.Cursors]::Hand
   $bn.Visible = $false
-  $bn.Add_Click({ try { $script:Panel.IdleHushUntil = [DateTime]::UtcNow.AddSeconds(5); Hide-PanelBanner; Add-PanelCommand 'seen' } catch {} })
+  $bn.Add_Click({
+      try {
+        $q = $script:Panel
+        # (The "is out" bar: the start screen asks about the update, Wait-AskInput.)
+        if ($q.BannerCmd -eq 'update') { $b = Get-PanelBus; if ($b) { $b.UpdateReq = $true } }
+        $q.IdleHushUntil = [DateTime]::UtcNow.AddSeconds(5); Hide-PanelBanner; Add-PanelCommand 'seen'
+      } catch {} })
   $p.Banner = $bn
   $root.Controls.Add($bn, 0, 2)
 
@@ -787,7 +793,7 @@ function New-ControlPanel {
     param($sender, $e)
     try {
       $q = $script:Panel
-      if (($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -or $e.CloseReason -eq [System.Windows.Forms.CloseReason]::None) -and -not $q.Closed -and -not $script:PanelSync.CloseReq -and $q.Mode -and $q.Mode -ne 'off' -and $q.Mode -ne 'ended') {
+      if (($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -or $e.CloseReason -eq [System.Windows.Forms.CloseReason]::None) -and -not $q.Closed -and -not $script:PanelSync.CloseReq -and $q.Mode -and $q.Mode -ne 'off' -and $q.Mode -ne 'ended' -and $q.Mode -ne 'starting') {
         $c = Show-PanelCloseChoice
         if ($c -ne 'close') {
           $e.Cancel = $true
@@ -922,7 +928,7 @@ function Receive-PanelDrop($data) {
 function Request-PanelWarm {
   $q = $script:Panel
   $t = ([string]$q.Input.Text).Trim()
-  if ($t.Length -lt 2 -or @('', 'off', 'waiting') -contains [string]$q.Mode) { return }
+  if ($t.Length -lt 2 -or @('', 'off', 'waiting', 'starting') -contains [string]$q.Mode) { return }
   if ($t -match '^(?i)([a-z][a-z0-9+.-]*://|magnet:|[a-z]:[\\/]|[\\/"])') { return }
   if (([DateTime]::UtcNow - $q.WarmAt).TotalSeconds -lt 30) { return }
   $q.WarmAt = [DateTime]::UtcNow
@@ -1596,23 +1602,45 @@ function Get-PanelIconImage([int]$n) {
 }
 
 # The warnings banner: the latest yellow / red message line, for about 15 s.
-function Show-PanelBanner([string]$text, [string]$color) {
+# $color: Yellow / Red (a warning), Green (news: -Cmd says what a click does, -Tip what the tooltip says instead of
+# "Click to hide.").
+function Show-PanelBanner([string]$text, [string]$color, [string]$Cmd = '', [string]$Tip = '', [int]$Seconds = 15) {
   $q = $script:Panel
   $line = ''
   foreach ($l in ($text -split "`r?`n")) { if ($l.Trim()) { $line = $l.Trim(); break } }
   if (-not $line) { return }
   $bn = $q.Banner
   if ($color -like '*Red') { $bn.BackColor = (New-PanelColor 84 34 34); $bn.ForeColor = (New-PanelColor 250 150 150) }
+  elseif ($color -like '*Green') { $bn.BackColor = (New-PanelColor 26 70 40); $bn.ForeColor = (New-PanelColor 150 230 170) }
   else { $bn.BackColor = (New-PanelColor 74 62 22); $bn.ForeColor = (New-PanelColor 240 214 120) }
   $bn.Text = $line
-  $q.Tips.SetToolTip($bn, $text.Trim() + "`r`n" + (T 'Click to hide.'))
-  $q.BannerUntil = [DateTime]::UtcNow.AddSeconds(15)
+  $q.BannerCmd = $Cmd
+  if (-not $Tip) { $Tip = $text.Trim() + "`r`n" + (T 'Click to hide.') }
+  $q.Tips.SetToolTip($bn, $Tip)
+  $q.BannerUntil = [DateTime]::UtcNow.AddSeconds($Seconds)
   if (-not $bn.Visible) { $bn.Visible = $true }
+}
+
+# News from the main thread for the bar (bus.Notice: Text, Tip, Color, Cmd, Seq), shown once per window.
+function Update-PanelNotice {
+  $q = $script:Panel
+  $b = Get-PanelBus
+  if ($null -eq $b) { return }
+  $n = $b.Notice
+  if ($null -eq $n) {
+    if ($q.NoticeSeq -and $q.BannerCmd -and $q.Banner.Visible) { Hide-PanelBanner }
+    $q.NoticeSeq = $null
+    return
+  }
+  if ($q.NoticeSeq -eq $n.Seq) { return }
+  $q.NoticeSeq = $n.Seq
+  Show-PanelBanner ([string]$n.Text) ([string]$n.Color) -Cmd ([string]$n.Cmd) -Tip ([string]$n.Tip + "`r`n" + (T 'Click: the start screen asks whether to update.')) -Seconds 120
 }
 
 function Hide-PanelBanner {
   $q = $script:Panel
   $q.BannerUntil = [DateTime]::MinValue
+  $q.BannerCmd = ''
   if ($q.Banner.Visible) { $q.Banner.Visible = $false }
 }
 
@@ -2424,6 +2452,8 @@ function Set-PanelMode([string]$mode) {
       if ($q.EndedError) { $bc = (New-PanelColor 170 50 50) }
     }
     'reconnect' { $q.Big.Text = $pause + ' ' + (T 'Pause');     $q.Big.Enabled = $false; $badge = T 'Reconnecting';   $bc = (New-PanelColor 180 70 40) }
+    # (At start, while the checks run: the window opens first, Main.)
+    'starting'  { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $false; $badge = T 'Starting...';    $bc = (New-PanelColor 70 70 78) }
     default     { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $false; $badge = T 'Off';            $bc = (New-PanelColor 70 70 78) }
   }
   if (-not $q.Big.Enabled) { $q.Big.BackColor = $q.Colors.Button }
@@ -2443,6 +2473,8 @@ function Set-PanelMode([string]$mode) {
     Remove-PanelImage
     $q.Preview.Invalidate()
   }
+  # (The waiting screen: the most-asked first question is whether the link works yet.)
+  elseif ($mode -eq 'waiting' -and $q.ListEmptyText) { $q.ListEmpty.Text = $q.ListEmptyText + "`r`n`r`n" + (T 'The waiting screen is on the air: the link already works in the world''s player.') }
   elseif ($q.ListEmptyText) { $q.ListEmpty.Text = $q.ListEmptyText }
   $q.Badge.ForeColor = [System.Drawing.Color]::White
 }
@@ -2529,7 +2561,10 @@ try {
 } finally { $Sync.Closed = $true }
 '@
 
-function Open-ControlPanel {
+# -NoWait (at start): back at once; Invoke-PanelPump / Confirm-PanelStarted check that it showed. -Front: it comes to
+# the front when it shows, if the tool's console is in front then (it was just started).
+$script:PanelWaitUntil = $null
+function Open-ControlPanel([switch]$NoWait, [switch]$Front) {
   try {
     if (Test-ControlPanelOpen) { $script:PanelSync.ShowReq = $true; return $true }
     Close-ControlPanel
@@ -2566,7 +2601,7 @@ function Open-ControlPanel {
       State = $null; Cmds = $bus.Cmds; Bus = $bus
       Ready = $false; ReadyAt = $null; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
       Log = $bus.Log; Backlog = $backlog; LogPath = $logPath; ToolFile = [string]$script:ScriptFile
-      StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts
+      StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts; Front = [bool]$Front
     })
     $self = $script:PanelSelf
     if (-not $self) { $self = $script:PanelFile }
@@ -2576,6 +2611,7 @@ function Open-ControlPanel {
     $script:PanelSync = $sync
     $script:PanelPs = $ps
     $script:PanelRun = $ps.BeginInvoke()
+    if ($NoWait) { $script:PanelWaitUntil = [DateTime]::UtcNow.AddSeconds(15); return $true }
     # Until it shows (the first time takes a moment: Windows Forms loads).
     $until = [DateTime]::UtcNow.AddSeconds(15)
     while (-not $sync.Ready -and -not $sync.Closed -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 20 }
@@ -2590,7 +2626,26 @@ function Open-ControlPanel {
   }
 }
 
+# A window opened with -NoWait: once it shows, that is noted (the start's timing). One that failed, or didn't show
+# within 15 s, is closed, and the tool goes on without it (F2 tries again).
+function Confirm-PanelStarted {
+  if ($null -eq $script:PanelWaitUntil) { return }
+  $sync = $script:PanelSync
+  if ($sync -and $sync.Ready -and -not $sync.Closed) {
+    $script:PanelWaitUntil = $null
+    if ($sync.ReadyAt -is [DateTime] -and (Get-Command Add-StartMark -CommandType Function -ErrorAction SilentlyContinue)) { Add-StartMark 'window' $sync.ReadyAt }
+    return
+  }
+  if ($sync -and -not $sync.Closed -and [DateTime]::UtcNow -lt $script:PanelWaitUntil) { return }
+  $script:PanelWaitUntil = $null
+  if ($sync -and $sync.Error -and -not $sync.Logged) { $sync.Logged = $true; Write-PanelError ([string]$sync.Error) }
+  elseif ($sync -and -not $sync.Closed) { Write-PanelError 'it did not show within 15 s' }
+  Close-ControlPanel
+  $script:PanelShown = $false
+}
+
 function Close-ControlPanel {
+  $script:PanelWaitUntil = $null
   $sync = $script:PanelSync
   $ps = $script:PanelPs
   $run = $script:PanelRun
@@ -2633,7 +2688,7 @@ function Start-PanelUi($sync) {
     $timer.Interval = 100
     $timer.Add_Tick({ Invoke-PanelTick })
     $q.Timer = $timer
-    $q.Form.Add_Shown({ try { $script:PanelSync.ReadyAt = [DateTime]::UtcNow; $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {} })
+    $q.Form.Add_Shown({ try { $script:PanelSync.ReadyAt = [DateTime]::UtcNow; $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {}; try { $script:Panel.LookUntil = [DateTime]::UtcNow.AddSeconds(10); Set-PanelStartLook } catch {} })
     $timer.Start()
     [System.Windows.Forms.Application]::Run($q.Form)
   } finally {
@@ -2651,6 +2706,7 @@ function Invoke-PanelTick {
   try {
     if ($sync.CloseReq) { $q.Closed = $true; $q.Form.Close(); return }
     if ($sync.ShowReq) { $sync.ShowReq = $false; Show-PanelWindow }
+    if ($q.LookUntil) { Set-PanelStartLook }
   } catch {
     Stop-PanelAfterError $_
     return
@@ -2660,6 +2716,7 @@ function Invoke-PanelTick {
   try { Update-PanelView $sync.State } catch { Write-PanelWarning $_ }
   if ($q.Closed) { return }
   try { Update-PanelLog $sync } catch { Write-PanelWarning $_ }
+  try { Update-PanelNotice } catch { Write-PanelWarning $_ }
   try { Update-PanelBanner } catch { Write-PanelWarning $_ }
 }
 
@@ -2734,6 +2791,42 @@ function Show-PanelWindow {
   $f.Activate()
 }
 
+# Once it shows: the console gets the window's icon (one look at the taskbar: the same program, the titles tell the two
+# apart), and the window opened at start comes to the front if the console is in front then (Win.ToFront). Needs the
+# helper (Initialize-Helper on the main thread): tried again from the tick until it is there, for up to 10 s.
+function Set-PanelStartLook {
+  $q = $script:Panel
+  if (-not ('VRCLinkMaker.Win' -as [type])) {
+    if ([DateTime]::UtcNow -ge $q.LookUntil) { $q.LookUntil = $null }
+    return
+  }
+  $q.LookUntil = $null
+  $b = Get-PanelBus
+  if ($b -and $null -eq $b.ConIcon -and -not $env:VRCLM_NO_CONSOLE_ICON) {
+    # (Kept, not disposed, while the tool runs: the console shows them. Restore-ConsoleIcon puts the old ones back.)
+    $ic = New-PanelIcon
+    $s16 = New-Object System.Drawing.Icon($ic, 16, 16)
+    $s32 = New-Object System.Drawing.Icon($ic, 32, 32)
+    $old = [VRCLinkMaker.Win]::ConsoleIcon($s16.Handle, $false)
+    $oldBig = [VRCLinkMaker.Win]::ConsoleIcon($s32.Handle, $true)
+    $b.ConIcon = @{ Small = $old; Big = $oldBig; Keep = @($ic, $s16, $s32) }
+  }
+  if ($script:PanelSync.Front) { [void][VRCLinkMaker.Win]::ToFront($q.Form.Handle) }
+}
+
+# At the very end (main thread): the console's own icon back.
+function Restore-ConsoleIcon {
+  try {
+    $b = $script:UiBus
+    if ($null -eq $b) { return }
+    $c = $b.ConIcon
+    if ($null -eq $c -or -not ('VRCLinkMaker.Win' -as [type])) { return }
+    [void][VRCLinkMaker.Win]::ConsoleIcon([IntPtr]$c.Small, $false)
+    [void][VRCLinkMaker.Win]::ConsoleIcon([IntPtr]$c.Big, $true)
+    $b.ConIcon = $false
+  } catch {}
+}
+
 function Remove-PanelResources {
   $q = $script:Panel
   if ($null -eq $q) { return }
@@ -2770,7 +2863,7 @@ function Update-PanelView($s) {
     $canSeek = [bool]$s['CanSeek']
     $q.EndedError = [bool]$s['EndedError']
     $q.EndedTry = [int]$s['Try']
-    $on = ($mode -ne 'off' -and $mode -ne 'ended')
+    $on = ($mode -ne 'off' -and $mode -ne 'ended' -and $mode -ne 'starting')
     # (Prompt: the tool's own window still asks its start questions, nothing plays yet: no commands meanwhile.)
     $cmdOn = ($on -and -not [bool]$s['Prompt'])
 
