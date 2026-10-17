@@ -2074,6 +2074,11 @@ function Get-AllohaTranslations($fileList) {
   return $res
 }
 
+# Alloha answers a quality as "<url A> or <url B>" (mirror syntax); ffmpeg rejects the whole string. Returns the alternatives, first = preferred.
+function Split-AllohaMirrors([string]$s) {
+  return @(($s -split '\s+or\s+') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
 <#
 .SYNOPSIS
   Resolves an Alloha iframe URL (e.g. the WPARTY movieSourceURL + "&kp=..&translation=..&season=..&episode=..") to a direct HLS URL.
@@ -2165,11 +2170,12 @@ function Resolve-Alloha {
 
   # 3. audio tracks / qualities
   $tracks = @()
+  $mir = @{}
   if ($data.ContainsKey('hlsSource') -and $data['hlsSource']) {
     foreach ($src in $data['hlsSource']) {
       $q = [ordered]@{}
       $keys = @($src['quality'].Keys | Sort-Object { [int]([regex]::Match([string]$_, '\d+').Value) } -Descending)
-      foreach ($k in $keys) { $q[[string]$k] = [string]$src['quality'][$k] }
+      foreach ($k in $keys) { $alts = @(Split-AllohaMirrors ([string]$src['quality'][$k])); if ($alts.Count -gt 0) { $q[[string]$k] = $alts[0]; if ($alts.Count -gt 1) { $mir[[string]$k + '|' + [string]$src['audioId']] = $alts[1..($alts.Count - 1)] } } }
       $def = -1; if ($src.ContainsKey('default') -and $src['default']) { try { $def = [double]$src['default'] } catch { $def = 1 } }
       $tracks += [pscustomobject]@{ Label = [string]$src['label']; AudioId = [string]$src['audioId']; Default = $def; Qualities = $q }
     }
@@ -2224,6 +2230,7 @@ function Resolve-Alloha {
     UserAgent     = $script:WebUA
     Quality       = $qKey
     Qualities     = $chosen.Qualities
+    MirrorUrls    = @($mir[[string]$qKey + '|' + $chosen.AudioId])   # the other "A or B" alternatives of the chosen quality (try when Url fails)
     AudioTrack    = $chosen.Label
     AudioTracks   = $tracks
     Subtitles     = $subs
