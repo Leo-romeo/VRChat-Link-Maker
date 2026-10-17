@@ -191,6 +191,20 @@ function Receive-UpdateCheck([switch]$Quiet) {
   }
 }
 
+# The check and the question at once, waiting for GitHub (as before the check moved to the background; Main no longer
+# uses it). $true = updated.
+function Invoke-UpdateCheck {
+  if (-not (Test-UpdateCheckOn)) { return $false }
+  $latest = $null
+  try { $latest = Get-LatestVersion }
+  catch { Say (T 'Couldn''t check for a new version: {0}' $_.Exception.Message) 'DarkGray'; return $false }
+  $cur = ConvertTo-UpdateVersion $script:Version
+  if (-not $latest -or -not $cur -or $latest.Version -le $cur) { return $false }
+  if ("$(Get-Prop $script:Cfg 'SkipVersion')" -eq $latest.Tag) { return $false }
+  $script:UpdateFound = $latest
+  return (Invoke-UpdateOffer)
+}
+
 # U + Enter on the start screen (or a click on the window's bar): the release notes and the question. $true = updated:
 # the tool ends and starts again.
 function Invoke-UpdateOffer {

@@ -720,13 +720,13 @@ function Invoke-Winget([string]$id) {
   $name = $id
   if ($id -eq 'Gyan.FFmpeg') { $name = 'ffmpeg' } elseif ($id -eq 'yt-dlp.yt-dlp') { $name = 'yt-dlp' }
   Say (T 'Installing {0} with winget (1 to 3 minutes)...' $name) 'Gray'
-  $psi = New-StartInfo $wg.Path @('install', '-e', '--id', $id, '--accept-source-agreements', '--accept-package-agreements', '--disable-interactivity')
+  $psi = New-StartInfo $wg.Path @('install', '-e', '--id', $id, '--accept-source-agreements', '--accept-package-agreements')
   $psi.RedirectStandardOutput = $true
   $psi.RedirectStandardError = $true
   $psi.RedirectStandardInput = $true
   $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
   $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
-  $p = Start-Child $psi
+  $p = Start-Child $psi   # (hidden, in the job; Write-StartLog notes it)
   try { $p.StandardInput.Close() } catch {}
   $errT = $p.StandardError.ReadToEndAsync()
   $outT = $p.StandardOutput.ReadToEndAsync()
@@ -1980,9 +1980,9 @@ function Get-MenuItems([switch]$WithMenu) {
     # D works while a video plays too: it opens a window of its own (Read-Entries, Add-TypedLine; the control window has
     # its own item). ("skachat'" = U+0441 U+043A U+0430 U+0447 U+0430 U+0442 U+044C)
     @{ Id = 'download'; Label = (T 'Download videos to this PC (no stream)...'); Letter = 'D'; Need = ''; Re = '^\s*(?:d|download|\u0432|\u0441\u043a\u0430\u0447\u0430\u0442\u044c)\s*$' },
-    @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' },
     # (? itself is read by Read-Entries: it also prints all the start screen's keys.)
-    @{ Id = 'help'; Label = (T 'Link help'); Letter = '?'; Need = ''; Re = '' }
+    @{ Id = 'help'; Label = (T 'Link help'); Letter = '?'; Need = ''; Re = '' },
+    @{ Id = 'forget'; Label = (T 'Ask again: player, audio, subtitles'); Letter = ''; Need = ''; Re = '' }
   )
   if ($WithMenu) { $items += @{ Id = 'menu'; Label = (T 'Settings'); Letter = 'M'; Need = ''; Re = '^\s*(?:m|menu|\u044c)\s*$' } }
   return $items
@@ -2120,9 +2120,9 @@ function Read-Entries([string]$Prefill = '') {
       if (-not $side) { Say (T '  - V = picture size (resolution)') 'DarkGray' }
       if (-not $dlm) { Say (T '  - D = download videos to this PC instead (no stream; a window of its own)') 'DarkGray' }
       if ($keys) { Say (T '  - In questions: Enter = the suggested answer, Esc or B = back, Right arrow = your earlier answer again, Home = cancel') 'DarkGray' }
-      if ($side) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
       if ($side) { Say (T '  - ? = this list again') 'DarkGray' } else { Say (T '  - ? = this list again, with the full link help') 'DarkGray' }
       if ($script:UpdateFound -and -not $side) { Say (T '  - U = update to {0}' $script:UpdateFound.Tag) 'Green' }
+      if ($side) { Say (T '  - Esc = close this window') 'DarkGray' } else { Say (T '  - M = menu (all settings),  Q + Enter = end') 'DarkGray' }
     }
     $line = ''
     $picked = $null
