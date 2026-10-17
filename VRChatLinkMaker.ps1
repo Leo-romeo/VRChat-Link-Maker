@@ -942,11 +942,31 @@ function Receive-QueueFile {
   $lines = @($lines | Where-Object { $_.Trim() -ne '#vrclm-now' })
   if ($lines.Count -eq 0) { return }
   $playing = ($script:Src -and $script:Src.Kind -ne 'waiting')
+  $before = $script:Queue.Count
+  $at = $script:Queue.Count
+  $n = 0
   if ($now -and $playing -and $script:Idx -lt $script:Queue.Count) {
-    $n = Add-Entries $lines $true ($script:Idx + 1)
+    $at = $script:Idx + 1
+    $n = Add-Entries $lines $true $at
     if ($n -gt 0) { Add-Cmd (New-Cmd 'playnow' $null 'file') }
-  } elseif ($now) { [void](Add-Entries $lines $true $script:Idx) }
-  else { [void](Add-Entries $lines $true) }
+  } elseif ($now) { $at = $script:Idx; $n = Add-Entries $lines $true $at }
+  else { $n = Add-Entries $lines $true }
+  # (The control window says it too, in green: the second window that asked the questions is gone by now.)
+  if ($n -gt 0 -and $script:Queue.Count -gt $before -and $at -lt $script:Queue.Count) {
+    $nm = Get-ShortText ([string]$script:Queue[[Math]::Min($at, $script:Queue.Count - 1)].Name) 70
+    if ($n -gt 1) { Show-UiBanner (T 'Added to Up next: {0} and {1} more' $nm ($n - 1)) }
+    else { Show-UiBanner (T 'Added to Up next: {0}' $nm) }
+  }
+}
+
+# A note for the control window's banner (green: something good happened; Say lines in yellow / red show there by
+# themselves). Bus.Note = @{ Text; Color; Seq; At }; the window shows a new Seq for 15 s.
+$script:UiNoteSeq = 0
+function Show-UiBanner([string]$text, [string]$color = 'Green') {
+  try {
+    $script:UiNoteSeq++
+    $script:UiBus.Note = @{ Text = $text; Color = $color; Seq = $script:UiNoteSeq; At = [DateTime]::UtcNow }
+  } catch {}
 }
 
 # ------------------------------------------------------------------ fonts for subtitles
@@ -2276,8 +2296,14 @@ function Invoke-AddEntries([string[]]$entries, [string]$kind = '', [string]$line
       if ([int]$r.Value -eq 0) { Say (T '  Nothing added - couldn''t find: {0}' ($entries -join ' ')) 'Yellow' }
       return
     }
+    # (A series link while something plays can't be asked about: it takes the voice-over chosen last and the next
+    # episodes. Said once it is known which, with how to choose instead.)
+    $dubBefore = $script:LastDub
+    $script:LastDub = $null
     $n = Add-Entries $entries $true
     if ($n -eq 0) { Say (T '  Nothing added - couldn''t find: {0}' ($entries -join ' ')) 'Yellow' }
+    elseif ($n -ge 2 -and $script:LastDub) { Say (T '  Queued the next {0} episodes with {1}. To choose the voice-over or the episodes, type the title instead.' $n (Format-DubName ([string]$script:LastDub))) 'Gray' }
+    if (-not $script:LastDub) { $script:LastDub = $dubBefore }
   } finally { $script:PromptOk = $false }
 }
 
@@ -6288,7 +6314,7 @@ function Receive-Commands([string]$kind) {
           $fs = @(@($p.Arg) | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() })
           if ($fs.Count -gt 0) { Invoke-AddEntries $fs $kind }
         }
-        { $_ -in @('qplay', 'qup', 'qdown', 'qremove', 'qclear') } { Invoke-QueueCommand $p.Cmd $p.Arg $kind }
+        { $_ -in @('qplay', 'qnext', 'qup', 'qdown', 'qremove', 'qclear') } { Invoke-QueueCommand $p.Cmd $p.Arg $kind }
         'quit' {
           try { $script:UiBus.QuitReq = $false } catch {}
           Add-Cmd (New-Cmd 'quit' $p.Arg 'panel')
@@ -6394,6 +6420,12 @@ function Invoke-QueueCommand([string]$cmd, $arg, [string]$kind) {
       if ($i -ne $to) { $script:Queue.RemoveAt($i); $script:Queue.Insert($to, $it) }
       if ($kind -ne 'waiting') { Add-Cmd (New-Cmd 'playnow' @{ Id = (Get-Prop $it 'Id') } 'panel') }
       else { Say (T '  Next up: {0}' $it.Name) 'Gray' }
+    }
+    'qnext' {
+      # (Right after the video that plays, which goes on; while nothing plays, after the one being got ready.)
+      $to = $script:Idx + 1
+      if ($i -gt $to) { $script:Queue.RemoveAt($i); $script:Queue.Insert($to, $it) }
+      if ($i -ge $to) { Say (T '  Plays after this one: {0}' $it.Name) 'Gray' }
     }
     'qup' {
       if ($i - 1 -ge $first) { $script:Queue.RemoveAt($i); $script:Queue.Insert($i - 1, $it) }
@@ -7398,27 +7430,40 @@ function Test-HoldReady($h) {
   return ($now -ge $h.Since.AddSeconds(8))
 }
 
-function Get-HoldText($h, $media, [double]$at) {
+# ($win: the control window's texts, without the console's keys: its Start now button does what Space does here.)
+function Get-HoldText($h, $media, [double]$at, [bool]$win = $false) {
   $v = $script:Vrc
   $pos = ''
   if ($at -gt 1) { $pos = ' ' + (T 'at {0}' (Format-Time $at)) }
   if (-not (Test-VrcWatching)) {
-    if ($h.Reason -eq 'start') { return (T '  Ready{0}. Viewers see "Starting in a moment". Press Space to start.' $pos) }
+    if ($h.Reason -eq 'start') {
+      if ($win) { return (T 'Ready{0}. Viewers see "Starting in a moment". Click Start now to start.' $pos) }
+      return (T '  Ready{0}. Viewers see "Starting in a moment". Press Space to start.' $pos)
+    }
+    if ($win) { return (T 'Waiting a few seconds for the players to reconnect...') }
     return (T '  Waiting a few seconds for the players to reconnect...   Space = go on now')
   }
   if ($v.State -eq 'playing' -and ($h.Reason -eq 'start' -or $v.PlayAt -gt $h.Since)) {
     $left = [Math]::Max(0, [Math]::Ceiling(($v.PlayAt.AddSeconds($script:StartDelay) - (Get-Date)).TotalSeconds))
+    if ($win) { return (T 'The world''s player shows the stream - starting{0} in {1} s...' $pos $left) }
     return (T '  The world''s player shows the stream - starting{0} in {1} s...   Space = now' $pos $left)
   }
   if ($v.State -eq 'failed' -and ((Get-Date) - $v.FailAt).TotalSeconds -gt 10) {
+    if ($win) { return (T 'The world''s player gave up on the stream: press Reload (or put the link in again) in the world.') }
     return (T '  The world''s player gave up on the stream: press Reload (or put the link in again) in the world.   Space = start anyway')
   }
-  if ($h.Reason -eq 'start') { return (T '  Starting{0} as soon as the world''s player shows the stream (put the link in it).   Space = start now' $pos) }
+  if ($h.Reason -eq 'start') {
+    if ($win) { return (T 'Starting{0} as soon as the world''s player shows the stream (put the link in it).' $pos) }
+    return (T '  Starting{0} as soon as the world''s player shows the stream (put the link in it).   Space = start now' $pos)
+  }
+  if ($win) { return (T 'Waiting for the players to reconnect before going on{0}...' $pos) }
   return (T '  Waiting for the players to reconnect before going on{0}...   Space = go on now' $pos)
 }
 
 # ------------------------------------------------------------------ the status line and the control window
-function Get-StatusText([string]$kind, $src, $media, [double]$pos, $speed, $hold, [double]$holdAt) {
+# (-ForWindow: the control window's status line, Get-WindowStatusText.)
+function Get-StatusText([string]$kind, $src, $media, [double]$pos, $speed, $hold, [double]$holdAt, [switch]$ForWindow) {
+  if ($ForWindow) { return (Get-WindowStatusText $kind $media $pos $speed $hold $holdAt) }
   if ($script:TypeBuf.Length -gt 0) {
     $what = T 'add'
     if ((Get-Command Test-SearchQuery -CommandType Function -ErrorAction SilentlyContinue) -and (Test-SearchQuery $script:TypeBuf)) { $what = T 'search' }
@@ -7440,6 +7485,95 @@ function Get-StatusText([string]$kind, $src, $media, [double]$pos, $speed, $hold
   if ($nx -and $nx.State -eq 'downloading') { return ((T '  Waiting screen is on. Next: {0}   Q Q = end' (Get-DownloadText $nx)) + (T '   M = menu')) }
   if ($nx) { return ((T '  Waiting screen is on. Getting {0} ready...   Q Q = end' $nx.Name) + (T '   M = menu')) }
   return ((T '  Waiting screen is on. Type a title or paste a link + Enter (Enter alone = pick files).   Q Q = end') + (T '   M = menu'))
+}
+
+# The control window's status line: what the console's says, without its keys (the window has a button for each), and
+# without the count of what is queued (the Up next tab says it).
+function Get-WindowStatusText([string]$kind, $media, [double]$pos, $speed, $hold, [double]$holdAt) {
+  if ($kind -eq 'content') {
+    $txt = (T 'Streaming') + '   ' + (Format-Time $pos)
+    if ($media -and $media.Info -and $media.Info.Duration -gt 0) { $txt += ' / ' + (Format-Time $media.Info.Duration) }
+    if ($null -ne $speed -and $speed -lt 0.97) { $txt += (T '   (slow: {0}x)' ($speed.ToString('0.00', $script:Inv))) }
+    return $txt
+  }
+  if ($kind -eq 'paused') { return (T 'Paused at {0}. Viewers see "Paused".' (Format-Time $script:PausedAt)) }
+  if ($kind -eq 'hold') { return (Get-HoldText $hold $media $holdAt $true) }
+  $nx = $null
+  if ($script:Idx -lt $script:Queue.Count) { $nx = $script:Queue[$script:Idx] }
+  if ($nx -and $nx.State -eq 'downloading') { return (T 'Waiting screen is on. Next: {0}' (Get-DownloadText $nx)) }
+  if ($nx) { return (T 'Waiting screen is on. Getting {0} ready...' $nx.Name) }
+  return (T 'Waiting screen is on. Type a title or paste a link above, or drop videos on this window.')
+}
+
+# How long a queue item is (seconds), or 0 when that isn't known yet (before its file or stream was looked at).
+function Get-ItemSeconds($it) {
+  try { if ($it -and $it.Info -and -not $it.IsLive -and $it.Info.Duration -gt 0) { return [double]$it.Info.Duration } } catch {}
+  return 0.0
+}
+
+# What comes after the video that plays, and when: "Up next: <name> (24:10), starts at about 21:46" and "Queue ends at
+# about 23:10" (one string each; unknown lengths show "?"). Clock times only while it plays: paused or waiting for the
+# players, nobody knows when it goes on, so then only the lengths. $kind: the source's kind (content / paused / hold),
+# $pos: where the video is. (The room for more lines - a file's upload, later - is here.)
+function Get-QueuePlan([string]$kind, $media, [double]$pos) {
+  $out = @()
+  if ($kind -ne 'content' -and $kind -ne 'paused' -and $kind -ne 'hold') { return $out }
+  $now = Get-Date
+  $end = $null
+  $cur = Get-ItemSeconds $media
+  if ($kind -eq 'content' -and $cur -gt 0) { $end = $now.AddSeconds([Math]::Max(0.0, $cur - $pos)) }
+  $from = $script:Idx + 1
+  $left = $script:Queue.Count - $from
+  if ($left -le 0) {
+    if ($end) { $out += (T 'Ends at about {0}' $end.ToString('HH:mm', $script:Inv)) }
+    return $out
+  }
+  $nx = $script:Queue[$from]
+  $nd = Get-ItemSeconds $nx
+  $nt = '?'
+  if ($nd -gt 0) { $nt = Format-Time $nd }
+  $nm = Get-ShortText ([string]$nx.Name) 60
+  if ($end) { $out += (T 'Up next: {0} ({1}), starts at about {2}' $nm $nt $end.ToString('HH:mm', $script:Inv)) }
+  else { $out += (T 'Up next: {0} ({1})' $nm $nt) }
+  if ($left -ge 2) {
+    $sum = 0.0
+    $unknown = 0
+    for ($i = $from; $i -lt $script:Queue.Count; $i++) {
+      $d = Get-ItemSeconds $script:Queue[$i]
+      if ($d -gt 0) { $sum += $d } else { $unknown++ }
+    }
+    if ($end -and $unknown -eq 0) { $out += (T 'Queue ends at about {0}' $end.AddSeconds($sum).ToString('HH:mm', $script:Inv)) }
+    elseif ($end) { $out += (T 'Queue ends at about {0} or later ({1} of unknown length)' $end.AddSeconds($sum).ToString('HH:mm', $script:Inv) $unknown) }
+    elseif ($unknown -eq 0) { $out += (T 'Queue: {0} videos, {1} in all' $left (Format-Time $sum)) }
+  }
+  return $out
+}
+
+# What plays and how, for the title bars ("Playing: Overlord II - 09"; '' = nothing to say): the control window's
+# (State.WinTitle) and this console's, which follows it (Update-ConsoleTitle).
+function Get-StateTitle([string]$kind, $media) {
+  $nm = ''
+  if ($media) { $nm = Get-ShortText ([string]$media.Name) 60 }
+  switch ($kind) {
+    'content' { if ($nm) { return (T 'Playing: {0}' $nm) } }
+    'paused' { if ($nm) { return (T 'Paused: {0}' $nm) } }
+    'hold' { if ($nm) { return (T 'Ready to start: {0}' $nm) } }
+    'waiting' { if (Test-RelayAlive) { return (T 'Waiting screen') } }
+  }
+  return ''
+}
+
+# This console's title: "<state>  |  VRChat Link Maker - console" (only the streaming window's: ConsoleTitleBase is
+# set in Main; a second window keeps its own title).
+$script:ConsoleTitleBase = $null
+$script:ConsoleTitleShown = $null
+function Update-ConsoleTitle([string]$state) {
+  if (-not $script:ConsoleTitleBase) { return }
+  $t = $script:ConsoleTitleBase
+  if ($state) { $t = $state + '  |  ' + $t }
+  if ($t -ceq $script:ConsoleTitleShown) { return }
+  $script:ConsoleTitleShown = $t
+  try { $Host.UI.RawUI.WindowTitle = $t } catch {}
 }
 
 function Show-Panel {
@@ -7514,7 +7648,13 @@ function Update-Panel([string]$kind, $media, [double]$pos, [string]$status) {
     $s = @{ Mode = $mode; Title = $title; Position = $pos; Duration = $dur; Status = $status.Trim(); Player = $pl; Upcoming = $up; UpcomingIds = [int[]]$upIds
       UpcomingNames = [string[]]$upNames; UpcomingInfo = [string[]]$upInfo; UpcomingTotal = [Math]::Max(0, $script:Queue.Count - $from)
       Link = $script:ShownLink; QuestLink = $quest; Clock = $script:ClockOn; CanSeek = (($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') -and -not ($media -and $media.IsLive))
-      Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip; Tracks = $null; IdleWarn = ($kind -eq 'waiting' -and [bool]$script:IdleWarnAt) }
+      Quality = $ql.Text; QualityLow = $ql.Low; QualityTip = $qtip; Tracks = $null; IdleWarn = ($kind -eq 'waiting' -and [bool]$script:IdleWarnAt)
+      Plan = ''; WinTitle = (Get-StateTitle $mode $media); NowName = '' }
+    # (Under the status line: what comes next and when. Up next's first row is the video that plays: NowName.)
+    if ($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold') {
+      try { $s.Plan = (@(Get-QueuePlan $kind $media $pos) -join "`n") } catch {}
+      $s.NowName = $title
+    }
     if ($media -and $media.Info -and ($kind -eq 'content' -or $kind -eq 'paused' -or $kind -eq 'hold')) { try { $s.Tracks = Get-PanelTracks $media } catch {} }
     $m = $null
     try { $m = Get-PanelMenuState } catch {}
@@ -7788,12 +7928,14 @@ function Invoke-Source {
       $st = Get-StatusText $Kind $src $Media ($Start + $pos) $speed $Hold $holdAt
       Show-Status (Join-StatusKeys $st (T '   M = menu')) -NoWindow
       $script:LastStatus = $st
+      $script:LastWinStatus = Get-StatusText $Kind $src $Media ($Start + $pos) $speed $Hold $holdAt -ForWindow
     }
     if ($now -ge $nextPanel) {
       $nextPanel = $now.AddMilliseconds(200)
       $ppos = $Start + $pos
       if ($Kind -eq 'paused') { $ppos = $script:PausedAt } elseif ($Kind -eq 'hold') { $ppos = $holdAt }
-      Update-Panel $Kind $Media $ppos $script:LastStatus
+      Update-ConsoleTitle (Get-StateTitle $Kind $Media)
+      Update-Panel $Kind $Media $ppos $script:LastWinStatus
     }
     if ($now -ge $nextPoll) {
       $nextPoll = $now.AddSeconds(2)
@@ -7940,6 +8082,10 @@ function Show-NowPlaying($item) {
   if ($item.FpsNote) { Say (T '  Note: {0}' $item.FpsNote) 'DarkGray' }
   if ($item.Info -and (Test-HdrVideo $item.Info.Video)) { Say (T '  Note: {0}' (T 'this is an HDR video: its colours may look washed out on the stream')) 'DarkGray' }
   if ($item.ResumeAt -gt 0) { Say (T '  Starting from {0}' (Format-Time $item.ResumeAt)) 'Gray' }
+  # (What comes next and when, as one line: the control window shows it under its status line.)
+  $plan = @()
+  try { $plan = @(Get-QueuePlan 'content' $item ([double]$item.ResumeAt)) } catch {}
+  if ($plan.Count -gt 0) { Say ('  ' + ($plan -join '. ')) 'DarkGray' }
 }
 
 function Show-Controls {
@@ -8795,7 +8941,8 @@ function Show-EndedPanel {
   if ($script:EndError) { $why = T 'Error: {0}' $script:EndError }
   if (-not $why) { $why = T 'The stream was ended.' }
   # (Why on the status line, the summary on the line under it.)
-  $s = @{ Mode = 'ended'; Title = (T 'The stream ended'); Status = $why; Ended = $true; EndedError = [bool]$script:EndError
+  Update-ConsoleTitle (T 'Ended')
+  $s = @{ Mode = 'ended'; Title = (T 'The stream ended'); Status = $why; Ended = $true; EndedError = [bool]$script:EndError; WinTitle = (T 'Ended')
     Prompt = $true; Link = ''; QuestLink = ''; Upcoming = @(); UpcomingIds = [int[]]@(); UpcomingTotal = 0; Player = [string]$script:EndSummary; Quality = '' }
   $script:PanelState = $s
   Update-ControlPanel $s
@@ -9415,7 +9562,8 @@ function Main {
   Add-StartMark 'main'
   Initialize-Language (Get-LanguageSetting)
   # (The control window is "VRChat Link Maker": this console says what it is, so the two differ in the taskbar.)
-  try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - console') } catch {}
+  $script:ConsoleTitleBase = T 'VRChat Link Maker - console'
+  Update-ConsoleTitle ''
   Say "VRChat Link Maker $($script:Version)" 'Cyan'
   [void][System.IO.Directory]::CreateDirectory($script:TempRoot)
   $entries = @($script:Args0 | Where-Object { $_ -and "$_".Trim() })
@@ -9425,6 +9573,7 @@ function Main {
 
   if (-not (Enter-SingleInstance)) {
     # Already streaming in another window: add these videos to its queue (this window asks the questions).
+    $script:ConsoleTitleBase = $null
     try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - add to the stream') } catch {}
     # config.json's "DubPriority" and "Player" count here too (only read: the streaming window owns the file).
     if ([System.IO.File]::Exists((Get-ConfigPath))) { try { $script:Cfg = Get-Config } catch {} }
