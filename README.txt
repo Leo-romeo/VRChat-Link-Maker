@@ -268,15 +268,21 @@ At the top:
   Link for VRChat  the link to put in the world's video player, with Copy and
                    Quest link (copies the link for Quest / Android viewers,
                    when the server has one).
-  A yellow or red strip shows the latest warning for about 15 seconds (click it
-  to hide it; every message stays in Messages).
+  A yellow or red strip shows the latest warning: yellow for about 15
+  seconds, red until you click it. A green one says what a second window (or
+  a file dropped on the .bat) added to Up next. Click a strip to hide it;
+  every message stays in Messages.
+  The window's title bar says what plays ("Playing: ...", "Paused: ..."), so
+  the taskbar and Alt+Tab show it; the console's title follows.
 
 On the left: a live preview of what's being streamed, a seek bar, and buttons:
 
   << 30s  << 10s  Pause / Continue / Start now  10s >>  30s >>  Next
   Stop (click it twice)
 
-Under them: what the stream is doing, what your VRChat player shows, and
+Under them: what the stream is doing, then what plays next and when ("Up
+next: ... starts at about 21:46", "Queue ends at about 23:10"; "?" for a
+video whose length isn't known yet), what your VRChat player shows, and
 
   Watch as viewers see it   opens the real stream in a player on your PC,
                    with the same delay viewers have
@@ -298,12 +304,17 @@ On the right:
                    after them (only here, not in the console); Cancel or Esc
                    stops it. If nothing is found, the title comes back into
                    the box.
-  Up next          the queue. Point at a video for its buttons: play now, move
-                   up, move down, remove (its download stops). Right-click has
-                   the same and Clear the queue. The video that plays can't be
-                   removed: use Next or Stop. A video that downloads (a torrent
-                   episode too) shows how far the download got.
-  Messages         everything the console says (right-click: copy, log.txt)
+  Up next          the queue. Point at a video for its buttons: play now,
+                   play after this one (it moves right behind the video that
+                   plays, which goes on), move up, move down, remove (its
+                   download stops). Right-click has the same and Clear the
+                   queue. The first row is the video that plays; it can't be
+                   removed: use Next or Stop. A video that downloads (a
+                   torrent episode too) shows how far the download got.
+  Messages         everything the console says (right-click: copy, copy the
+                   last 100 lines, log.txt). "Warnings only" shows just the
+                   yellow and red lines. "Messages (2!)" counts the warnings
+                   that came since you last looked.
   Question         every question the console asks shows here too, in its own
                    tab that opens by itself: buttons or a list to pick from (a
                    list of search results shows where each one comes from on
@@ -620,8 +631,18 @@ All of these are optional.
               (not recommended: the picture may not come).
   Clock       false. true shows the video time in a corner of the picture.
   ControlWindow       true (the default) opens the control window.
+  ConsoleStart        "normal" (the default). "minimized" minimizes this console
+              window once the control window shows (restore it from the taskbar).
+  Hotkeys             false (the default). true turns on global keys that work
+              while VRChat has the focus: Ctrl+Alt+Space pause / continue,
+              Ctrl+Alt+Left / Right back / forward 10 seconds, Ctrl+Alt+N next.
+              (A key another program already owns is skipped, with a warning.)
   IdleMinutes         15. With nothing queued, the waiting screen ends after
               this many minutes (3 to 600).
+  SummaryStep         true (the default): after the questions for a show with
+              2 or more episodes, one line sums them up ("Overlord II,
+              AniLibria, episodes 1-13") - Enter = go, Esc = back.
+              false skips it.
   AskTimeoutSec       60. A question about the next video asked while viewers
               wait (audio / subtitles, which player, installing yt-dlp,
               downloading rqbit) takes the suggested answer after this many

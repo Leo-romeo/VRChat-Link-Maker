@@ -209,7 +209,7 @@ function New-ControlPanel {
     AskInfoText = ''; AskList = $null; AskPicks = @(); AskText = $null; AskDigits = ''; AskDigitsAt = [DateTime]::MinValue
     Wide = $null; Page = 'queue'; PageBack = 'queue'; ClockOn = $false; ListNames = @(); ListInfo = @(); QHot = -1; QHotBtn = ''; QOn = $false
     AskRows = @(); AskHot = -1; AskTags = $false; LogAtEnd = $true; Icon = $null; ListTotal = 0; QPress = $null; AskCtxLines = @()
-    WarmAt = [DateTime]::MinValue
+    WarmAt = [DateTime]::MinValue; LogAll = $null; LogWarnOnly = $false; LogUnread = 0; NoteSeq = 0; NowOff = 0; BannerKind = ''; QHotTip = ''; DlDir = ''; DlOpened = ''; HotWin = $null
   }
   $script:Panel = $p
   $script:PanelLast = @{}
@@ -310,7 +310,7 @@ function New-ControlPanel {
   $top.Controls.Add($p.Quality, 2, 0)
   # Settings: the same list as M in the console (the main thread sends it, see Update-PanelMenu), then the clock, always
   # on top, log.txt and End stream. What changes the link or the picture works only while nothing plays.
-  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Where to stream, picture size, speed test, new link, language, downloading videos, the clock on the stream, always on top, log.txt and End stream. The stream settings work while nothing plays; their questions show here and in the console window.') '' $null $null
+  $p.More = New-PanelButton ((T 'Settings') + ' ' + [char]0x25BE) (T 'Stream: where to, picture size, speed test, new link. This session: ask again, the clock, always on top. Tool: language, downloading videos, more settings, config.json, log.txt. And End stream. The settings work while nothing plays; their questions show here and in the console window.') '' $null $null
   $p.More.AutoEllipsis = $false
   $menu = New-Object "$WF.ContextMenuStrip"
   $menu.ShowItemToolTips = $true
@@ -367,7 +367,15 @@ function New-ControlPanel {
   $bn.Margin = New-Object System.Windows.Forms.Padding(2, [int](3 * $k), 2, [int](2 * $k))
   $bn.Cursor = [System.Windows.Forms.Cursors]::Hand
   $bn.Visible = $false
-  $bn.Add_Click({ try { $script:Panel.IdleHushUntil = [DateTime]::UtcNow.AddSeconds(5); Hide-PanelBanner; Add-PanelCommand 'seen' } catch {} })
+  $bn.Add_Click({
+      try {
+        $q = $script:Panel
+        # (The grey download bar: its folder opens.)
+        if ($q.BannerKind -eq 'dl') { Open-PanelDownloadFolder; return }
+        # (The "is out" bar: the start screen asks about the update, Wait-AskInput.)
+        if ($q.BannerCmd -eq 'update') { $b = Get-PanelBus; if ($b) { $b.UpdateReq = $true } }
+        $q.IdleHushUntil = [DateTime]::UtcNow.AddSeconds(5); Hide-PanelBanner; Add-PanelCommand 'seen'
+      } catch {} })
   $p.Banner = $bn
   $root.Controls.Add($bn, 0, 2)
 
@@ -565,8 +573,10 @@ function New-ControlPanel {
   $p.SubsBtn = New-PanelButton '' (T 'Turn the subtitles on or off, or switch them (F4 in the console window). They get drawn into the picture; the video goes on from the same moment.') '' $null $null
   # (A menu that is empty when it opens starts out cancelled: filled now, it opens after all.)
   $p.AudioMenu = New-Object "$WF.ContextMenuStrip"
+  $p.AudioMenu.ShowItemToolTips = $true
   $p.AudioMenu.Add_Opening({ param($sender, $e) try { Update-PanelTrackMenu 'audio'; $e.Cancel = ($sender.Items.Count -eq 0) } catch { Write-PanelWarning $_ } })
   $p.SubsMenu = New-Object "$WF.ContextMenuStrip"
+  $p.SubsMenu.ShowItemToolTips = $true
   $p.SubsMenu.Add_Opening({ param($sender, $e) try { Update-PanelTrackMenu 'subs'; $e.Cancel = ($sender.Items.Count -eq 0) } catch { Write-PanelWarning $_ } })
   $p.AudioBtn.Add_Click({ try { $q = $script:Panel; $q.AudioMenu.Show($q.AudioBtn, 0, $q.AudioBtn.Height) } catch {} })
   $p.SubsBtn.Add_Click({ try { $q = $script:Panel; $q.SubsMenu.Show($q.SubsBtn, 0, $q.SubsBtn.Height) } catch {} })
@@ -621,6 +631,18 @@ function New-ControlPanel {
   $p.TabQueue = New-PanelTab (T 'Up next') 'queue'
   $p.TabLog = New-PanelTab (T 'Messages') 'log'
   foreach ($b in @($p.TabAsk, $p.TabQueue, $p.TabLog)) { $tabs.Controls.Add($b) }
+  # (Messages only: its yellow and red lines alone, Set-PanelLogFilter.)
+  $wo = New-Object "$WF.CheckBox"
+  $wo.Text = T 'Warnings only'
+  $wo.AutoSize = $true
+  $wo.ForeColor = $c.Dim
+  $wo.BackColor = $c.Back
+  $wo.Margin = New-Object System.Windows.Forms.Padding([int](10 * $k), [int](7 * $k), 0, 0)
+  $wo.Visible = $false
+  $wo.Add_CheckedChanged({ try { Set-PanelLogFilter ([bool]$this.Checked) } catch { Write-PanelWarning $_ } })
+  $p.Tips.SetToolTip($wo, (T 'Shows only the yellow and red lines: warnings and errors.'))
+  $p.WarnOnly = $wo
+  $tabs.Controls.Add($wo)
   $p.Tabs = $tabs
   $right.Controls.Add($tabs, 0, 1)
 
@@ -666,15 +688,17 @@ function New-ControlPanel {
   })
   $qm = New-Object "$WF.ContextMenuStrip"
   $p.QPlay = New-PanelMenuItem (T 'Play now') 'qplay'
+  $p.QNext = New-PanelMenuItem (T 'Play after this one') 'qnext'
   $p.QUp = New-PanelMenuItem (T 'Move up') 'qup'
   $p.QDown = New-PanelMenuItem (T 'Move down') 'qdown'
   $p.QRemove = New-PanelMenuItem (T 'Remove') 'qremove'
   $p.QClear = New-PanelMenuItem (T 'Clear the queue') 'qclear'
-  foreach ($mi in @($p.QPlay, $p.QUp, $p.QDown, $p.QRemove)) {
+  foreach ($mi in @($p.QPlay, $p.QNext, $p.QUp, $p.QDown, $p.QRemove)) {
     $mi.Add_Click({ try { $id = Get-PanelListId; if ($id -gt 0) { Add-PanelCommand ([string]$this.Tag.Cmd) @{ Id = $id } } } catch {} })
   }
   $p.QClear.Add_Click({ try { if (Confirm-Panel (T 'Remove everything from Up next?')) { Add-PanelCommand 'qclear' @{ Id = (Get-PanelListId) } } } catch { Write-PanelWarning $_ } })
-  foreach ($mi in @($p.QPlay, $p.QUp, $p.QDown, $p.QRemove)) { [void]$qm.Items.Add($mi) }
+  foreach ($mi in @($p.QPlay, $p.QNext, $p.QUp, $p.QDown, $p.QRemove)) { [void]$qm.Items.Add($mi) }
+  $qm.ShowItemToolTips = $true
   [void]$qm.Items.Add((New-Object "$WF.ToolStripSeparator"))
   [void]$qm.Items.Add($p.QClear)
   $qm.Add_Opening({ try { Update-PanelQueueMenu } catch { Write-PanelWarning $_ } })
@@ -709,6 +733,9 @@ function New-ControlPanel {
   $lg.SelectionMode = [System.Windows.Forms.SelectionMode]::MultiExtended
   $lg.Visible = $false
   $p.LogColors = New-Object 'System.Collections.Generic.List[string]'
+  # (Every line with its colour, @(text, colour): what the list shows is all of them or, with Warnings only, the yellow
+  # and red ones.)
+  $p.LogAll = New-Object 'System.Collections.Generic.List[object]'
   $p.LogPal = @{
     Red = (New-PanelColor 240 110 110); DarkRed = (New-PanelColor 240 110 110); Yellow = (New-PanelColor 232 200 90); DarkYellow = (New-PanelColor 232 200 90)
     Green = (New-PanelColor 110 205 125); DarkGreen = (New-PanelColor 110 205 125); Cyan = (New-PanelColor 100 190 235); DarkCyan = (New-PanelColor 100 190 235)
@@ -747,11 +774,21 @@ function New-ControlPanel {
       if ($t) { [System.Windows.Forms.Clipboard]::SetDataObject($t, $true, 5, 100) }
     } catch {}
   })
+  # (For a bug report: the end of it, not the whole session.)
+  $ltl = New-Object "$WF.ToolStripMenuItem"
+  $ltl.Text = T 'Copy the last 100 lines'
+  $ltl.Add_Click({
+    try {
+      $t = Get-PanelLogTail 100
+      if ($t) { [System.Windows.Forms.Clipboard]::SetDataObject($t, $true, 5, 100) }
+    } catch {}
+  })
   $p.LogOpen = New-Object "$WF.ToolStripMenuItem"
   $p.LogOpen.Text = T 'Open log.txt'
   $p.LogOpen.Add_Click({ try { Open-PanelLogFile } catch { Write-PanelWarning $_ } })
   [void]$lcm.Items.Add($p.LogCopy)
   [void]$lcm.Items.Add($lmi)
+  [void]$lcm.Items.Add($ltl)
   [void]$lcm.Items.Add($p.LogOpen)
   $lcm.Add_Opening({
     try {
@@ -787,7 +824,7 @@ function New-ControlPanel {
     param($sender, $e)
     try {
       $q = $script:Panel
-      if (($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -or $e.CloseReason -eq [System.Windows.Forms.CloseReason]::None) -and -not $q.Closed -and -not $script:PanelSync.CloseReq -and $q.Mode -and $q.Mode -ne 'off' -and $q.Mode -ne 'ended') {
+      if (($e.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing -or $e.CloseReason -eq [System.Windows.Forms.CloseReason]::None) -and -not $q.Closed -and -not $script:PanelSync.CloseReq -and $q.Mode -and $q.Mode -ne 'off' -and $q.Mode -ne 'ended' -and $q.Mode -ne 'starting') {
         $c = Show-PanelCloseChoice
         if ($c -ne 'close') {
           $e.Cancel = $true
@@ -922,7 +959,7 @@ function Receive-PanelDrop($data) {
 function Request-PanelWarm {
   $q = $script:Panel
   $t = ([string]$q.Input.Text).Trim()
-  if ($t.Length -lt 2 -or @('', 'off', 'waiting') -contains [string]$q.Mode) { return }
+  if ($t.Length -lt 2 -or @('', 'off', 'waiting', 'starting') -contains [string]$q.Mode) { return }
   if ($t -match '^(?i)([a-z][a-z0-9+.-]*://|magnet:|[a-z]:[\\/]|[\\/"])') { return }
   if (([DateTime]::UtcNow - $q.WarmAt).TotalSeconds -lt 30) { return }
   $q.WarmAt = [DateTime]::UtcNow
@@ -1138,6 +1175,30 @@ function Open-PanelDownloadWindow {
   [void][System.Diagnostics.Process]::Start($psi)
 }
 
+# The Settings menu's This session group ends with these (the window's own): the clock on the stream (ticked as the
+# stream has it: the main thread flips it after the command) and always on top.
+function Add-PanelSessionItems($m) {
+  $q = $script:Panel
+  $ck = New-PanelMenuItem (T 'Clock on the stream') 'clock'
+  $ck.Checked = [bool]$q.ClockOn
+  $ck.ToolTipText = T 'The video time in a corner of the picture: compare it to spot who is behind.'
+  $ck.Add_Click({ try { Add-PanelCommand 'clock' } catch {} })
+  [void]$m.Items.Add($ck)
+  $ot = New-PanelMenuItem (T 'Always on top') 'ontop'
+  $ot.Checked = [bool]$q.Form.TopMost
+  $ot.Add_Click({ try { $f = $script:Panel.Form; $f.TopMost = -not $f.TopMost } catch {} })
+  [void]$m.Items.Add($ot)
+}
+
+# A download window (the console's D): opened from here, so it works any time, also while a question waits.
+function Add-PanelDownloadItem($m) {
+  $dw = New-PanelMenuItem (T 'Download videos to this PC (no stream)...') 'download'
+  $dw.Enabled = (Test-PanelToolFile)
+  $dw.ToolTipText = T 'Opens a window that downloads episodes or videos into a folder instead of streaming them. The stream goes on meanwhile.'
+  $dw.Add_Click({ try { Open-PanelDownloadWindow } catch { Write-PanelWarning $_ } })
+  [void]$m.Items.Add($dw)
+}
+
 # The Settings menu, made again each time it opens from what the main thread sent last (State.Menu = Get-MenuItems:
 # Id, Label, On; State.Choices.<id> = the choices of host / res / lang with State.Chosen.<id> checked). A click queues
 # the item's Id (with the choice as Arg); the main thread runs it on the waiting screen (Invoke-Queue).
@@ -1156,12 +1217,23 @@ function Update-PanelMenu {
   $asking = Test-PanelMainAsk
   $waitOk = ($mode -eq 'waiting' -and -not $prompt -and -not $asking)
   $tip = T 'Available while nothing plays (press Stop first).'
+  # In groups, a separator between them: Stream (where, size, speed test, new link), This session (ask again, the
+  # clock, always on top), Tool (language, download window, more settings, config.json, log.txt), then End stream.
   $n = 0
+  $group = ''
   if ($s -and $null -ne $s['Menu']) {
     $choices = $s['Choices']
     $chosen = $s['Chosen']
     foreach ($it in @($s['Menu'])) {
       $id = [string]$it['Id']
+      $g = [string]$it['Group']
+      if ($g -cne $group) {
+        if ($group -eq 'session') { Add-PanelSessionItems $m }
+        if ($n -gt 0) { [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
+        $group = $g
+      }
+      $n++
+      if ($id -eq 'download') { Add-PanelDownloadItem $m; continue }
       $list = @()
       if ($choices -and $null -ne $choices[$id]) { $list = @($choices[$id]) }
       $label = [string]$it['Label']
@@ -1175,6 +1247,8 @@ function Update-PanelMenu {
           $sub.Checked = ([string]$ch['Value'] -ceq $cur)
           if ($ch['Tip']) { $sub.ToolTipText = [string]$ch['Tip'] }
           $sub.Add_Click({ try { Add-PanelCommand ([string]$this.Tag.Cmd) ([string]$this.Tag.Arg) } catch {} })
+          # (More settings: its last item, Open config.json, after a line.)
+          if ($id -eq 'more' -and [string]$ch['Value'] -eq 'config') { [void]$mi.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
           [void]$mi.DropDownItems.Add($sub)
         }
         try { $mi.DropDown.ShowItemToolTips = $true } catch {}
@@ -1184,28 +1258,10 @@ function Update-PanelMenu {
       $mi.Enabled = ($waitOk -and [bool]$it['On'])
       if (-not $waitOk) { $mi.ToolTipText = $tip }
       [void]$m.Items.Add($mi)
-      $n++
     }
   }
-  if ($n -gt 0) { [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) }
-  # A download window (the console's D): opened from here, so it works any time, also while a question waits.
-  $dw = New-PanelMenuItem (T 'Download videos to this PC (no stream)...') 'download'
-  $dw.Enabled = (Test-PanelToolFile)
-  $dw.ToolTipText = T 'Opens a window that downloads episodes or videos into a folder instead of streaming them. The stream goes on meanwhile.'
-  $dw.Add_Click({ try { Open-PanelDownloadWindow } catch { Write-PanelWarning $_ } })
-  [void]$m.Items.Add($dw)
-  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-  # The clock on the stream (ticked as the stream has it: the main thread flips it after the command) and always on top.
-  $ck = New-PanelMenuItem (T 'Clock on the stream') 'clock'
-  $ck.Checked = [bool]$q.ClockOn
-  $ck.ToolTipText = T 'The video time in a corner of the picture: compare it to spot who is behind.'
-  $ck.Add_Click({ try { Add-PanelCommand 'clock' } catch {} })
-  [void]$m.Items.Add($ck)
-  $ot = New-PanelMenuItem (T 'Always on top') 'ontop'
-  $ot.Checked = [bool]$q.Form.TopMost
-  $ot.Add_Click({ try { $f = $script:Panel.Form; $f.TopMost = -not $f.TopMost } catch {} })
-  [void]$m.Items.Add($ot)
-  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  if ($group -eq 'session') { Add-PanelSessionItems $m }
+  if ($n -eq 0) { Add-PanelSessionItems $m; [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)); Add-PanelDownloadItem $m }
   $lo = New-PanelMenuItem (T 'Open log.txt') 'openlog'
   $lo.Enabled = (Test-PanelLogFile)
   $lo.Add_Click({ try { Open-PanelLogFile } catch { Write-PanelWarning $_ } })
@@ -1241,13 +1297,18 @@ function Update-PanelTrackMenu([string]$what) {
   if ($null -eq $t) { return }
   $labels = @()
   $cur = -1
-  if ($what -eq 'audio') { $labels = @($t['Audio']); $cur = [int]$t['A'] } else { $labels = @($t['Subs']); $cur = [int]$t['S'] }
+  if ($what -eq 'audio') { $labels = @($t['Audio']); $full = @($t['AudioFull']); $cur = [int]$t['A'] } else { $labels = @($t['Subs']); $full = @($t['SubsFull']); $cur = [int]$t['S'] }
   $items = @()
-  if ($what -eq 'subs') { $items += , @((T 'No subtitles'), -1) }
-  for ($i = 0; $i -lt $labels.Count; $i++) { $items += , @([string]$labels[$i], $i) }
+  if ($what -eq 'subs') { $items += , @((T 'No subtitles'), -1, '') }
+  for ($i = 0; $i -lt $labels.Count; $i++) {
+    $tip = ''
+    if ($i -lt $full.Count -and [string]$full[$i] -cne [string]$labels[$i]) { $tip = [string]$full[$i] }
+    $items += , @([string]$labels[$i], $i, $tip)
+  }
   foreach ($x in $items) {
     $mi = New-PanelMenuItem $x[0] $what ([int]$x[1])
     $mi.Checked = ([int]$x[1] -eq $cur)
+    if ($x[2]) { $mi.ToolTipText = [string]$x[2] }   # (the whole name, staff list and all)
     $mi.Add_Click({ try { Add-PanelCommand ([string]$this.Tag.Cmd) ([int]$this.Tag.Arg) } catch {} })
     [void]$m.Items.Add($mi)
   }
@@ -1270,11 +1331,23 @@ function Update-PanelQueueMenu {
   $ids = @($q.ListIds)
   $ix = $q.List.SelectedIndex
   $has = ($ok -and (Get-PanelListId) -gt 0)
+  # (Its place among what waits: the first row may be the video that plays, NowOff.)
+  $off = [int]$q.NowOff
+  $u = $ix - $off
   $q.QPlay.Enabled = $has
+  $q.QNext.Enabled = ($has -and $u -gt 0 -and (Test-PanelPlaying))
   $q.QRemove.Enabled = $has
-  $q.QUp.Enabled = ($has -and $ix -gt 0)
-  $q.QDown.Enabled = ($has -and $ix -lt [Math]::Max($ids.Count, [int]$q.ListTotal) - 1)
-  $q.QClear.Enabled = ($ok -and $ids.Count -gt 0)
+  $q.QRemove.ToolTipText = ''
+  if ($ok -and $ix -ge 0 -and $u -lt 0) { $q.QRemove.ToolTipText = T 'Use Next or Stop for the video that plays' }
+  $q.QUp.Enabled = ($has -and $u -gt 0)
+  $q.QDown.Enabled = ($has -and $u -lt [Math]::Max($ids.Count - $off, [int]$q.ListTotal) - 1)
+  $q.QClear.Enabled = ($ok -and $ids.Count - $off -gt 0)
+}
+
+# Does a video play (or is paused / waits for the players)? Then Up next's first row is that video.
+function Test-PanelPlaying {
+  $m = [string]$script:Panel.Mode
+  return ($m -eq 'content' -or $m -eq 'paused' -or $m -eq 'hold')
 }
 
 # The two sides: next to each other (the player left, a column of 400-560 px right), or in a narrow window one above
@@ -1327,8 +1400,9 @@ function Update-PanelLayout {
   } finally { $q.InRows = $false }
 }
 
-# The status line: one line high, two when its text needs them at this width (a third line ends in "..."). Measured
-# by the label itself (it draws the way it measures): taller at its width than in one line = it wraps.
+# The status line, with what comes next under it (State.Plan): as many lines as its text needs at this width, at most
+# 4 (a fifth ends in "..."). Measured by the label itself (it draws the way it measures): its height at this width,
+# over the height of one of its lines (unwrapped: its own lines).
 function Set-PanelStatusHeight {
   $q = $script:Panel
   if ($null -eq $q -or $null -eq $q.Status) { return }
@@ -1336,7 +1410,12 @@ function Set-PanelStatusHeight {
   $w = $st.Width
   if ($w -le 20) { return }
   $lines = 1
-  if ($st.Text -and $st.GetPreferredSize((New-Object System.Drawing.Size($w, 0))).Height -gt $st.GetPreferredSize((New-Object System.Drawing.Size(0, 0))).Height) { $lines = 2 }
+  if ($st.Text) {
+    $own = [Math]::Max(1, @($st.Text -split "`n").Count)
+    $one = [Math]::Max(1.0, $st.GetPreferredSize((New-Object System.Drawing.Size(0, 0))).Height / [double]$own)
+    $lines = [Math]::Max($own, [int][Math]::Round($st.GetPreferredSize((New-Object System.Drawing.Size($w, 0))).Height / $one))
+    $lines = [Math]::Min(4, $lines)
+  }
   $want = $lines * $q.Font.Height + 6
   if ($st.Height -ne $want) { $st.Height = $want }
 }
@@ -1358,6 +1437,7 @@ function Select-PanelPage([string]$page) {
   }
   $wasLog = $q.Log.Visible
   $q.Page = $page
+  if ($page -eq 'log') { $q.LogUnread = 0 }
   foreach ($n in @('List', 'ListEmpty', 'Log', 'Ask')) { if ($q[$n].Visible -ne $show[$n]) { $q[$n].Visible = $show[$n] } }
   # (Messages that came while another page showed: it shows the newest ones, unless it was scrolled up before.)
   if ($show.Log -and -not $wasLog -and $q.LogAtEnd -and $q.Log.Items.Count -gt 0) {
@@ -1370,16 +1450,22 @@ function Select-PanelPage([string]$page) {
 # The tabs' texts (Up next with how many) and looks: the shown one light and underlined, [Question] yellow while open.
 function Update-PanelTabs {
   $q = $script:Panel
-  $n = [Math]::Max(@($q.ListIds).Count, [int]$q.ListTotal)
+  $n = [Math]::Max(@($q.ListIds).Count - [int]$q.NowOff, [int]$q.ListTotal)
   $t = T 'Up next'
   if ($n -gt 0) { $t += ' (' + $n + ')' }
   if ($q.TabQueue.Text -cne $t) { $q.TabQueue.Text = $t }
+  # (Warnings and errors that came since Messages was last looked at: "Messages (2!)", in yellow.)
+  $lt = T 'Messages'
+  if ($q.LogUnread -gt 0) { $lt += ' (' + $q.LogUnread + '!)' }
+  if ($q.TabLog.Text -cne $lt) { $q.TabLog.Text = $lt }
+  $wv = ($q.Page -ceq 'log')
+  if ($q.WarnOnly -and $q.WarnOnly.Visible -ne $wv) { $q.WarnOnly.Visible = $wv }
   $ask = [bool]$q.AskId
   if ($q.TabAsk.Visible -ne $ask) { $q.TabAsk.Visible = $ask }
   foreach ($b in @($q.TabAsk, $q.TabQueue, $q.TabLog)) {
     $on = ([string]$b.Tag -ceq $q.Page)
     $fc = $q.Colors.Dim
-    if ($on) { $fc = $q.Colors.Text } elseif ($b -eq $q.TabAsk) { $fc = $q.Colors.Warn }
+    if ($on) { $fc = $q.Colors.Text } elseif ($b -eq $q.TabAsk -or ($b -eq $q.TabLog -and $q.LogUnread -gt 0)) { $fc = $q.Colors.Warn }
     $bc = $q.Colors.Back
     if ($on) { $bc = $q.Colors.Box }
     if ($b.ForeColor -ne $fc) { $b.ForeColor = $fc }
@@ -1390,20 +1476,28 @@ function Update-PanelTabs {
 
 # ------------------------------------------------------------------ Up next rows
 # The row's buttons (only on the row under the mouse or the selected one, and only while the queue can change): Play
-# now, Move up, Move down, Remove, from the left; each @{ Cmd; Rect; On; Glyph }.
+# now, Play after this one, Move up, Move down, Remove, from the left; each @{ Cmd; Rect; On; Glyph; Tip }. The row
+# of the video that plays (the first one, NowOff) has only Remove, off: its tooltip says what to use instead.
 function Get-PanelQueueIcons($lb, [int]$i) {
   $q = $script:Panel
   $n = @($q.ListIds).Count
   if (-not $q.QOn -or $i -lt 0 -or $i -ge $n -or $i -ge $lb.Items.Count) { return @() }
   if ($i -ne $q.QHot -and $i -ne $lb.SelectedIndex) { return @() }
+  $off = [int]$q.NowOff
+  $u = $i - $off
   # (The rows stop at 20: the 20th can still go down when more wait.)
-  $all = [Math]::Max($n, [int]$q.ListTotal)
+  $all = [Math]::Max($n - $off, [int]$q.ListTotal)
   $r = $lb.GetItemRectangle($i)
   $iw = [int](24 * $q.K)
-  $x = $r.Right - [int](4 * $q.K) - 4 * $iw
+  $defs = @(@('qplay', 0x25B6, $true), @('qnext', 0x21A5, ($u -gt 0 -and (Test-PanelPlaying))), @('qup', 0x25B2, ($u -gt 0)), @('qdown', 0x25BC, ($u -lt $all - 1)), @('qremove', 0x2715, $true))
+  if ($u -lt 0) { $defs = @(, @('qremove', 0x2715, $false)) }
+  $x = $r.Right - [int](4 * $q.K) - $defs.Count * $iw
   $out = @()
-  foreach ($d in @(@('qplay', 0x25B6, $true), @('qup', 0x25B2, ($i -gt 0)), @('qdown', 0x25BC, ($i -lt $all - 1)), @('qremove', 0x2715, $true))) {
-    $out += @{ Cmd = [string]$d[0]; Glyph = [string][char][int]$d[1]; On = [bool]$d[2]; Rect = (New-Object System.Drawing.Rectangle($x, $r.Y, $iw, $r.Height)) }
+  foreach ($d in $defs) {
+    $on = [bool]$d[2]
+    $tip = ''
+    if ($on) { $tip = Get-PanelQueueTip ([string]$d[0]) } elseif ($u -lt 0) { $tip = T 'Use Next or Stop for the video that plays' }
+    $out += @{ Cmd = [string]$d[0]; Glyph = [string][char][int]$d[1]; On = $on; Tip = $tip; Rect = (New-Object System.Drawing.Rectangle($x, $r.Y, $iw, $r.Height)) }
     $x += $iw
   }
   return $out
@@ -1412,6 +1506,7 @@ function Get-PanelQueueIcons($lb, [int]$i) {
 function Get-PanelQueueTip([string]$cmd) {
   switch ($cmd) {
     'qplay' { return (T 'Play now') }
+    'qnext' { return (T 'Play after this one') }
     'qup' { return (T 'Move up') }
     'qdown' { return (T 'Move down') }
     'qremove' { return (T 'Remove') }
@@ -1430,8 +1525,9 @@ function Show-PanelQueueRow($lb, $e) {
   $c = $q.Colors
   $k = $q.K
   $sel = (($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0)
+  $now = ($i -lt [int]$q.NowOff)
   $bg = $c.Box
-  if ($sel) { $bg = $c.Sel } elseif ($q.QHot -eq $i) { $bg = $c.Hot }
+  if ($sel) { $bg = $c.Sel } elseif ($q.QHot -eq $i) { $bg = $c.Hot } elseif ($now) { $bg = $c.Card }
   $q.Brushes.Row.Color = $bg
   $g.FillRectangle($q.Brushes.Row, $b)
   $TF = [System.Windows.Forms.TextFormatFlags]
@@ -1443,7 +1539,9 @@ function Show-PanelQueueRow($lb, $e) {
   if ($i -lt $q.ListInfo.Count) { $info = [string]$q.ListInfo[$i] }
   $numW = $q.NumW
   $x = $b.X + $pad
-  [System.Windows.Forms.TextRenderer]::DrawText($g, [string]($i + 1), $q.Font, (New-Object System.Drawing.Rectangle($x, $b.Y, $numW, $b.Height)), $c.Dim, ($flags -bor $TF::Right))
+  $numR = New-Object System.Drawing.Rectangle($x, $b.Y, $numW, $b.Height)
+  if ($now) { [System.Windows.Forms.TextRenderer]::DrawText($g, [string][char]0x25B6, $q.Sym, $numR, $c.Accent, ($flags -bor $TF::Right)) }
+  else { [System.Windows.Forms.TextRenderer]::DrawText($g, [string]($i + 1 - [int]$q.NowOff), $q.Font, $numR, $c.Dim, ($flags -bor $TF::Right)) }
   $x += $numW + $pad
   $right = $b.Right - $pad
   $icons = @(Get-PanelQueueIcons $lb $i)
@@ -1491,13 +1589,15 @@ function Update-PanelQueueHot($lb, $pt) {
   $q = $script:Panel
   $i = Get-PanelRowAt $lb $pt
   $cmd = ''
+  $tip = ''
   $old = $q.QHot
   $q.QHot = $i
-  if ($i -ge 0) { foreach ($ic in @(Get-PanelQueueIcons $lb $i)) { if ($ic.On -and $ic.Rect.Contains($pt)) { $cmd = $ic.Cmd } } }
-  if ($i -eq $old -and $cmd -ceq $q.QHotBtn) { return }
+  if ($i -ge 0) { foreach ($ic in @(Get-PanelQueueIcons $lb $i)) { if ($ic.Rect.Contains($pt)) { $tip = [string]$ic.Tip; if ($ic.On) { $cmd = $ic.Cmd } } } }
+  if ($i -eq $old -and $cmd -ceq $q.QHotBtn -and $tip -ceq $q.QHotTip) { return }
   $q.QHotBtn = $cmd
+  $q.QHotTip = $tip
   Update-PanelRowsLit $lb $old $i
-  $q.Tips.SetToolTip($lb, (Get-PanelQueueTip $cmd))
+  $q.Tips.SetToolTip($lb, $tip)
 }
 
 # The row button under the point $pt: @{ Cmd; Id } (an enabled one only), or $null.
@@ -1595,24 +1695,90 @@ function Get-PanelIconImage([int]$n) {
   } finally { $ms.Dispose() }
 }
 
-# The warnings banner: the latest yellow / red message line, for about 15 s.
-function Show-PanelBanner([string]$text, [string]$color) {
+# The banner: the latest yellow / red message line (yellow for about 15 s, red until it is clicked: it may have come
+# while you were in VRChat), or news from the main thread: green -Cmd says what a click does, -Tip what the tooltip
+# says instead of "Click to hide.". A red one isn't pushed away by a yellow or green one meanwhile (those are in
+# Messages), only by -Force (the idle warning: it wants a click).
+function Show-PanelBanner([string]$text, [string]$color, [string]$Cmd = '', [string]$Tip = '', [int]$Seconds = 15, [switch]$Force) {
   $q = $script:Panel
   $line = ''
   foreach ($l in ($text -split "`r?`n")) { if ($l.Trim()) { $line = $l.Trim(); break } }
   if (-not $line) { return }
   $bn = $q.Banner
-  if ($color -like '*Red') { $bn.BackColor = (New-PanelColor 84 34 34); $bn.ForeColor = (New-PanelColor 250 150 150) }
-  else { $bn.BackColor = (New-PanelColor 74 62 22); $bn.ForeColor = (New-PanelColor 240 214 120) }
+  $kind = 'yellow'
+  if ($color -like '*Red') { $kind = 'red' } elseif ($color -like '*Green') { $kind = 'green' }
+  if ($kind -ne 'red' -and -not $Force -and $bn.Visible -and $q.BannerKind -eq 'red') { return }
+  switch ($kind) {
+    'red' { $bn.BackColor = (New-PanelColor 84 34 34); $bn.ForeColor = (New-PanelColor 250 150 150) }
+    'green' { $bn.BackColor = (New-PanelColor 28 70 42); $bn.ForeColor = (New-PanelColor 150 230 165) }
+    default { $bn.BackColor = (New-PanelColor 74 62 22); $bn.ForeColor = (New-PanelColor 240 214 120) }
+  }
   $bn.Text = $line
-  $q.Tips.SetToolTip($bn, $text.Trim() + "`r`n" + (T 'Click to hide.'))
-  $q.BannerUntil = [DateTime]::UtcNow.AddSeconds(15)
+  $q.BannerCmd = $Cmd
+  if (-not $Tip) { $Tip = $text.Trim() + "`r`n" + (T 'Click to hide.') }
+  $q.Tips.SetToolTip($bn, $Tip)
+  $q.BannerKind = $kind
+  if ($kind -eq 'red') { $q.BannerUntil = [DateTime]::MaxValue } else { $q.BannerUntil = [DateTime]::UtcNow.AddSeconds($Seconds) }
   if (-not $bn.Visible) { $bn.Visible = $true }
+}
+
+# News from the main thread for the bar (bus.Notice: Text, Tip, Color, Cmd, Seq), shown once per window.
+function Update-PanelNotice {
+  $q = $script:Panel
+  $b = Get-PanelBus
+  if ($null -eq $b) { return }
+  $n = $b.Notice
+  if ($null -eq $n) {
+    if ($q.NoticeSeq -and $q.BannerCmd -and $q.Banner.Visible) { Hide-PanelBanner }
+    $q.NoticeSeq = $null
+    return
+  }
+  if ($q.NoticeSeq -eq $n.Seq) { return }
+  $q.NoticeSeq = $n.Seq
+  Show-PanelBanner ([string]$n.Text) ([string]$n.Color) -Cmd ([string]$n.Cmd) -Tip ([string]$n.Tip + "`r`n" + (T 'Click: the start screen asks whether to update.')) -Seconds 120
+}
+
+# A green note from the main thread (Show-UiBanner there): shown once, and only while it is new (not in a window
+# opened later).
+function Update-PanelNote {
+  $q = $script:Panel
+  $n = $null
+  try { $b = Get-PanelBus; if ($b) { $n = $b['Note'] } } catch {}
+  if ($null -eq $n -or [int]$n['Seq'] -eq $q.NoteSeq) { return }
+  $q.NoteSeq = [int]$n['Seq']
+  if (([DateTime]::UtcNow - [DateTime]$n['At']).TotalSeconds -lt 15) { Show-PanelBanner ([string]$n['Text']) ([string]$n['Color']) }
+}
+
+# A download window runs (State.DlText, from its progress file): the same bar in grey, unless a warning shows. A click
+# opens the folder the videos go to.
+function Show-PanelDlBanner([string]$text, [string]$dir) {
+  $q = $script:Panel
+  $q.DlDir = $dir
+  $bn = $q.Banner
+  if ($bn.Visible -and $q.BannerKind -ne 'dl') { return }
+  if ($q.BannerKind -ne 'dl' -or $bn.Text -cne $text) {
+    $bn.BackColor = (New-PanelColor 52 56 64); $bn.ForeColor = (New-PanelColor 200 205 212)
+    $bn.Text = $text
+    $q.BannerKind = 'dl'
+    $q.Tips.SetToolTip($bn, $text + "`r`n" + (T 'Click to open the folder.'))
+  }
+  $q.BannerUntil = [DateTime]::UtcNow.AddSeconds(6)
+  if (-not $bn.Visible) { $bn.Visible = $true }
+}
+
+function Open-PanelDownloadFolder {
+  $q = $script:Panel
+  $d = [string]$q.DlDir
+  if (-not $d -or -not [System.IO.Directory]::Exists($d)) { return }
+  $q.DlOpened = $d
+  try { [void][System.Diagnostics.Process]::Start('explorer.exe', '"' + $d + '"') } catch {}
 }
 
 function Hide-PanelBanner {
   $q = $script:Panel
+  $q.BannerKind = ''
   $q.BannerUntil = [DateTime]::MinValue
+  $q.BannerCmd = ''
   if ($q.Banner.Visible) { $q.Banner.Visible = $false }
 }
 
@@ -1826,10 +1992,12 @@ function New-PanelAskStrip {
   # buttons stacked, an empty band under them.)
   $p.AskBar.WrapContents = $false
   $p.AskBar.Margin = New-Object System.Windows.Forms.Padding(0, [int](8 * $k), 0, 0)
-  $t.Controls.Add($p.AskTitle, 0, 0)
-  $t.Controls.Add($p.AskInfo, 1, 0)
-  $t.Controls.Add($p.AskCrumb, 0, 1)
+  # (The path of answers that led here - "Start > Overlord II > Voice-over" - above the question, as the console has
+  # it: Back goes to its last step.)
+  $t.Controls.Add($p.AskCrumb, 0, 0)
   $t.SetColumnSpan($p.AskCrumb, 2)
+  $t.Controls.Add($p.AskTitle, 0, 1)
+  $t.Controls.Add($p.AskInfo, 1, 1)
   $t.Controls.Add($p.AskCtx, 0, 2)
   $t.SetColumnSpan($p.AskCtx, 2)
   $t.Controls.Add($p.AskScroll, 0, 3)
@@ -2424,6 +2592,8 @@ function Set-PanelMode([string]$mode) {
       if ($q.EndedError) { $bc = (New-PanelColor 170 50 50) }
     }
     'reconnect' { $q.Big.Text = $pause + ' ' + (T 'Pause');     $q.Big.Enabled = $false; $badge = T 'Reconnecting';   $bc = (New-PanelColor 180 70 40) }
+    # (At start, while the checks run: the window opens first, Main.)
+    'starting'  { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $false; $badge = T 'Starting...';    $bc = (New-PanelColor 70 70 78) }
     default     { $q.Big.Text = $play + ' ' + (T 'Start now');  $q.Big.Enabled = $false; $badge = T 'Off';            $bc = (New-PanelColor 70 70 78) }
   }
   if (-not $q.Big.Enabled) { $q.Big.BackColor = $q.Colors.Button }
@@ -2443,6 +2613,8 @@ function Set-PanelMode([string]$mode) {
     Remove-PanelImage
     $q.Preview.Invalidate()
   }
+  # (The waiting screen: the most-asked first question is whether the link works yet.)
+  elseif ($mode -eq 'waiting' -and $q.ListEmptyText) { $q.ListEmpty.Text = $q.ListEmptyText + "`r`n`r`n" + (T 'The waiting screen is on the air: the link already works in the world''s player.') }
   elseif ($q.ListEmptyText) { $q.ListEmpty.Text = $q.ListEmptyText }
   $q.Badge.ForeColor = [System.Drawing.Color]::White
 }
@@ -2529,7 +2701,10 @@ try {
 } finally { $Sync.Closed = $true }
 '@
 
-function Open-ControlPanel {
+# -NoWait (at start): back at once; Invoke-PanelPump / Confirm-PanelStarted check that it showed. -Front: it comes to
+# the front when it shows, if the tool's console is in front then (it was just started).
+$script:PanelWaitUntil = $null
+function Open-ControlPanel([switch]$NoWait, [switch]$Front) {
   try {
     if (Test-ControlPanelOpen) { $script:PanelSync.ShowReq = $true; return $true }
     Close-ControlPanel
@@ -2564,9 +2739,10 @@ function Open-ControlPanel {
     }
     $sync = [hashtable]::Synchronized(@{
       State = $null; Cmds = $bus.Cmds; Bus = $bus
-      Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
+      Ready = $false; ReadyAt = $null; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
       Log = $bus.Log; Backlog = $backlog; LogPath = $logPath; ToolFile = [string]$script:ScriptFile
-      StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts
+      StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts; Front = [bool]$Front
+      Hotkeys = $(try { [bool](Get-BoolSetting 'Hotkeys' $false) } catch { $false })
     })
     $self = $script:PanelSelf
     if (-not $self) { $self = $script:PanelFile }
@@ -2576,6 +2752,7 @@ function Open-ControlPanel {
     $script:PanelSync = $sync
     $script:PanelPs = $ps
     $script:PanelRun = $ps.BeginInvoke()
+    if ($NoWait) { $script:PanelWaitUntil = [DateTime]::UtcNow.AddSeconds(15); return $true }
     # Until it shows (the first time takes a moment: Windows Forms loads).
     $until = [DateTime]::UtcNow.AddSeconds(15)
     while (-not $sync.Ready -and -not $sync.Closed -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 20 }
@@ -2590,7 +2767,28 @@ function Open-ControlPanel {
   }
 }
 
+# A window opened with -NoWait: once it shows, that is noted (the start's timing). One that failed, or didn't show
+# within 15 s, is closed, and the tool goes on without it (F2 tries again).
+function Confirm-PanelStarted {
+  if ($null -eq $script:PanelWaitUntil) { return }
+  $sync = $script:PanelSync
+  if ($sync -and $sync.Ready -and -not $sync.Closed) {
+    $script:PanelWaitUntil = $null
+    if ($sync.ReadyAt -is [DateTime] -and (Get-Command Add-StartMark -CommandType Function -ErrorAction SilentlyContinue)) { Add-StartMark 'window' $sync.ReadyAt }
+    # ("ConsoleStart": "minimized": the console goes down once the window is there.)
+    if (Get-Command Invoke-ConsoleStart -CommandType Function -ErrorAction SilentlyContinue) { Invoke-ConsoleStart }
+    return
+  }
+  if ($sync -and -not $sync.Closed -and [DateTime]::UtcNow -lt $script:PanelWaitUntil) { return }
+  $script:PanelWaitUntil = $null
+  if ($sync -and $sync.Error -and -not $sync.Logged) { $sync.Logged = $true; Write-PanelError ([string]$sync.Error) }
+  elseif ($sync -and -not $sync.Closed) { Write-PanelError 'it did not show within 15 s' }
+  Close-ControlPanel
+  $script:PanelShown = $false
+}
+
 function Close-ControlPanel {
+  $script:PanelWaitUntil = $null
   $sync = $script:PanelSync
   $ps = $script:PanelPs
   $run = $script:PanelRun
@@ -2633,7 +2831,7 @@ function Start-PanelUi($sync) {
     $timer.Interval = 100
     $timer.Add_Tick({ Invoke-PanelTick })
     $q.Timer = $timer
-    $q.Form.Add_Shown({ try { $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {} })
+    $q.Form.Add_Shown({ try { $script:PanelSync.ReadyAt = [DateTime]::UtcNow; $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {}; try { $script:Panel.LookUntil = [DateTime]::UtcNow.AddSeconds(10); Set-PanelStartLook } catch {}; try { if ($script:PanelSync.Hotkeys) { Start-PanelHotkeys } } catch {} })
     $timer.Start()
     [System.Windows.Forms.Application]::Run($q.Form)
   } finally {
@@ -2651,6 +2849,7 @@ function Invoke-PanelTick {
   try {
     if ($sync.CloseReq) { $q.Closed = $true; $q.Form.Close(); return }
     if ($sync.ShowReq) { $sync.ShowReq = $false; Show-PanelWindow }
+    if ($q.LookUntil) { Set-PanelStartLook }
   } catch {
     Stop-PanelAfterError $_
     return
@@ -2660,7 +2859,10 @@ function Invoke-PanelTick {
   try { Update-PanelView $sync.State } catch { Write-PanelWarning $_ }
   if ($q.Closed) { return }
   try { Update-PanelLog $sync } catch { Write-PanelWarning $_ }
+  try { Update-PanelNotice } catch { Write-PanelWarning $_ }
+  try { Update-PanelNote } catch { Write-PanelWarning $_ }
   try { Update-PanelBanner } catch { Write-PanelWarning $_ }
+  try { Update-PanelHotkeys } catch { Write-PanelWarning $_ }
 }
 
 # New message lines for the pane (at most 300 per tick). Past 1500 lines it drops the oldest down to 1200 (at once, not
@@ -2675,16 +2877,24 @@ function Update-PanelLog($sync) {
   $src = $sync.Log
   # (The warnings banner: the newest yellow / red line that came in now, not one from the backlog of an earlier window.)
   $warn = $null
+  $unread = 0
   if ($null -ne $src) {
     $e = $null
     $n = 0
     while ($n -lt 300 -and $src.TryDequeue([ref]$e)) {
       $new.Add($e); $n++
-      try { if ([string]$e[1] -match '^(Dark)?(Yellow|Red)$' -and ([string]$e[0]).Trim()) { $warn = $e } } catch {}
+      try {
+        if ((Test-PanelWarnColor ([string]$e[1])) -and ([string]$e[0]).Trim()) {
+          # (A red one stays on the banner: a later yellow one in the same batch doesn't take its place.)
+          if (-not $warn -or [string]$warn[1] -notlike '*Red' -or [string]$e[1] -like '*Red') { $warn = $e }
+          if ($q.Page -ne 'log') { $unread++ }
+        }
+      } catch {}
     }
   }
   if ($new.Count -eq 0) { return }
   if ($warn) { try { Show-PanelBanner ([string]$warn[0]) ([string]$warn[1]) } catch { Write-PanelWarning $_ } }
+  if ($unread -gt 0) { $q.LogUnread += $unread; try { Update-PanelTabs } catch { Write-PanelWarning $_ } }
   $rows = [Math]::Max(1, [int][Math]::Floor($lg.ClientSize.Height / [Math]::Max(1, $lg.ItemHeight)))
   $atEnd = ($lg.Items.Count -eq 0) -or (($lg.TopIndex + $rows) -ge ($lg.Items.Count - 1))
   $q.LogAtEnd = $atEnd
@@ -2698,6 +2908,8 @@ function Update-PanelLog($sync) {
       try {
         foreach ($ln in (([string]$e[0]) -split "`r?`n")) {
           try {
+            $q.LogAll.Add(@($ln, [string]$e[1]))
+            if ($q.LogWarnOnly -and -not (Test-PanelWarnColor ([string]$e[1]))) { continue }
             [void]$lg.Items.Add($ln)
             $q.LogColors.Add([string]$e[1])
             # Each line is measured once, as it comes in: the widest one sets how far the list scrolls sideways.
@@ -2720,10 +2932,53 @@ function Update-PanelLog($sync) {
       foreach ($i in $sel) { if ($i -ge $drop) { $lg.SetSelected($i - $drop, $true) } }
       if (-not $atEnd) { $lg.TopIndex = [Math]::Max(0, $top - $drop) }
     }
+    if ($q.LogAll.Count -gt 1500) { $q.LogAll.RemoveRange(0, $q.LogAll.Count - 1200) }
     if ($widest -gt $q.LogWidest) { $q.LogWidest = $widest; $lg.HorizontalExtent = $widest + 6 }
     if ($atEnd) { $lg.TopIndex = [Math]::Max(0, $lg.Items.Count - $rows) }
   } finally { $lg.EndUpdate() }
   if ($failed) { Write-PanelWarning $failed }
+}
+
+function Test-PanelWarnColor([string]$color) { return ($color -match '^(Dark)?(Yellow|Red)$') }
+
+# Messages with all lines, or with the yellow and red ones only (Warnings only): filled again from LogAll, at the end.
+function Set-PanelLogFilter([bool]$on) {
+  $q = $script:Panel
+  $q.LogWarnOnly = $on
+  $lg = $q.Log
+  $flags = [System.Windows.Forms.TextFormatFlags]::NoPrefix -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
+  $widest = 0
+  $lg.BeginUpdate()
+  try {
+    $lg.Items.Clear()
+    $q.LogColors.Clear()
+    foreach ($e in $q.LogAll) {
+      $col = [string]$e[1]
+      if ($on -and -not (Test-PanelWarnColor $col)) { continue }
+      $ln = [string]$e[0]
+      [void]$lg.Items.Add($ln)
+      $q.LogColors.Add($col)
+      if ($ln.Length -gt 0) { $widest = [Math]::Max($widest, [System.Windows.Forms.TextRenderer]::MeasureText($ln, $lg.Font, [System.Drawing.Size]::Empty, $flags).Width) }
+    }
+    $q.LogWidest = $widest
+    $lg.HorizontalExtent = $widest + 6
+    # (The list scrolls no further than its last page: the last line shows, above the sideways scroll bar too.)
+    if ($lg.Items.Count -gt 0) { $lg.TopIndex = $lg.Items.Count - 1 }
+  } finally { $lg.EndUpdate() }
+  $q.LogAtEnd = $true
+  # (The focus back in the list: Space on the box would only tick it again.)
+  if ($lg.Visible) { $q.Form.ActiveControl = $lg }
+}
+
+# The last $n lines Messages shows (what Copy the last 100 lines copies), as one text.
+function Get-PanelLogTail([int]$n) {
+  $lg = $script:Panel.Log
+  $c = $lg.Items.Count
+  if ($c -eq 0) { return '' }
+  $from = [Math]::Max(0, $c - $n)
+  $out = New-Object System.Text.StringBuilder
+  for ($i = $from; $i -lt $c; $i++) { if ($i -gt $from) { [void]$out.Append("`r`n") }; [void]$out.Append([string]$lg.Items[$i]) }
+  return $out.ToString()
 }
 
 function Show-PanelWindow {
@@ -2734,9 +2989,120 @@ function Show-PanelWindow {
   $f.Activate()
 }
 
+# Once it shows: the console gets the window's icon (one look at the taskbar: the same program, the titles tell the two
+# apart), and the window opened at start comes to the front if the console is in front then (Win.ToFront). Needs the
+# helper (Initialize-Helper on the main thread): tried again from the tick until it is there, for up to 10 s.
+function Set-PanelStartLook {
+  $q = $script:Panel
+  if (-not ('VRCLinkMaker.Win' -as [type])) {
+    if ([DateTime]::UtcNow -ge $q.LookUntil) { $q.LookUntil = $null }
+    return
+  }
+  $q.LookUntil = $null
+  $b = Get-PanelBus
+  if ($b -and $null -eq $b.ConIcon -and -not $env:VRCLM_NO_CONSOLE_ICON) {
+    # (Kept, not disposed, while the tool runs: the console shows them. Restore-ConsoleIcon puts the old ones back.)
+    $ic = New-PanelIcon
+    $s16 = New-Object System.Drawing.Icon($ic, 16, 16)
+    $s32 = New-Object System.Drawing.Icon($ic, 32, 32)
+    $old = [VRCLinkMaker.Win]::ConsoleIcon($s16.Handle, $false)
+    $oldBig = [VRCLinkMaker.Win]::ConsoleIcon($s32.Handle, $true)
+    $b.ConIcon = @{ Small = $old; Big = $oldBig; Keep = @($ic, $s16, $s32) }
+  }
+  if ($script:PanelSync.Front) { [void][VRCLinkMaker.Win]::ToFront($q.Form.Handle) }
+}
+
+# At the very end (main thread): the console's own icon back.
+function Restore-ConsoleIcon {
+  try {
+    $b = $script:UiBus
+    if ($null -eq $b) { return }
+    $c = $b.ConIcon
+    if ($null -eq $c -or -not ('VRCLinkMaker.Win' -as [type])) { return }
+    [void][VRCLinkMaker.Win]::ConsoleIcon([IntPtr]$c.Small, $false)
+    [void][VRCLinkMaker.Win]::ConsoleIcon([IntPtr]$c.Big, $true)
+    $b.ConIcon = $false
+  } catch {}
+}
+
+# ------------------------------------------------------------------ global hotkeys (config.json "Hotkeys": true, off by default)
+# Ctrl+Alt+Space pause / continue, Ctrl+Alt+Left / Right seek 10 s, Ctrl+Alt+N next. RegisterHotKey for a message-only
+# NativeWindow of this thread: its WM_HOTKEY ids queue up and the 100 ms timer runs them (Update-PanelHotkeys). Another
+# program that owns a key makes only that one hotkey fail (one warning).
+$script:PanelHotkeySource = @'
+using System;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+namespace VRCLinkMaker {
+  public class PanelHotkeyWindow : NativeWindow, IDisposable {
+    [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+    [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+    public readonly ConcurrentQueue<int> Pressed = new ConcurrentQueue<int>();
+    readonly System.Collections.Generic.List<int> ids = new System.Collections.Generic.List<int>();
+    public PanelHotkeyWindow() { CreateParams cp = new CreateParams(); cp.Parent = (IntPtr)(-3); CreateHandle(cp); }
+    public bool Register(int id, uint mods, uint vk) {
+      if (Handle == IntPtr.Zero || !RegisterHotKey(Handle, id, mods | 0x4000, vk)) return false;
+      ids.Add(id); return true;
+    }
+    protected override void WndProc(ref Message m) {
+      if (m.Msg == 0x0312) { Pressed.Enqueue(m.WParam.ToInt32()); return; }
+      base.WndProc(ref m);
+    }
+    public void Dispose() {
+      if (Handle != IntPtr.Zero) { foreach (int id in ids) UnregisterHotKey(Handle, id); DestroyHandle(); }
+      ids.Clear();
+    }
+  }
+}
+'@
+
+function Start-PanelHotkeys {
+  $q = $script:Panel
+  if ($q.HotWin) { return }
+  try {
+    if (-not ('VRCLinkMaker.PanelHotkeyWindow' -as [type])) {
+      Add-Type -TypeDefinition $script:PanelHotkeySource -ReferencedAssemblies System.Windows.Forms
+    }
+    $w = New-Object VRCLinkMaker.PanelHotkeyWindow
+    $q.HotWin = $w
+    $K = [System.Windows.Forms.Keys]
+    # (MOD_ALT 1 + MOD_CONTROL 2; the id is what Invoke-PanelHotkey switches on.)
+    foreach ($h in @(@(1, [int]$K::Space, 'Space'), @(2, [int]$K::Left, 'Left'), @(3, [int]$K::Right, 'Right'), @(4, [int]$K::N, 'N'))) {
+      if (-not $w.Register([int]$h[0], [uint32]3, [uint32]$h[1])) { Write-PanelWarning ((T 'Hotkey Ctrl+Alt+{0} is taken by another program, so it does nothing.' $h[2])) }
+    }
+  } catch { Write-PanelWarning $_ }
+}
+
+function Stop-PanelHotkeys {
+  $q = $script:Panel
+  if ($null -eq $q -or -not $q.HotWin) { return }
+  try { $q.HotWin.Dispose() } catch {}
+  $q.HotWin = $null
+}
+
+# What a hotkey does: the same as its button (and the same only when that button works right now).
+function Invoke-PanelHotkey([int]$id) {
+  $p = $script:Panel
+  switch ($id) {
+    1 { if ($p.Big.Enabled -and $p.Mode -ne 'waiting' -and $p.Mode -ne 'ended') { Add-PanelCommand 'toggle' } }
+    2 { if ($p.Back10.Enabled) { Add-PanelCommand 'seek' (-10) } }
+    3 { if ($p.Fwd10.Enabled) { Add-PanelCommand 'seek' 10 } }
+    4 { if ($p.Next.Enabled) { Add-PanelCommand 'skip' } }
+  }
+}
+
+function Update-PanelHotkeys {
+  $q = $script:Panel
+  if ($null -eq $q -or -not $q.HotWin) { return }
+  $id = 0
+  while ($q.HotWin.Pressed.TryDequeue([ref]$id)) { Invoke-PanelHotkey $id }
+}
+
 function Remove-PanelResources {
   $q = $script:Panel
   if ($null -eq $q) { return }
+  try { Stop-PanelHotkeys } catch {}
   try { Remove-PanelImage } catch {}
   try { if ($q.Form -and -not $q.Form.IsDisposed) { $q.Form.Dispose() } } catch {}
   foreach ($x in @($q.Tips, $q.Font, $q.Bold, $q.Small, $q.Sym, $q.SymS, $q.BigFont, $q.Mono, $q.Icon)) { try { if ($x) { $x.Dispose() } } catch {} }
@@ -2750,6 +3116,7 @@ function Remove-PanelResources {
 # is, apart) and UpcomingTotal (how many wait in all: the rows stop at 20), Link, QuestLink ('' = none), Clock (bool), CanSeek (bool), Quality / QualityLow / QualityTip (the chip
 # right of the title), Menu / Choices / Chosen (the Settings menu, see Update-PanelMenu), Tracks ($null, or the audio
 # tracks and subtitles of what plays: Audio / Subs / AudioShort / SubsShort (labels), A / S (-1 = none), Busy),
+# DlText / DlDir (a download window runs: the grey bar's text and the folder a click opens),
 # Prompt (bool: the start screen and its questions, nothing plays yet: Next / Stop / Resync and the Settings items off;
 # the input row answers the start screen's '>' only). An open question (bus.Ask, the card) turns the input row and the
 # Up next buttons and menu off.
@@ -2770,7 +3137,7 @@ function Update-PanelView($s) {
     $canSeek = [bool]$s['CanSeek']
     $q.EndedError = [bool]$s['EndedError']
     $q.EndedTry = [int]$s['Try']
-    $on = ($mode -ne 'off' -and $mode -ne 'ended')
+    $on = ($mode -ne 'off' -and $mode -ne 'ended' -and $mode -ne 'starting')
     # (Prompt: the tool's own window still asks its start questions, nothing plays yet: no commands meanwhile.)
     $cmdOn = ($on -and -not [bool]$s['Prompt'])
 
@@ -2779,13 +3146,20 @@ function Update-PanelView($s) {
     # is added; a click tells the main thread someone is there ('seen').
     if ([bool]$s['IdleWarn'] -and $now -ge $q.IdleHushUntil) {
       $iw = T 'The stream ends in 2 minutes: nothing is queued. Click here to keep it on.'
-      if (-not $q.Banner.Visible -or $q.Banner.Text -cne $iw) { Show-PanelBanner $iw 'Yellow' }
+      if (-not $q.Banner.Visible -or $q.Banner.Text -cne $iw) { Show-PanelBanner $iw 'Yellow' -Force }
       $q.BannerUntil = $now.AddSeconds(5)
     }
+    $dlt = [string]$s['DlText']
+    if ($dlt) { Show-PanelDlBanner $dlt ([string]$s['DlDir']) }
+    elseif ($q.BannerKind -eq 'dl') { Hide-PanelBanner }
     $title = [string]$s['Title']
     if (-not $title) { $title = T 'Nothing is playing' }
     if ($script:PanelLast['title'] -cne $title) { $q.Tips.SetToolTip($q.Title, $title) }
     Set-PanelProp 'title' $q.Title 'Text' $title
+    # The title bar too ("Playing: Overlord II - 09  |  VRChat Link Maker"): the taskbar and Alt+Tab say it.
+    $wt = 'VRChat Link Maker'
+    if ([string]$s['WinTitle']) { $wt = [string]$s['WinTitle'] + '  |  ' + $wt }
+    Set-PanelProp 'wintitle' $q.Form 'Text' $wt
 
     $rel = ($canSeek -and ($mode -eq 'content' -or $mode -eq 'paused' -or $mode -eq 'hold'))
     foreach ($b in @($q.Back30, $q.Back10, $q.Fwd10, $q.Fwd30)) { Set-PanelProp ('en' + $b.GetHashCode()) $b 'Enabled' $rel }
@@ -2906,6 +3280,9 @@ function Update-PanelView($s) {
         if ($bs -and [string]$bs['Text'] -and ($now - [DateTime]$bs['At']).TotalSeconds -lt 3) { $st = [string]$bs['Text'] }
       } catch {}
     }
+    # (Under it: what comes next and when, State.Plan.)
+    $plan = [string]$s['Plan']
+    if ($plan) { $st = (@($st) + @($plan -split "`r?`n") | Where-Object { $_ }) -join "`r`n" }
     if ($script:PanelLast['status'] -cne $st) { $q.Tips.SetToolTip($q.Status, $st); $q.Status.Text = $st; $script:PanelLast['status'] = $st; Set-PanelStatusHeight }
     $pl = [string]$s['Player']
     if ($script:PanelLast['player'] -cne $pl) { $q.Tips.SetToolTip($q.Player, $pl) }
@@ -2944,10 +3321,21 @@ function Update-PanelView($s) {
     }
     $total = $ids.Count
     try { if ($null -ne $s['UpcomingTotal']) { $total = [Math]::Max($ids.Count, [int]$s['UpcomingTotal']) } } catch {}
-    $upKey = ($up -join "`n") + "`n" + ($ids -join ',') + "`n" + $total
+    # (The video that plays is the first row, with Id 0, while something waits after it: State.NowName.)
+    $off = 0
+    $nowName = [string]$s['NowName']
+    if ($nowName -and $ids.Count -gt 0) {
+      $off = 1
+      $up = @($nowName) + $up
+      $ids = @(0) + $ids
+      $names = @($nowName) + $names
+      $infos = @((T 'playing now')) + $infos
+    }
+    $upKey = ($up -join "`n") + "`n" + ($ids -join ',') + "`n" + $total + "`n" + $off
     if (-not $script:PanelLast.ContainsKey('up') -or $script:PanelLast['up'] -cne $upKey) {
       $script:PanelLast['up'] = $upKey
       $q.ListTotal = $total
+      $q.NowOff = $off
       # (The same line stays selected when the list changes around it: by its Id. The view stays scrolled where it
       # was too: a download's progress changes the texts every second or two.)
       $selId = Get-PanelListId
@@ -2957,7 +3345,7 @@ function Update-PanelView($s) {
       $q.ListInfo = $infos
       $q.List.BeginUpdate()
       $q.List.Items.Clear()
-      $n = 1
+      $n = 1 - $off
       foreach ($u in $up) { [void]$q.List.Items.Add(('{0}. {1}' -f $n, $u)); $n++ }
       if ($selId -gt 0) { $ix = [array]::IndexOf([int[]]$ids, $selId); if ($ix -ge 0) { $q.List.SelectedIndex = $ix } }
       if ($top -gt 0 -and $q.List.Items.Count -gt 0) { $q.List.TopIndex = [Math]::Min($top, $q.List.Items.Count - 1) }

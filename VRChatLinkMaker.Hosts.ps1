@@ -520,13 +520,21 @@ function Get-HostKbps($p) {
 # VLC test link and the host's warnings. $pcLink = the PC link as the world's player gets it (with ?retry=-1 etc.);
 # empty = $script:ShownLink (when it belongs to this host) or the profile's PcUrl. The caller draws the frame
 # around it, adds the Stream / Live mode and world-player control hints and copies the link.
-function Show-HostLinks($p, [string]$pcLink = '') {
+# -Short: only the header, the link and the Quest link (Show-Links' short form after the first time).
+function Show-HostLinks($p, [string]$pcLink = '', [switch]$Short) {
   if (-not $pcLink) {
     $pcLink = $p.PcUrl
     $sl = "$($script:ShownLink)"
     if ($sl -and $p.PcUrl -and $sl.StartsWith($p.PcUrl, [System.StringComparison]::OrdinalIgnoreCase)) { $pcLink = $sl }
   }
   Say (T '  YOUR VRCHAT LINK  (via {0})' $p.Name) 'White'
+  if ($Short) {
+    Say ''
+    Say "      $pcLink" 'Green'
+    Say ''
+    if ($p.QuestUrl) { Say (T '  Quest / Android viewers use:  {0}' $p.QuestUrl) 'Gray' }
+    return
+  }
   if ($p.Trusted) {
     Say (T '  Trusted by VRChat: plays in every instance (Public ones too), nobody has to change a setting.') 'DarkGreen'
   } else {
@@ -3760,6 +3768,7 @@ function Measure-EncodeSpeed([string]$venc, [int]$kbps, [int]$ak) {
 #    the network's share is Speed / EncodeSpeed), StreamKbps (what was really sent, audio included), EffectiveKbps
 #    (video that got through: video bitrate x NetSpeed), EncodeSpeed, Error.
 function Measure-PushSpeed([string]$url, [string]$fmt, [int]$kbps, [int]$seconds = 30) {
+  if (-not $script:VEnc -and (Get-Command Complete-EncoderChoice -CommandType Function -ErrorAction SilentlyContinue)) { Complete-EncoderChoice }
   $venc = "$($script:VEnc)"
   if (-not $venc) { $venc = 'libx264' }
   $ak = 128
@@ -3957,6 +3966,8 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
     $out.Result = $u
     if (-not $u.Ok) { Say (T 'The speed test did not work ({0}).' $u.Error) 'Yellow'; return $out }
     Say (T 'Upload: {0} Mbps.' (Format-Num ([Math]::Round($u.Kbps / 1000.0, 1)))) 'Green'
+    # (Kept for the menu's "Upload speed test (last: ...)", Save-SpeedTestLast.)
+    if (-not $NoSave -and (Test-HostFn 'Save-SpeedTestLast')) { Save-SpeedTestLast $p.Id $u.Kbps }
     $counts = @(2, 5, 10)
     $opts = @()
     $vals = @()
@@ -4022,6 +4033,7 @@ function Invoke-SpeedTest($p, [int]$Seconds = 30, [string]$Target = '', [string]
   }
   Say (T 'Result: {0}x real time, about {1} kbps of video got through.' (Format-Num ([Math]::Round($r.NetSpeed, 2))) $r.EffectiveKbps) 'Green'
   if ($r.NetSpeed -ge 0.95) { Say (T 'The whole test stream got through, so the line may take even more.') 'DarkGray' }
+  if (-not $NoSave -and -not $Target -and (Test-HostFn 'Save-SpeedTestLast')) { Save-SpeedTestLast $p.Id $r.EffectiveKbps }
   $rec = Get-Floor50 ([Math]::Min($r.EffectiveKbps * 0.8, $maxK))
   if ($rec -lt $minK) {
     Say (T 'That is below {0} kbps, the lowest this tool uses for this host: expect stutter.' $minK) 'Yellow'

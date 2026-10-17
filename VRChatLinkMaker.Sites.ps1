@@ -2074,6 +2074,11 @@ function Get-AllohaTranslations($fileList) {
   return $res
 }
 
+# Alloha answers a quality as "<url A> or <url B>" (mirror syntax); ffmpeg rejects the whole string. Returns the alternatives, first = preferred.
+function Split-AllohaMirrors([string]$s) {
+  return @(($s -split '\s+or\s+') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
 <#
 .SYNOPSIS
   Resolves an Alloha iframe URL (e.g. the WPARTY movieSourceURL + "&kp=..&translation=..&season=..&episode=..") to a direct HLS URL.
@@ -2165,11 +2170,12 @@ function Resolve-Alloha {
 
   # 3. audio tracks / qualities
   $tracks = @()
+  $mir = @{}
   if ($data.ContainsKey('hlsSource') -and $data['hlsSource']) {
     foreach ($src in $data['hlsSource']) {
       $q = [ordered]@{}
       $keys = @($src['quality'].Keys | Sort-Object { [int]([regex]::Match([string]$_, '\d+').Value) } -Descending)
-      foreach ($k in $keys) { $q[[string]$k] = [string]$src['quality'][$k] }
+      foreach ($k in $keys) { $alts = @(Split-AllohaMirrors ([string]$src['quality'][$k])); if ($alts.Count -gt 0) { $q[[string]$k] = $alts[0]; if ($alts.Count -gt 1) { $mir[[string]$k + '|' + [string]$src['audioId']] = $alts[1..($alts.Count - 1)] } } }
       $def = -1; if ($src.ContainsKey('default') -and $src['default']) { try { $def = [double]$src['default'] } catch { $def = 1 } }
       $tracks += [pscustomobject]@{ Label = [string]$src['label']; AudioId = [string]$src['audioId']; Default = $def; Qualities = $q }
     }
@@ -2224,6 +2230,7 @@ function Resolve-Alloha {
     UserAgent     = $script:WebUA
     Quality       = $qKey
     Qualities     = $chosen.Qualities
+    MirrorUrls    = @($mir[[string]$qKey + '|' + $chosen.AudioId])   # the other "A or B" alternatives of the chosen quality (try when Url fails)
     AudioTrack    = $chosen.Label
     AudioTracks   = $tracks
     Subtitles     = $subs
@@ -6029,9 +6036,10 @@ function Expand-NyaaGroup([string]$u) {
   return $items
 }
 
-# One result as a line of the list: Title (Year) - kind - extra [source]
+# One result as a line of the list: Title (Year) - kind - extra [source]. The whole title (the part that tells two releases apart is often at its end: year, "BATCH", "1080p"): the console
+# wraps a long row under itself (Format-AskOption), the control window's list shows it whole on hover.
 function Format-SearchRow($r) {
-  $s = Get-ShortText ([string]$r.Title) 70
+  $s = Get-ShortText ((([string]$r.Title) -replace '\s+', ' ').Trim()) 200
   if ($r.Year) { $s += " ($($r.Year))" }
   if ($r.Kind) { $s += " - $($r.Kind)" }
   if ($r.Extra) { $s += " - $($r.Extra)" }
@@ -6063,6 +6071,7 @@ function Invoke-ContentSearch([string]$query, [switch]$AskPlayer) {
   catch { if ($script:CtrlCQuit -or $script:NavSignal) { throw }; Say (T '  Couldn''t use {0}: {1}' (Get-ShortText ([string]$row.Title) 70) $_.Exception.Message) 'Yellow'; return @() }
   if ($items.Count -eq 0) { return @() }
   if ($AskPlayer) { Read-HandoverPlayer $items }
+  if (Get-Command Confirm-SiteSummary -CommandType Function -ErrorAction SilentlyContinue) { Confirm-SiteSummary $items ([string]$row.Title) }
   if (@($items | Where-Object { $_.Kind -ne 'torrent' }).Count -eq 0) {
     # Torrents ([EN] rows): their own links (magnets, .torrent files) with the episodes, so the streaming window
     # doesn't look the site up again (a wait while a video plays). Several links: an array.
