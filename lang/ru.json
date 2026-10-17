@@ -989,5 +989,8 @@
   "Close the window": "Закрыть окно",
   "Start again (under the picture) to stream more, or close this window.": "Чтобы показать ещё что-нибудь, нажмите «Запустить снова» под картинкой или закройте это окно.",
   "Stream ended at {0}. On the air for {1}. Log: {2}": "Трансляция закончилась в {0}. В эфире {1}. Журнал: {2}",
-  "End the stream": "Завершить трансляцию"
+  "End the stream": "Завершить трансляцию",
+  "window at {0} s": "окно через {0} с",
+  "on the air at {0} s": "в эфире через {0} с",
+  "Ready in {0} s": "Готово за {0} с"
 }

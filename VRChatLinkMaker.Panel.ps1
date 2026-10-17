@@ -2564,7 +2564,7 @@ function Open-ControlPanel {
     }
     $sync = [hashtable]::Synchronized(@{
       State = $null; Cmds = $bus.Cmds; Bus = $bus
-      Ready = $false; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
+      Ready = $false; ReadyAt = $null; Closed = $false; ShowReq = $false; CloseReq = $false; Error = $null; Logged = $false; Warn = $null
       Log = $bus.Log; Backlog = $backlog; LogPath = $logPath; ToolFile = [string]$script:ScriptFile
       StartBounds = $script:PanelBounds; Bounds = $null; MediaExts = $exts
     })
@@ -2633,7 +2633,7 @@ function Start-PanelUi($sync) {
     $timer.Interval = 100
     $timer.Add_Tick({ Invoke-PanelTick })
     $q.Timer = $timer
-    $q.Form.Add_Shown({ try { $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {} })
+    $q.Form.Add_Shown({ try { $script:PanelSync.ReadyAt = [DateTime]::UtcNow; $script:PanelSync.Ready = $true; Update-PanelLayout; Set-PanelCue } catch {} })
     $timer.Start()
     [System.Windows.Forms.Application]::Run($q.Form)
   } finally {

@@ -9185,7 +9185,55 @@ function Invoke-DownloadMain([string[]]$entries) {
   }
 }
 
+# How long the start takes (seconds since this process started; VRCLM_LAUNCH_TICKS, UTC ticks, can give an earlier
+# moment, e.g. when the .bat started). Add-StartMark notes a step; Show-StartupTime says it once the start screen is up.
+$script:LaunchAt = $null
+$script:StartMarks = New-Object System.Collections.ArrayList
+$script:StartTimed = $false
+function Get-StartupSeconds {
+  if ($null -eq $script:LaunchAt) {
+    $t = [DateTime]::UtcNow
+    try { $t = [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime() } catch {}
+    try { if ($env:VRCLM_LAUNCH_TICKS) { $t = New-Object DateTime ([long]$env:VRCLM_LAUNCH_TICKS), ([System.DateTimeKind]::Utc) } } catch {}
+    $script:LaunchAt = $t
+  }
+  return ([DateTime]::UtcNow - $script:LaunchAt).TotalSeconds
+}
+function Add-StartMark([string]$name, $at = $null) {
+  if ($script:StartTimed) { return }
+  try {
+    $s = 0.0
+    if ($at -is [DateTime]) { [void](Get-StartupSeconds); $s = ($at - $script:LaunchAt).TotalSeconds } else { $s = Get-StartupSeconds }
+    [void]$script:StartMarks.Add(@($name, $s))
+  } catch {}
+}
+function Get-StartMark([string]$name) {
+  foreach ($m in $script:StartMarks) { if ($m[0] -eq $name) { return [double]$m[1] } }
+  return -1.0
+}
+# "Ready in 3.1 s (window at 0.9 s, on the air at 2.8 s)" in the console, and every step in log.txt.
+function Show-StartupTime {
+  if ($script:StartTimed) { return }
+  Add-StartMark 'ready'
+  $script:StartTimed = $true
+  try {
+    $f = { param($x) ([Math]::Round([double]$x, 1)).ToString('0.0', $script:Inv) }
+    $win = Get-StartMark 'window'
+    if ($win -lt 0 -and $script:PanelSync -and $script:PanelSync.ReadyAt -is [DateTime]) { $win = ($script:PanelSync.ReadyAt - $script:LaunchAt).TotalSeconds }
+    $air = Get-StartMark 'on air'
+    $ready = Get-StartMark 'ready'
+    $parts = @()
+    if ($win -ge 0) { $parts += (T 'window at {0} s' (& $f $win)) }
+    if ($air -ge 0) { $parts += (T 'on the air at {0} s' (& $f $air)) }
+    $line = T 'Ready in {0} s' (& $f $ready)
+    if ($parts.Count -gt 0) { $line += ' (' + ($parts -join ', ') + ')' }
+    Say ('  ' + $line + '.') 'DarkGray'
+    Write-LogLine ('  (startup: ' + ((@($script:StartMarks) | ForEach-Object { $_[0] + ' ' + (& $f $_[1]) }) -join ', ') + ')')
+  } catch {}
+}
+
 function Main {
+  [void](Get-StartupSeconds)
   Initialize-Language (Get-LanguageSetting)
   # (The control window is "VRChat Link Maker": this console says what it is, so the two differ in the taskbar.)
   try { $Host.UI.RawUI.WindowTitle = (T 'VRChat Link Maker - console') } catch {}
@@ -9240,14 +9288,17 @@ function Main {
     Select-Language
   }
   $script:Cfg = Get-Config
+  Add-StartMark 'config'
   # How long the waiting screen stays on with nothing queued (config.json "IdleMinutes"; the rig's VRCLM_IDLE_MIN wins).
   if (-not $env:VRCLM_IDLE_MIN) { $script:IdleMinutes = [double](Get-NumSetting 'IdleMinutes' 15 3 600) }
   if ((Get-Command Invoke-UpdateCheck -CommandType Function -ErrorAction SilentlyContinue) -and (Invoke-UpdateCheck)) { return }
+  Add-StartMark 'update'
   if (Test-HostModule) {
     # Older config.json files get "Host" / "StreamKey" (same link as before) and the self-host settings.
     try { if (Initialize-HostConfig) { Save-Config $script:Cfg } } catch { Say (T 'Couldn''t update config.json: {0}' $_.Exception.Message) 'Yellow' }
   }
   Initialize-Tools
+  Add-StartMark 'tools'
   $script:VideoKbps = [int]$script:Cfg.VideoKbps
   if ($script:VideoKbps -lt 200) { $script:VideoKbps = 1350 }
   if (-not (Test-HostModule) -and $script:Cfg.IngestUrl -match '(?i)topaz\.chat' -and $script:VideoKbps -eq 1700 -and [int]$script:Cfg.AudioKbps -eq 128) {
@@ -9262,16 +9313,21 @@ function Main {
   Initialize-Slate
   $script:VEnc = Select-VideoEncoder
   Say (T 'Encoding with: {0}' (Get-EncoderName $script:VEnc)) 'DarkGray'
+  Add-StartMark 'encoder'
   Set-ActiveHost
+  Add-StartMark 'host'
   Start-WorldPlayerControl
   Show-Links
+  Add-StartMark 'links'
   if ($script:Interactive -and (Get-BoolSetting 'ControlWindow' $true) -and (Get-Command Open-ControlPanel -CommandType Function -ErrorAction SilentlyContinue)) {
     $script:PanelShown = $false
     try { $script:PanelShown = [bool](Open-ControlPanel) } catch {}
+    if ($script:PanelShown -and $script:PanelSync -and $script:PanelSync.ReadyAt -is [DateTime]) { Add-StartMark 'window' $script:PanelSync.ReadyAt }
   }
   if ($script:Interactive -or $env:VRCLM_STANDBY) {
     # On the air right away (with the waiting screen), so the link works in the world's player from now on.
     Start-Standby
+    if (Test-RelayAlive) { Add-StartMark 'on air' }
     if (Test-RelayAlive) { Say (T '  The stream is on the air (waiting screen), so you can put the link in the world''s player now.') 'DarkGray' }
   }
   # The control window shows the link and the waiting screen (or 'Off') during the questions below too, with Next /
@@ -9288,6 +9344,7 @@ function Main {
     $prefill = ''
     if ($entries.Count -eq 1) { $prefill = [string]$entries[0] }
     $again = ($script:Interactive -and ($script:HasConsole -or $script:KeySource))
+    Show-StartupTime
     while ($true) {
       if ($entries.Count -eq 0) {
         $entries = @(Read-Entries $prefill)
