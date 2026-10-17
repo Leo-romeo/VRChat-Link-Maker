@@ -1129,9 +1129,11 @@ function Test-VpsFileService($v, [int]$ms = 5000) {
   if ($s.Code -eq 200) { try { $st = ConvertFrom-Json $s.Text } catch { $st = $null } }
   if (-not $st) { $r.State = 'error'; $r.Detail = "HTTP $($s.Code)"; return $r }
   $r.Status = $st
-  $room = [double]$st.budget_bytes - [double]$st.used_bytes
-  if ($null -ne $st.free_disk_bytes) { $room = [Math]::Min($room, [double]$st.free_disk_bytes - [double]$st.min_free_bytes) }
-  if ($room -lt 256MB) { $r.State = 'full' } else { $r.State = 'ok' }
+  try {
+    $room = [double]$st.budget_bytes - [double]$st.used_bytes
+    if ($null -ne $st.free_disk_bytes) { $room = [Math]::Min($room, [double]$st.free_disk_bytes - [double]$st.min_free_bytes) }
+    if ($room -lt 256MB) { $r.State = 'full' } else { $r.State = 'ok' }
+  } catch { $r.State = 'error'; $r.Detail = 'a status the tool can''t read' }
   return $r
 }
 
@@ -1184,10 +1186,13 @@ function Show-VpsFileCheck {
   if ($r.State -eq 'off') { return $r.State }
   $problem = Get-VpsFileProblemText $v $r
   if ($problem) { Say $problem 'Yellow' }
-  foreach ($line in @(Get-VpsFileHealthLines $r.Status)) { Say $line 'Yellow' }
+  # (The status comes over plain http: a broken or forged answer must not stop the start.)
+  $lines = @()
+  try { $lines = @(Get-VpsFileHealthLines $r.Status) } catch { $lines = @() }
+  foreach ($line in $lines) { Say $line 'Yellow' }
   if ($r.State -eq 'ok') {
     $st = $r.Status
-    Say (T '  The file service on your VPS is ready: {0} of {1} used, {2} free on its disk.' (Format-VpsGb $st.used_bytes) (Format-VpsGb $st.budget_bytes) (Format-VpsGb ([double]$st.free_disk_bytes))) 'DarkGray'
+    try { Say (T '  The file service on your VPS is ready: {0} of {1} used, {2} free on its disk.' (Format-VpsGb $st.used_bytes) (Format-VpsGb $st.budget_bytes) (Format-VpsGb ([double]$st.free_disk_bytes))) 'DarkGray' } catch {}
   }
   return $r.State
 }
@@ -1238,6 +1243,8 @@ function Show-VpsBundle($v, [switch]$Quiet) {
   if (-not $dir -or $Quiet) { return }
   $tcp = "$($v.RtspPort), $($v.RtmpPort)"
   if (ConvertTo-HostBool (Get-Prop $v 'Hls') $false) { $tcp += ", $($v.HlsPort)" }
+  $fp = ConvertTo-HostInt (Get-Prop $v 'FilePort') 80 0 65535
+  if ($fp -gt 0) { $tcp += ", $fp" }
   Say ''
   Say (T '  The setup files for your VPS are in:  {0}' $dir) 'White'
   Say (T '   1) Open README-VPS.txt there: it shows how to get the free Oracle Cloud server (or Hetzner). Viewers in Russia can''t watch from either: see "Viewers in Russia" in README.txt.') 'Gray'
@@ -2675,6 +2682,7 @@ function Get-VpsInstallScript([string]$yml, [string]$tcpPorts, [string]$udpPorts
   $L.Add('# Run as root: paste all of it into the SSH window after "sudo -i", or run: sudo bash install.sh')
   $L.Add('# Running it again is safe: it replaces the settings (e.g. after "New link") and restarts the server.')
   $L.Add('set +H 2>/dev/null || true')
+  $L.Add('unset HISTFILE 2>/dev/null || true   # (the passwords and keys below stay out of the shell history)')
   $L.Add('(')
   $L.Add('set -eu')
   $L.Add("MTX_VERSION='$($script:MediaMtxVersion)'")
@@ -2683,6 +2691,7 @@ function Get-VpsInstallScript([string]$yml, [string]$tcpPorts, [string]$udpPorts
   $L.Add("TCP_PORTS='$tcpPorts'")
   $L.Add("UDP_PORTS='$udpPorts'")
   $L.Add("FILE_PORT='$filePort'")
+  if ($files) { $L.Add("FILES_SHA='$(Get-Sha256Hex ([System.Text.Encoding]::ASCII.GetBytes($filesPy.TrimEnd("`n") + "`n")))'") }
   $L.Add(@'
 say() { printf '\n=== %s\n' "$*"; }
 fail() { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
@@ -2855,13 +2864,13 @@ install_files() {
     command -v apt-get >/dev/null 2>&1 || { echo 'It needs python3 (3.8 or newer), and there is no apt-get here to install it.'; return 1; }
     echo 'Installing python3 (3.8 or newer is needed)...'
     export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y python3 >/dev/null 2>&1 || { apt-get update >/dev/null 2>&1 && apt-get install -y python3 >/dev/null 2>&1; } ||
+    apt-get -o DPkg::Lock::Timeout=120 install -y python3 >/dev/null 2>&1 ||
+      { apt-get -o DPkg::Lock::Timeout=120 update >/dev/null 2>&1 && apt-get -o DPkg::Lock::Timeout=120 install -y python3 >/dev/null 2>&1; } ||
       { echo 'Could not install python3 (apt-get install -y python3).'; return 1; }
     PY=$(command -v python3 || true)
     { [ -n "$PY" ] && files_py_ok "$PY"; } || { echo 'python3 3.8 or newer is needed.'; return 1; }
   fi
-  PY=$(readlink -f "$PY") || return 1
-  case "$PY" in /usr/bin/* | /usr/local/bin/* | /bin/*) ;; *) echo "python3 is in an unusual place ($PY)."; return 1 ;; esac
+  case "$PY" in /usr/bin/python3 | /usr/local/bin/python3 | /bin/python3) ;; *) echo "python3 is in an unusual place ($PY)."; return 1 ;; esac
   "$PY" -I -c 'import http.server, socketserver, json, hmac, hashlib, shutil, secrets' >/dev/null 2>&1 ||
     { echo "$PY lacks parts of the standard library (apt-get install -y python3)."; return 1; }
   echo "Using $PY ($("$PY" -V 2>&1))."
@@ -2874,6 +2883,8 @@ install_files() {
     foreach ($line in ($filesPy.TrimEnd("`n") -split "`n")) { $L.Add($line) }
     $L.Add(@'
 VRCLM_PY_EOF
+  echo "$FILES_SHA  /usr/local/lib/vrclm-files/vrclm_files.py.new" | sha256sum -c --status - ||
+    { echo 'The file service program did not arrive intact (SHA256 mismatch): paste all of install.sh again.'; return 1; }
   chown root:root /usr/local/lib/vrclm-files/vrclm_files.py.new && chmod 0644 /usr/local/lib/vrclm-files/vrclm_files.py.new || return 1
   "$PY" -I -c 'import ast, sys; ast.parse(open(sys.argv[1], "rb").read())' /usr/local/lib/vrclm-files/vrclm_files.py.new ||
     { echo 'The file service program does not parse with this python3.'; return 1; }
@@ -2890,9 +2901,15 @@ VRCLM_CFG_EOF
     { echo 'The file service does not accept its settings (see above).'; return 1; }
   mv -f /etc/vrclm-files/config.json.new /etc/vrclm-files/config.json || return 1
 
-  if ! systemctl is-active --quiet vrclm-files && command -v ss >/dev/null 2>&1 && [ -n "$(ss -Hltn "sport = :$FILE_PORT" 2>/dev/null)" ]; then
+  if command -v ss >/dev/null 2>&1; then
+    own=$(systemctl show -p MainPID --value vrclm-files 2>/dev/null || true)
+    busy=$(ss -Hltnp "sport = :$FILE_PORT" 2>/dev/null | grep -v "pid=${own:-x}," || true)
+  else
+    busy=''
+  fi
+  if [ -n "$busy" ]; then
     echo "TCP port $FILE_PORT is already used by another program on this server:"
-    ss -Hltnp "sport = :$FILE_PORT" 2>/dev/null || true
+    echo "$busy"
     echo 'Set "FilePort" under "Vps" in config.json to a free port (or 0 = no file service), then make install.sh again.'
     return 1
   fi
@@ -2942,9 +2959,15 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 UMask=0077
+MemoryHigh=160M
 MemoryMax=200M
+MemorySwapMax=0
 TasksMax=128
 LimitNOFILE=1024
+CPUWeight=20
+IOWeight=20
+LogRateLimitIntervalSec=60
+LogRateLimitBurst=300
 
 [Install]
 WantedBy=multi-user.target
@@ -2956,6 +2979,7 @@ VRCLM_UNIT_EOF
   open_ports "$FILE_PORT" '' vrclm-files
 
   systemctl daemon-reload || return 1
+  FILES_ENABLED=1
   systemctl enable vrclm-files >/dev/null 2>&1 || { echo 'Could not enable the vrclm-files service.'; return 1; }
   systemctl restart vrclm-files || { journalctl -u vrclm-files -n 20 --no-pager || true; return 1; }
   ok=''
@@ -2971,11 +2995,13 @@ VRCLM_UNIT_EOF
   echo "The file service is running on TCP port $FILE_PORT and starts with the server."
   return 0
 }
+FILES_ENABLED=''
 if install_files; then
   FILES_DONE=1
 else
   FILES_DONE=''
   umask 022
+  if [ -n "$FILES_ENABLED" ]; then systemctl disable --now vrclm-files >/dev/null 2>&1 || true; fi
   echo
   echo 'WARNING: the file service was NOT installed (see above). Streaming works as before; only hosting episodes as files does not.'
 fi

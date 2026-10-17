@@ -8,20 +8,26 @@
 #   GET/HEAD /s/<stream>/now.m3u8                         the stream's current item (only with "same_link": true)
 #   GET/HEAD /healthz                                      "ok vrclm-files <version>"
 # Signed (HMAC-SHA256 with the stream's FileKey, see sign()):
-#   PUT    /api/v1/items/<id>/<file>     one file (at most max_file_mb), written to a temp file, then renamed
+#   PUT    /api/v1/items/<id>/<file>     one file (a segment up to max_file_mb, the playlist up to max_playlist_kb),
+#                                        written to a temp file, checked, then renamed into the item
 #   POST   /api/v1/items/<id>/commit     every segment in index.m3u8 is there -> the item is finished
 #   GET    /api/v1/items/<id>            the item's files and sizes (to resume an upload)
 #   DELETE /api/v1/items/<id>
 #   GET    /api/v1/status                disk used vs budget, free disk, oldest item, last cleanup, this stream's items
 #   POST   /api/v1/streams/<stream>/now  {"item": "<id>"} (or "") -> what /s/<stream>/now.m3u8 serves
-# Cleanup runs every cleanup_min minutes: a finished item goes keep_hours after its last view, an unfinished one after
-# idle_upload_hours without an upload. When an upload needs room, the finished items viewed longest ago go first (never
-# one viewed in the last protect_min minutes); if there is still no room the upload gets 507.
+# Cleanup runs every cleanup_min minutes: a finished item goes keep_hours after its last view (and max_age_hours after
+# it was finished in any case), an unfinished one after idle_upload_hours without an upload. When an upload needs room,
+# finished items go, the uploading stream's own first, each viewed longest ago first (never one viewed or finished in
+# the last protect_min minutes, nor a stream's same-link item); if there is still no room the upload gets 507.
+# Every file counts as at least 64 KB against the budget (what it really takes on disk), and an id that was used once
+# can't be used again for tombstone_days.
 
 import argparse
 import base64
 import hashlib
 import hmac
+import http.client
+import ipaddress
 import json
 import os
 import re
@@ -35,6 +41,11 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Small header limits: the stdlib allows 100 headers of 64 KB each, which lets a few idle connections hold a lot of RAM.
+# (http.client reads both as module globals each time it parses headers.)
+http.client._MAXLINE = 8192
+http.client._MAXHEADERS = 32
 
 VERSION = 1
 SIG_PREFIX = 'VRCLM1'
@@ -55,17 +66,23 @@ API_NOW_RE = re.compile(r'/api/v1/streams/([A-Za-z0-9_-]{22,64})/now')
 EMPTY_SHA = hashlib.sha256(b'').hexdigest()
 META = '.meta.json'
 MB = 1024 * 1024
+MIN_COST = 65536                 # a file counts as at least this much (blocks and inodes are not free)
+NOT_SIGNED = 'not signed, an unknown stream, or a bad signature'
 
 DEFAULTS = {
-    'port': 80, 'bind': '', 'budget_mb': 4096, 'keep_hours': 24, 'idle_upload_hours': 2, 'protect_min': 15,
-    'cleanup_min': 10, 'min_free_mb': 512, 'max_file_mb': 64, 'max_files': 4000, 'max_items': 200,
-    'max_conns': 64, 'max_conns_per_ip': 16, 'timeout': 30, 'skew_sec': 300, 'same_link': False, 'public_base': '',
+    'port': 80, 'bind': '', 'budget_mb': 4096, 'keep_hours': 24, 'max_age_hours': 72, 'idle_upload_hours': 2,
+    'protect_min': 15, 'cleanup_min': 10, 'min_free_mb': 512, 'min_free_inodes': 20000, 'max_file_mb': 64,
+    'max_playlist_kb': 1024, 'max_files': 4000, 'max_total_files': 20000, 'max_items': 200, 'max_items_per_stream': 50,
+    'tombstone_days': 7, 'max_conns': 64, 'max_conns_per_ip': 8, 'timeout': 30, 'header_sec': 15, 'skew_sec': 300,
+    'same_link': False, 'public_base': '',
 }
 INT_LIMITS = {
-    'port': (1, 65535), 'budget_mb': (1, 1 << 30), 'keep_hours': (1, 24 * 365), 'idle_upload_hours': (1, 24 * 30),
-    'protect_min': (0, 24 * 60), 'cleanup_min': (1, 24 * 60), 'min_free_mb': (0, 1 << 30), 'max_file_mb': (1, 1024),
-    'max_files': (1, 100000), 'max_items': (1, 100000), 'max_conns': (1, 10000), 'max_conns_per_ip': (1, 10000),
-    'timeout': (1, 3600), 'skew_sec': (10, 86400),
+    'port': (1, 65535), 'budget_mb': (1, 1 << 30), 'keep_hours': (1, 24 * 365), 'max_age_hours': (1, 24 * 365),
+    'idle_upload_hours': (1, 24 * 30), 'protect_min': (0, 24 * 60), 'cleanup_min': (1, 24 * 60),
+    'min_free_mb': (0, 1 << 30), 'min_free_inodes': (0, 1 << 30), 'max_file_mb': (1, 1024), 'max_playlist_kb': (1, 16384),
+    'max_files': (1, 100000), 'max_total_files': (1, 1000000), 'max_items': (1, 100000),
+    'max_items_per_stream': (1, 100000), 'tombstone_days': (0, 365), 'max_conns': (1, 100), 'max_conns_per_ip': (1, 100),
+    'timeout': (1, 3600), 'header_sec': (1, 600), 'skew_sec': (10, 86400),
 }
 
 
@@ -142,8 +159,61 @@ def log(msg):
     sys.stderr.flush()
 
 
+class LogLimit(object):
+    """At most `burst` lines a minute for what strangers can trigger (refused requests); the rest is counted."""
+
+    def __init__(self, burst=30):
+        self.burst, self.lock = burst, threading.Lock()
+        self.start, self.count, self.dropped = time.monotonic(), 0, 0
+
+    def __call__(self, msg):
+        with self.lock:
+            now = time.monotonic()
+            if now - self.start >= 60:
+                if self.dropped:
+                    log('(%d more refused requests in the last minute were not logged)' % self.dropped)
+                self.start, self.count, self.dropped = now, 0, 0
+            if self.count >= self.burst:
+                self.dropped += 1
+                return
+            self.count += 1
+        log(msg)
+
+
+log_refused = LogLimit()
+
+
+def cost_of(size):
+    return max(size, MIN_COST)
+
+
+def check_playlist(text, finished):
+    """-> the segment names of an HLS playlist that may only list this item's segNNNNN.ts; StoreError if not."""
+    if not text.startswith('#EXTM3U'):
+        raise StoreError(409, 'index.m3u8 does not start with #EXTM3U')
+    segs, end = [], False
+    for raw in text.splitlines():
+        l = raw.strip()
+        if not l:
+            continue
+        if l.startswith('#'):
+            if 'URI' in l.upper():
+                raise StoreError(409, 'index.m3u8 refers to other files (URI=)')
+            if l == '#EXT-X-ENDLIST':
+                end = True
+            continue
+        if not SEG_RE.fullmatch(l):
+            raise StoreError(409, 'index.m3u8 lists a file that is not segNNNNN.ts')
+        segs.append(l)
+    if finished and not end:
+        raise StoreError(409, 'index.m3u8 has no #EXT-X-ENDLIST')
+    if finished and not segs:
+        raise StoreError(409, 'index.m3u8 lists no segments')
+    return segs
+
+
 class Item(object):
-    __slots__ = ('id', 'stream', 'created', 'updated', 'last_view', 'finished', 'files', 'dirty', 'playlist')
+    __slots__ = ('id', 'stream', 'created', 'updated', 'last_view', 'finished', 'files', 'cost', 'dirty', 'playlist')
 
     def __init__(self, iid, stream, now):
         self.id, self.stream = iid, stream
@@ -151,8 +221,15 @@ class Item(object):
         self.last_view = 0
         self.finished = 0
         self.files = {}
+        self.cost = 0
         self.dirty = True
         self.playlist = None
+
+    def set_file(self, name, size):
+        if name in self.files:
+            self.cost -= cost_of(self.files[name])
+        self.files[name] = size
+        self.cost += cost_of(size)
 
     @property
     def size(self):
@@ -173,26 +250,37 @@ class StoreError(Exception):
         self.code, self.text = code, text
 
 
+def default_inodes(path):
+    if not hasattr(os, 'statvfs'):
+        return None
+    return os.statvfs(path).f_favail
+
+
 class Store(object):
     """The items on disk and in memory. Every change goes through self.lock; file data is written outside it."""
 
-    def __init__(self, root, cfg, clock=time.time, disk_free=None):
+    def __init__(self, root, cfg, clock=time.time, disk_free=None, inodes_free=None):
         self.root = root
         self.items_dir = os.path.join(root, 'items')
+        self.tmp_dir = os.path.join(root, 'tmp')
         self.cfg = cfg
         self.clock = clock
         self.disk_free = disk_free or (lambda: shutil.disk_usage(self.root).free)
+        self.inodes_free = inodes_free or (lambda: default_inodes(self.root))
         self.lock = threading.RLock()
         self.items = {}
-        self.reserved = 0
-        self.uploading = {}          # temp path -> item id (uploads in progress)
+        self.reserved = 0            # bytes of uploads in progress (counted as cost)
+        self.reserved_files = 0
+        self.uploading = {}          # temp path -> (stream, item id) of uploads in progress
         self.now_map = {}            # stream -> item id (same link)
         self.now_times = {}          # stream -> time of the last accepted switch
-        self.seen_sigs = {}          # signature -> expiry (replayed DELETE / switch requests are refused)
+        self.seen_sigs = {}          # stream -> {signature: expiry} (replayed DELETE / switch requests are refused)
+        self.tombstones = {}         # item id -> until when it can't be used again
         self.last_cleanup = 0
         self.last_cleanup_info = {}
         self.budget = cfg['budget_mb'] * MB
         os.makedirs(self.items_dir, mode=0o700, exist_ok=True)
+        os.makedirs(self.tmp_dir, mode=0o700, exist_ok=True)
         self._load()
 
     def now(self):
@@ -200,6 +288,8 @@ class Store(object):
 
     # ---- loading and saving
     def _load(self):
+        for name in os.listdir(self.tmp_dir):
+            self._remove_path(os.path.join(self.tmp_dir, name))       # (uploads that never ended)
         for name in os.listdir(self.items_dir):
             path = os.path.join(self.items_dir, name)
             if not ID_RE.fullmatch(name) or not os.path.isdir(path) or os.path.islink(path):
@@ -216,21 +306,35 @@ class Store(object):
                 log('removing %s: no valid meta file' % name)
                 self._remove_path(path)
                 continue
+            if it.stream not in self.cfg['streams']:
+                log('removing %s: its stream is no longer on this server' % name)
+                self._remove_path(path)
+                continue
             for fn in os.listdir(path):
                 fp = os.path.join(path, fn)
                 if NAME_RE.fullmatch(fn) and os.path.isfile(fp) and not os.path.islink(fp):
-                    it.files[fn] = os.path.getsize(fp)
+                    it.set_file(fn, os.path.getsize(fp))
                 elif fn != META:
-                    self._remove_path(fp)       # (a temp file of an upload that never ended)
+                    self._remove_path(fp)
             it.dirty = False
             self.items[name] = it
         try:
             with open(os.path.join(self.root, 'now.json'), 'rb') as f:
                 m = json.loads(f.read(65536).decode('utf-8'))
-            for sid, iid in m.items():
+            times = m.get('times', {}) if 'map' in m else {}
+            for sid, iid in (m['map'] if 'map' in m else m).items():
                 if sid in self.cfg['streams'] and iid in self.items and self.items[iid].finished:
                     self.now_map[sid] = iid
-        except (OSError, ValueError, AttributeError):
+            for sid, ts in times.items():
+                if sid in self.cfg['streams'] and isinstance(ts, int):
+                    self.now_times[sid] = ts
+        except (OSError, ValueError, AttributeError, KeyError, TypeError):
+            pass
+        try:
+            with open(os.path.join(self.root, 'tombstones.json'), 'rb') as f:
+                m = json.loads(f.read(4 * MB).decode('utf-8'))
+            self.tombstones = dict((k, int(v)) for k, v in m.items() if ID_RE.fullmatch(k))
+        except (OSError, ValueError, AttributeError, TypeError):
             pass
 
     def _write_json(self, path, obj):
@@ -244,7 +348,13 @@ class Store(object):
         it.dirty = False
 
     def _save_now(self):
-        self._write_json(os.path.join(self.root, 'now.json'), self.now_map)
+        self._write_json(os.path.join(self.root, 'now.json'), {'map': self.now_map, 'times': self.now_times})
+
+    def _save_tombstones(self):
+        try:
+            self._write_json(os.path.join(self.root, 'tombstones.json'), self.tombstones)
+        except OSError:
+            pass
 
     def _remove_path(self, path):
         try:
@@ -255,8 +365,16 @@ class Store(object):
         except OSError:
             pass
 
-    def _drop(self, it, why):
+    def _drop(self, it, why, save_tombstones=True):
         self.items.pop(it.id, None)
+        days = self.cfg['tombstone_days']
+        if days:
+            self.tombstones[it.id] = self.now() + days * 86400
+            if len(self.tombstones) > 50000:
+                for k, _ in sorted(self.tombstones.items(), key=lambda kv: kv[1])[:10000]:
+                    del self.tombstones[k]
+            if save_tombstones:
+                self._save_tombstones()
         for sid, iid in list(self.now_map.items()):
             if iid == it.id:
                 del self.now_map[sid]
@@ -266,26 +384,45 @@ class Store(object):
 
     # ---- accounting
     def used(self):
-        return sum(it.size for it in self.items.values())
+        return sum(it.cost for it in self.items.values())
+
+    def files_total(self):
+        return sum(len(it.files) for it in self.items.values())
+
+    def _disk_ok(self, need, files):
+        """Is there room on the disk itself (bytes and inodes) for need more bytes in files more files?"""
+        if self.disk_free() - self.reserved - need < self.cfg['min_free_mb'] * MB:
+            return False
+        ino = self.inodes_free()
+        return ino is None or ino - self.reserved_files - files >= self.cfg['min_free_inodes']
 
     def _room_ok(self, need):
-        if self.used() + self.reserved + need > self.budget:
-            return False
-        return self.disk_free() - self.reserved - need >= self.cfg['min_free_mb'] * MB
+        return self.used() + self.reserved + need <= self.budget and self._disk_ok(need, 0)
 
-    def _ensure_room(self, need, keep_id):
-        """Evicts finished items (viewed longest ago first) until need bytes fit; False = still no room."""
-        if need > self.budget:
-            return False
+    def _victims(self, sid, keep_id):
+        """Finished items that may go for room: the stream's own first, then the others; each viewed longest ago first."""
         protect = self.now() - self.cfg['protect_min'] * 60
         now_items = set(self.now_map.values())
-        while not self._room_ok(need):
-            cands = [it for it in self.items.values() if it.finished and it.id != keep_id
-                     and it.id not in now_items and it.last_view <= protect]
-            if not cands:
+        cands = [it for it in self.items.values() if it.finished and it.id != keep_id
+                 and it.id not in now_items and it.idle_since() <= protect]
+        return sorted(cands, key=lambda it: (it.stream != sid, it.idle_since(), it.created))
+
+    def _ensure_room(self, need, keep_id, sid):
+        """Evicts finished items until need more bytes fit; False = still no room (nothing is evicted then)."""
+        if need > self.budget:
+            return False
+        victims, freed, plan = self._victims(sid, keep_id), 0, []
+        while not (self.used() - freed + self.reserved + need <= self.budget and
+                   self.disk_free() + freed - self.reserved - need >= self.cfg['min_free_mb'] * MB):
+            if not victims:
                 return False
-            victim = min(cands, key=lambda it: (it.idle_since(), it.created))
-            self._drop(victim, 'room needed')
+            v = victims.pop(0)
+            plan.append(v)
+            freed += v.cost
+        for v in plan:
+            self._drop(v, 'room needed', save_tombstones=False)
+        if plan:
+            self._save_tombstones()
         return True
 
     # ---- public reads
@@ -314,6 +451,10 @@ class Store(object):
                         pass
                 return None
 
+    def _read_playlist(self, iid):
+        with open(os.path.join(self.items_dir, iid, 'index.m3u8'), 'rb') as f:
+            return f.read(self.cfg['max_playlist_kb'] * 1024 + 1).decode('ascii')
+
     def now_playlist(self, sid, base):
         """The playlist of the stream's current item with absolute segment URLs, or None."""
         with self.lock:
@@ -323,8 +464,7 @@ class Store(object):
                 return None
             if it.playlist is None:
                 try:
-                    with open(os.path.join(self.items_dir, iid, 'index.m3u8'), 'rb') as f:
-                        it.playlist = f.read(self.cfg['max_file_mb'] * MB).decode('ascii')
+                    it.playlist = self._read_playlist(iid)
                 except (OSError, ValueError):
                     return None
             it.last_view = self.now()
@@ -338,18 +478,18 @@ class Store(object):
             return ('\n'.join(out) + '\n').encode('ascii')
 
     # ---- signed requests
-    def check_replay(self, sig, ts):
-        with self.lock:
-            now = self.now()
-            if len(self.seen_sigs) > 4096:
-                for k in [k for k, exp in self.seen_sigs.items() if exp < now]:
-                    del self.seen_sigs[k]
-            if sig in self.seen_sigs:
-                return False
-            if len(self.seen_sigs) > 20000:
-                return False
-            self.seen_sigs[sig] = ts + 2 * self.cfg['skew_sec'] + 1
-            return True
+    def _check_replay(self, sid, sig, ts):
+        """(lock held) A DELETE / switch signature seen before -> StoreError 409; else it is remembered."""
+        now = self.now()
+        seen = self.seen_sigs.setdefault(sid, {})
+        if len(seen) > 1000:
+            for k in [k for k, exp in seen.items() if exp < now]:
+                del seen[k]
+        if sig in seen:
+            raise StoreError(409, 'a replayed request')
+        if len(seen) > 5000:
+            raise StoreError(429, 'too many requests; try again in a few minutes')
+        seen[sig] = ts + 2 * self.cfg['skew_sec'] + 1
 
     def _own_item(self, sid, iid):
         it = self.items.get(iid)
@@ -358,46 +498,76 @@ class Store(object):
         return it
 
     def begin_put(self, sid, iid, name, length):
-        """Checks and reserves room for one file -> the temp path to write it to."""
+        """Checks one upload before its data comes, and reserves disk room for it -> the temp path to write it to.
+        (Nothing is evicted and no item is made yet: that waits until the data is really there, in end_put.)"""
+        if length <= 0:
+            raise StoreError(400, 'an empty file')
+        if name == 'index.m3u8' and length > self.cfg['max_playlist_kb'] * 1024:
+            raise StoreError(413, 'index.m3u8 is larger than %d KB' % self.cfg['max_playlist_kb'])
         with self.lock:
+            if self.tombstones.get(iid, 0) > self.now():
+                raise StoreError(410, 'that item id was used before: upload under a new id')
             it = self.items.get(iid)
             if it and it.stream != sid:
-                raise StoreError(409, 'that item id belongs to another stream')
+                raise StoreError(410, 'that item id was used before: upload under a new id')
             if it and it.finished:
                 raise StoreError(409, 'the item is finished (committed); upload it under a new id')
-            if not it and len(self.items) >= self.cfg['max_items']:
-                raise StoreError(507, 'too many items on the server')
-            if it and name not in it.files and len(it.files) >= self.cfg['max_files']:
+            if not it and sum(1 for x in self.items.values() if x.stream == sid) >= self.cfg['max_items_per_stream']:
+                raise StoreError(507, 'this stream has too many items on the server')
+            new_file = not it or name not in it.files
+            if new_file and it and len(it.files) >= self.cfg['max_files']:
                 raise StoreError(413, 'too many files in the item')
-            old = it.files.get(name, 0) if it else 0
-            if not self._ensure_room(max(0, length - old), iid):
+            if new_file and self.files_total() + self.reserved_files >= self.cfg['max_total_files']:
+                raise StoreError(507, 'too many files on the server')
+            if cost_of(length) > self.budget or not self._disk_ok(cost_of(length), 1):
                 raise StoreError(507, 'the server is full')
-            if not it:
-                it = Item(iid, sid, self.now())
-                os.makedirs(os.path.join(self.items_dir, iid), mode=0o700, exist_ok=True)
-                self.items[iid] = it
-                self._save_meta(it)
-            it.updated = self.now()
-            self.reserved += length
-            tmp = os.path.join(self.items_dir, iid, '.up-%s' % secrets.token_hex(8))
-            self.uploading[tmp] = iid
+            self.reserved += cost_of(length)
+            self.reserved_files += 1
+            tmp = os.path.join(self.tmp_dir, 'up-%s' % secrets.token_hex(8))
+            self.uploading[tmp] = (sid, iid)
             return tmp
 
     def end_put(self, sid, iid, name, tmp, length, ok):
+        """The upload ended (ok = all data there and its sha256 right): checks it, makes room and moves it in."""
         with self.lock:
-            self.reserved -= length
+            self.reserved -= cost_of(length)
+            self.reserved_files -= 1
             self.uploading.pop(tmp, None)
-            it = self.items.get(iid)
-            if not ok or not it or it.stream != sid or it.finished:
-                self._remove_path(tmp)
-                if ok:
+            try:
+                if not ok:
+                    return
+                it = self.items.get(iid)
+                if (it and (it.stream != sid or it.finished)) or self.tombstones.get(iid, 0) > self.now():
                     raise StoreError(409, 'the item was removed or finished during the upload')
-                return
-            os.replace(tmp, os.path.join(self.items_dir, iid, name))
-            it.files[name] = length
-            it.updated = self.now()
-            it.playlist = None
-            self._save_meta(it)
+                text = None
+                if name == 'index.m3u8':
+                    try:
+                        with open(tmp, 'rb') as f:
+                            text = f.read(self.cfg['max_playlist_kb'] * 1024 + 1).decode('ascii')
+                    except ValueError:
+                        raise StoreError(409, 'index.m3u8 is not a plain ASCII playlist')
+                    check_playlist(text, False)
+                old = cost_of(it.files[name]) if it and name in it.files else 0
+                if not self._ensure_room(cost_of(length) - old, iid, sid):
+                    raise StoreError(507, 'the server is full')
+                if not it:
+                    if len(self.items) >= self.cfg['max_items']:
+                        victims = self._victims(sid, None)
+                        if not victims:
+                            raise StoreError(507, 'too many items on the server')
+                        self._drop(victims[0], 'too many items')
+                    it = Item(iid, sid, self.now())
+                    os.makedirs(os.path.join(self.items_dir, iid), mode=0o700, exist_ok=True)
+                    self.items[iid] = it
+                os.replace(tmp, os.path.join(self.items_dir, iid, name))
+                tmp = None
+                it.set_file(name, length)
+                it.updated = self.now()
+                it.playlist = None
+                self._save_meta(it)
+            finally:
+                if tmp:
+                    self._remove_path(tmp)
 
     def commit(self, sid, iid):
         with self.lock:
@@ -407,36 +577,17 @@ class Store(object):
             if 'index.m3u8' not in it.files:
                 raise StoreError(409, 'index.m3u8 is missing')
             try:
-                with open(os.path.join(self.items_dir, iid, 'index.m3u8'), 'rb') as f:
-                    text = f.read(self.cfg['max_file_mb'] * MB).decode('ascii')
+                text = self._read_playlist(iid)
             except (OSError, ValueError):
                 raise StoreError(409, 'index.m3u8 is not a plain ASCII playlist')
-            lines = [l.strip() for l in text.splitlines()]
-            if not lines or lines[0] != '#EXTM3U':
-                raise StoreError(409, 'index.m3u8 does not start with #EXTM3U')
-            if '#EXT-X-ENDLIST' not in lines:
-                raise StoreError(409, 'index.m3u8 has no #EXT-X-ENDLIST')
-            segs, missing = 0, []
-            for l in lines:
-                if not l:
-                    continue
-                if l.startswith('#'):
-                    if 'URI=' in l.upper():
-                        raise StoreError(409, 'index.m3u8 refers to other files (URI=)')
-                    continue
-                if not SEG_RE.fullmatch(l):
-                    raise StoreError(409, 'index.m3u8 lists a file that is not segNNNNN.ts')
-                segs += 1
-                if l not in it.files:
-                    missing.append(l)
-            if not segs:
-                raise StoreError(409, 'index.m3u8 lists no segments')
+            segs = check_playlist(text, True)
+            missing = [s for s in segs if s not in it.files]
             if missing:
                 raise StoreError(409, 'missing segments: %d (first: %s)' % (len(missing), missing[0]))
             it.finished = self.now()
             it.playlist = text
             self._save_meta(it)
-            return {'ok': True, 'finished': True, 'segments': segs}
+            return {'ok': True, 'finished': True, 'segments': len(segs)}
 
     def listing(self, sid, iid):
         with self.lock:
@@ -444,13 +595,14 @@ class Store(object):
             return {'id': it.id, 'finished': bool(it.finished), 'bytes': it.size,
                     'files': dict(sorted(it.files.items()))}
 
-    def delete(self, sid, iid):
+    def delete(self, sid, iid, sig, ts):
         with self.lock:
             it = self._own_item(sid, iid)
+            self._check_replay(sid, sig, ts)
             self._drop(it, 'deleted by its stream')
             return {'ok': True}
 
-    def set_now(self, sid, iid, ts):
+    def set_now(self, sid, iid, sig, ts):
         with self.lock:
             if ts < self.now_times.get(sid, 0):
                 raise StoreError(409, 'an older switch request')
@@ -458,6 +610,8 @@ class Store(object):
                 it = self._own_item(sid, iid)
                 if not it.finished:
                     raise StoreError(409, 'the item is not finished')
+            self._check_replay(sid, sig, ts)
+            if iid:
                 self.now_map[sid] = iid
             else:
                 self.now_map.pop(sid, None)
@@ -470,14 +624,16 @@ class Store(object):
             now = self.now()
             fin = [it for it in self.items.values() if it.finished]
             own = sorted((it for it in self.items.values() if it.stream == sid), key=lambda it: it.created)
-            free = None
+            free = ino = None
             try:
                 free = self.disk_free()
+                ino = self.inodes_free()
             except OSError:
                 pass
             return {
                 'version': VERSION, 'time': now, 'budget_bytes': self.budget, 'used_bytes': self.used(),
                 'reserved_bytes': self.reserved, 'free_disk_bytes': free, 'min_free_bytes': self.cfg['min_free_mb'] * MB,
+                'free_inodes': ino, 'files_total': self.files_total(), 'max_total_files': self.cfg['max_total_files'],
                 'keep_hours': self.cfg['keep_hours'], 'items_total': len(self.items),
                 'oldest_idle_sec': max([now - it.idle_since() for it in fin] or [0]),
                 'oldest_age_sec': max([now - it.created for it in self.items.values()] or [0]),
@@ -494,41 +650,46 @@ class Store(object):
             now = self.now()
             removed, freed = 0, 0
             keep = self.cfg['keep_hours'] * 3600
+            max_age = self.cfg['max_age_hours'] * 3600
             idle = self.cfg['idle_upload_hours'] * 3600
+            busy = set(v[1] for v in self.uploading.values())
             for it in list(self.items.values()):
-                if it.finished and now - it.idle_since() > keep:
+                if it.stream not in self.cfg['streams']:
+                    why = 'its stream is no longer on this server'
+                elif it.finished and now - it.idle_since() > keep:
                     why = 'not viewed for %d h' % (keep // 3600)
-                elif not it.finished and now - it.updated > idle and not any(
-                        v == it.id for v in self.uploading.values()):
+                elif it.finished and now - it.finished > max_age:
+                    why = 'older than %d h' % (max_age // 3600)
+                elif not it.finished and now - it.updated > idle and it.id not in busy:
                     why = 'unfinished upload idle for %d h' % (idle // 3600)
                 else:
                     continue
                 removed += 1
                 freed += it.size
-                self._drop(it, why)
+                self._drop(it, why, save_tombstones=False)
             if self.used() + self.reserved > self.budget:     # (e.g. the budget was lowered)
                 before = len(self.items)
-                self._ensure_room(0, None)
+                self._ensure_room(0, None, None)
                 removed += before - len(self.items)
-            # Temp files no upload owns (a crash during an upload).
-            for it in self.items.values():
-                d = os.path.join(self.items_dir, it.id)
-                try:
-                    names = os.listdir(d)
-                except OSError:
-                    continue
-                for fn in names:
-                    p = os.path.join(d, fn)
-                    if fn.startswith('.up-') and p not in self.uploading:
+            try:
+                for fn in os.listdir(self.tmp_dir):           # (temp files no upload owns)
+                    p = os.path.join(self.tmp_dir, fn)
+                    if p not in self.uploading:
                         self._remove_path(p)
+            except OSError:
+                pass
             for it in self.items.values():
                 if it.dirty:
                     try:
                         self._save_meta(it)
                     except OSError:
                         pass
-            for k in [k for k, exp in self.seen_sigs.items() if exp < now]:
-                del self.seen_sigs[k]
+            for seen in self.seen_sigs.values():
+                for k in [k for k, exp in seen.items() if exp < now]:
+                    del seen[k]
+            for k in [k for k, exp in self.tombstones.items() if exp < now]:
+                del self.tombstones[k]
+            self._save_tombstones()
             self.last_cleanup = now
             self.last_cleanup_info = {'removed': removed, 'freed_bytes': freed}
             free = -1
@@ -536,9 +697,22 @@ class Store(object):
                 free = self.disk_free() // MB
             except OSError:
                 pass
-            log('cleanup: removed %d item(s), freed %d MB; %d item(s), %d of %d MB used, %d MB free on disk' % (
-                removed, freed // MB, len(self.items), self.used() // MB, self.budget // MB, free))
+            log('cleanup: removed %d item(s), freed %d MB; %d item(s), %d files, %d of %d MB used, %d MB free on disk' % (
+                removed, freed // MB, len(self.items), self.files_total(), self.used() // MB, self.budget // MB, free))
             return self.last_cleanup_info
+
+
+def client_key(ip):
+    """What the per-client connection cap counts: an IPv4 address, or an IPv6 /64 (one host can have all of it)."""
+    ip = ip.split('%', 1)[0]
+    if ip.startswith('::ffff:') and '.' in ip:
+        return ip[7:]
+    if ':' in ip:
+        try:
+            return str(ipaddress.ip_network(ip + '/64', strict=False).network_address) + '/64'
+        except ValueError:
+            return ip
+    return ip
 
 
 class Server(ThreadingHTTPServer):
@@ -553,6 +727,8 @@ class Server(ThreadingHTTPServer):
         self.conn_lock = threading.Lock()
         self.conns = 0
         self.per_ip = {}
+        self.deadlines = {}          # socket -> monotonic time by which its request line + headers must be in
+        self.reaper_stop = threading.Event()
         ThreadingHTTPServer.__init__(self, addr, handler, bind_and_activate=False)
         try:
             if family == socket.AF_INET6:
@@ -565,14 +741,41 @@ class Server(ThreadingHTTPServer):
         except Exception:
             self.server_close()
             raise
+        threading.Thread(target=self._reaper, daemon=True).start()
 
     def server_bind(self):
         # (HTTPServer.server_bind would look the address up in DNS: not needed here.)
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = 'vrclm-files', self.server_address[1]
 
+    def server_close(self):
+        self.reaper_stop.set()
+        ThreadingHTTPServer.server_close(self)
+
+    def set_deadline(self, sock, sec):
+        with self.conn_lock:
+            if sec is None:
+                self.deadlines.pop(sock, None)
+            else:
+                self.deadlines[sock] = time.monotonic() + sec
+
+    def _reaper(self):
+        # A client that is slow to send its request (or idles on a keep-alive connection) is cut off: the per-read
+        # timeout alone would let a byte every 29 s hold a connection for ever.
+        while not self.reaper_stop.wait(0.5):
+            now = time.monotonic()
+            with self.conn_lock:
+                late = [s for s, d in self.deadlines.items() if d < now]
+                for s in late:
+                    del self.deadlines[s]
+            for s in late:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
     def process_request(self, request, client_address):
-        ip = client_address[0]
+        ip = client_key(client_address[0])
         with self.conn_lock:
             if self.conns >= self.cfg['max_conns'] or self.per_ip.get(ip, 0) >= self.cfg['max_conns_per_ip']:
                 busy = True
@@ -598,7 +801,8 @@ class Server(ThreadingHTTPServer):
         try:
             ThreadingHTTPServer.process_request_thread(self, request, client_address)
         finally:
-            self._release(client_address[0])
+            self.set_deadline(request, None)
+            self._release(client_key(client_address[0]))
 
     def _release(self, ip):
         with self.conn_lock:
@@ -611,7 +815,7 @@ class Server(ThreadingHTTPServer):
 
     def handle_error(self, request, client_address):
         e = sys.exc_info()[1]
-        if not isinstance(e, (ConnectionError, socket.timeout, TimeoutError)):
+        if not isinstance(e, OSError):
             log('error: %s: %s' % (e.__class__.__name__, e))
 
 
@@ -622,17 +826,52 @@ class Handler(BaseHTTPRequestHandler):
     timeout = 30
 
     # ---- plumbing
+    def handle_one_request(self):
+        # As BaseHTTPRequestHandler's, but with an 8 KB request line, and the request line + headers (or a keep-alive
+        # wait) must arrive within header_sec.
+        # (A short per-read timeout ends an idle wait; the reaper ends a slow trickle, as the next read finds the
+        # socket shut down.)
+        srv = self.server
+        srv.set_deadline(self.connection, srv.cfg['header_sec'])
+        self.connection.settimeout(srv.cfg['header_sec'])
+        try:
+            self.raw_requestline = self.rfile.readline(8193)
+            if len(self.raw_requestline) > 8192:
+                self.requestline = self.request_version = self.command = ''
+                self.send_error(414)
+                self.close_connection = True
+                return
+            if not self.raw_requestline:
+                self.close_connection = True
+                return
+            ok = self.parse_request()
+            srv.set_deadline(self.connection, None)
+            self.connection.settimeout(self.timeout)
+            if not ok:
+                self.close_connection = True
+                return
+            method = getattr(self, 'do_' + self.command, None)
+            if method is None:
+                self.send_error(501, 'Unsupported method')
+                return
+            method()
+            self.wfile.flush()
+        except OSError:
+            self.close_connection = True
+        finally:
+            srv.set_deadline(self.connection, None)
+
     def log_message(self, fmt, *args):
         pass
 
     def log_error(self, fmt, *args):
         try:
-            log('http: ' + (fmt % args))
+            log_refused('http: ' + (fmt % args))
         except Exception:
             pass
 
     def handle_expect_100(self):
-        return True          # (answered in do_PUT, after the signature and the room are checked)
+        return True          # (answered later, after the signature and the room are checked)
 
     def reply(self, code, body=b'', ctype='text/plain; charset=utf-8', headers=None, close=False):
         if isinstance(body, str):
@@ -654,9 +893,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def fail(self, code, text, close=False, headers=None):
-        if code >= 400 and self.path.startswith('/api/'):
-            log('%s %s -> %d %s' % (self.command, self.path, code, text))
         if self.path.startswith('/api/'):
+            log_refused('%s %s -> %d %s' % (self.command, self.path, code, text))
             self.reply(code, {'ok': False, 'error': text}, close=close, headers=headers)
         else:
             self.reply(code, text + '\n', close=close, headers=headers)
@@ -678,6 +916,11 @@ class Handler(BaseHTTPRequestHandler):
         if len(vals) != 1 or not DIGITS_RE.fullmatch(vals[0].strip()):
             return None
         return int(vals[0].strip())
+
+    def send_continue(self):
+        if self.headers.get('Expect', '').lower() == '100-continue':
+            self.send_response_only(100)
+            self.end_headers()
 
     # ---- public
     def do_GET(self):
@@ -720,7 +963,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(200, body, 'application/vnd.apple.mpegurl',
                                       {'Cache-Control': 'no-cache, no-store, must-revalidate'})
             return self.fail(404, 'not found')
-        except (ConnectionError, socket.timeout, TimeoutError):
+        except OSError:
             self.close_connection = True
         except Exception as e:
             log('error in %s %s: %s: %s' % (self.command, self.path, e.__class__.__name__, e))
@@ -755,20 +998,20 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- signed
     def verify(self, path, body_sha):
-        """-> the stream id of a correctly signed request; raises StoreError(401) otherwise."""
+        """-> (stream id, time, signature) of a correctly signed request; raises StoreError(401) otherwise."""
         cfg = self.server.cfg
         sid = self.headers.get('X-Vrclm-Stream', '')
         ts = self.headers.get('X-Vrclm-Time', '')
         sig = self.headers.get('X-Vrclm-Sig', '').lower()
         key = cfg['streams'].get(sid)
-        if not key or not DIGITS_RE.fullmatch(ts) or not HEX64_RE.fullmatch(sig):
-            raise StoreError(401, 'not signed (or an unknown stream)')
+        if not DIGITS_RE.fullmatch(ts) or not HEX64_RE.fullmatch(sig):
+            raise StoreError(401, NOT_SIGNED)
         now = self.server.store.now()
         if abs(now - int(ts)) > cfg['skew_sec']:
             raise StoreError(401, 'the request time is too far from the server clock (%d)' % now)
-        good = sign(key, sid, self.command, path, int(ts), body_sha)
-        if not hmac.compare_digest(good, sig):
-            raise StoreError(401, 'bad signature')
+        good = sign(key or b'\0' * 32, sid if STREAM_RE.fullmatch(sid) else '-', self.command, path, int(ts), body_sha)
+        if not hmac.compare_digest(good, sig) or not key:
+            raise StoreError(401, NOT_SIGNED)
         return sid, int(ts), sig
 
     def read_small_body(self, limit=65536):
@@ -777,7 +1020,16 @@ class Handler(BaseHTTPRequestHandler):
             raise StoreError(411, 'send a Content-Length (no chunked bodies)')
         if n > limit:
             raise StoreError(413, 'body too large')
-        data = self.rfile.read(n) if n else b''
+        if not n:
+            return b''
+        self.send_continue()
+        self.server.set_deadline(self.connection, self.server.cfg['header_sec'])
+        self.connection.settimeout(self.server.cfg['header_sec'])
+        try:
+            data = self.rfile.read(n)
+        finally:
+            self.server.set_deadline(self.connection, None)
+            self.connection.settimeout(self.timeout)
         if len(data) != n:
             raise ConnectionError('short body')
         return data
@@ -794,7 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.put_file(p, m.group(1), m.group(2))
             body_sha = self.headers.get('X-Vrclm-Sha256', '').lower()
             if not HEX64_RE.fullmatch(body_sha):
-                raise StoreError(401, 'not signed (X-Vrclm-Sha256 is missing)')
+                raise StoreError(401, NOT_SIGNED)
             close = True
             body = self.read_small_body()
             close = False
@@ -809,9 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, store.listing(sid, m.group(1)), headers={'Cache-Control': 'no-store'})
             if m and self.command == 'DELETE':
                 sid, ts, sig = self.verify(p, body_sha)
-                if not store.check_replay(sig, ts):
-                    raise StoreError(409, 'a replayed request')
-                return self.reply(200, store.delete(sid, m.group(1)))
+                return self.reply(200, store.delete(sid, m.group(1), sig, ts))
             m = API_COMMIT_RE.fullmatch(p)
             if m and self.command == 'POST':
                 sid, _, _ = self.verify(p, body_sha)
@@ -829,9 +1079,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise StoreError(400, 'the body must be {"item": "<id>"}')
                 if not isinstance(want, str) or (want and not ID_RE.fullmatch(want)):
                     raise StoreError(400, 'the body must be {"item": "<id>"}')
-                if not store.check_replay(sig, ts):
-                    raise StoreError(409, 'a replayed request')
-                return self.reply(200, store.set_now(sid, want, ts))
+                return self.reply(200, store.set_now(sid, want, sig, ts))
             raise StoreError(404, 'not found')
         except StoreError as e:
             hdr = {'X-Vrclm-Now': str(store.now())} if e.code == 401 else None
@@ -846,32 +1094,35 @@ class Handler(BaseHTTPRequestHandler):
             raise StoreError(413, 'the file is larger than %d MB' % cfg['max_file_mb'])
         want = self.headers.get('X-Vrclm-Sha256', '').lower()
         if not HEX64_RE.fullmatch(want):
-            raise StoreError(401, 'not signed (X-Vrclm-Sha256 is missing)')
+            raise StoreError(401, NOT_SIGNED)
         sid, _, _ = self.verify(p, want)
         tmp = store.begin_put(sid, iid, name, length)
-        ok = False
+        ok, bad = False, None
         try:
-            if self.headers.get('Expect', '').lower() == '100-continue':
-                self.send_response_only(100)
-                self.end_headers()
+            self.send_continue()
             h = hashlib.sha256()
-            left = length
+            left, first = length, None
             with open(tmp, 'xb') as f:
                 while left:
                     chunk = self.rfile.read(min(262144, left))
                     if not chunk:
                         raise ConnectionError('short upload')
+                    if first is None:
+                        first = chunk[0]
                     h.update(chunk)
                     f.write(chunk)
                     left -= len(chunk)
             if h.hexdigest() != want:
-                store.end_put(sid, iid, name, tmp, length, False)
-                tmp = None
-                return self.fail(400, 'the file does not match X-Vrclm-Sha256')
-            ok = True
+                bad = 'the file does not match X-Vrclm-Sha256'
+            elif name != 'index.m3u8' and first != 0x47:
+                bad = 'a segment must be MPEG-TS (its first byte is 0x47)'
+            else:
+                ok = True
         finally:
-            if tmp and not ok:
+            if not ok:
                 store.end_put(sid, iid, name, tmp, length, False)
+        if bad:
+            return self.fail(400, bad)
         store.end_put(sid, iid, name, tmp, length, True)
         return self.reply(201, {'ok': True, 'file': name, 'bytes': length})
 
