@@ -12,7 +12,7 @@
 # Settings live in config.json next to this file (created on first run).
 
 $ErrorActionPreference = 'Stop'
-$script:Version = '1.17'
+$script:Version = '1.18'
 $script:Args0 = @($args)
 # A download window (D, "Download Videos.bat"): started with --download first, see Invoke-DownloadMain.
 $script:DownloadArg = '--download'
@@ -1113,6 +1113,24 @@ function Clear-OldTemp {
     }
     $keep = Get-HelperDllName
     foreach ($f in [System.IO.Directory]::GetFiles($script:TempRoot, 'helper-*.dll')) { if ([System.IO.Path]::GetFileName($f) -ne $keep) { try { [System.IO.File]::Delete($f) } catch {} } }
+    $old = [DateTime]::UtcNow.AddHours(-1)
+    foreach ($d in [System.IO.Directory]::GetDirectories($script:TempRoot, 'update-*')) {
+      if ([System.IO.Directory]::GetCreationTimeUtc($d) -lt $old) { try { [System.IO.Directory]::Delete($d, $true) } catch {} }
+    }
+  } catch {}
+  # yt-dlp.exe unpacks itself to %TEMP%\_MEI<number> and only removes that when it exits on its own, so every
+  # stopped download / search left ~20 MB behind. A copy still running keeps its DLLs open, and Windows will not
+  # rename a folder with open files in it: rename first, delete only what could be renamed (and is over an hour old).
+  try {
+    $old = [DateTime]::UtcNow.AddHours(-1)
+    foreach ($d in [System.IO.Directory]::GetDirectories([System.IO.Path]::GetTempPath(), '_MEI*')) {
+      if ([System.IO.Path]::GetFileName($d) -notmatch '^_MEI\d+$') { continue }
+      if ([System.IO.Directory]::GetCreationTimeUtc($d) -ge $old) { continue }
+      $gone = $d + '-old'
+      try { [System.IO.Directory]::Move($d, $gone) } catch { continue }
+      try { [System.IO.Directory]::Delete($gone, $true) } catch {}
+    }
+    foreach ($d in [System.IO.Directory]::GetDirectories([System.IO.Path]::GetTempPath(), '_MEI*-old')) { try { [System.IO.Directory]::Delete($d, $true) } catch {} }
   } catch {}
 }
 
